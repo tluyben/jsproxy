@@ -186,15 +186,30 @@ class ProxyServer {
   buildTargetUrl(mapping, requestUrl) {
     let targetPath = requestUrl;
     
+    // Handle front_uri to back_uri mapping
     if (mapping.front_uri && mapping.front_uri !== '') {
-      const frontUriPattern = new RegExp(`^/${mapping.front_uri.replace(/\//g, '\\/')}`);  
-      targetPath = requestUrl.replace(frontUriPattern, `/${mapping.back_uri}`);
+      // Create pattern to match front_uri at the beginning of the path
+      const frontUri = mapping.front_uri.startsWith('/') ? mapping.front_uri : `/${mapping.front_uri}`;
+      const backUri = mapping.back_uri.startsWith('/') ? mapping.back_uri : `/${mapping.back_uri}`;
+      
+      if (requestUrl.startsWith(frontUri)) {
+        // Replace front_uri with back_uri
+        targetPath = requestUrl.replace(frontUri, backUri);
+      } else if (requestUrl.startsWith(frontUri.substring(1))) {
+        // Handle case where front_uri has leading slash but requestUrl doesn't
+        targetPath = requestUrl.replace(frontUri.substring(1), backUri);
+      }
     } else if (mapping.back_uri && mapping.back_uri !== '') {
-      targetPath = `/${mapping.back_uri}${requestUrl}`;
+      // If no front_uri but there's a back_uri, prepend it
+      const backUri = mapping.back_uri.startsWith('/') ? mapping.back_uri : `/${mapping.back_uri}`;
+      targetPath = `${backUri}${requestUrl}`;
     }
     
-    // Clean up double slashes
+    // Clean up multiple slashes and ensure it starts with /
     targetPath = targetPath.replace(/\/+/g, '/');
+    if (!targetPath.startsWith('/')) {
+      targetPath = '/' + targetPath;
+    }
     
     return `http://localhost:${mapping.back_port}${targetPath}`;
   }

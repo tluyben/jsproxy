@@ -37,6 +37,7 @@
   "devDependencies": {
     "jest": "^29.7.0",
     "supertest": "^6.3.3",
+    "ws": "^8.14.2",
     "eslint": "^8.57.0",
     "eslint-config-standard": "^17.1.0",
     "eslint-plugin-import": "^2.29.1",
