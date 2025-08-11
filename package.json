@@ -1,0 +1,49 @@
+{
+  "name": "jsproxy",
+  "version": "1.0.0",
+  "description": "A resilient HTTP/HTTPS proxy server with WebSocket support and automatic SSL certificate generation",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "dev:80": "HTTP_PORT=80 HTTPS_PORT=443 ENABLE_HTTPS=false npm run dev",
+    "dev:custom": "HTTP_PORT=3000 HTTPS_PORT=3443 ENABLE_HTTPS=false npm run dev", 
+    "start:prod": "NODE_ENV=production HTTP_PORT=80 HTTPS_PORT=443 ENABLE_HTTPS=true npm start",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "docker:dev": "docker-compose --profile dev up jsproxy-dev",
+    "docker:prod": "docker-compose up jsproxy",
+    "docker:tools": "docker-compose --profile tools up"
+  },
+  "keywords": [
+    "proxy",
+    "https",
+    "websocket",
+    "ssl",
+    "acme",
+    "sqlite"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "http-proxy": "^1.18.1",
+    "sqlite3": "^5.1.6",
+    "acme-client": "^5.3.0",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.3",
+    "eslint": "^8.57.0",
+    "eslint-config-standard": "^17.1.0",
+    "eslint-plugin-import": "^2.29.1",
+    "eslint-plugin-n": "^16.6.2",
+    "eslint-plugin-promise": "^6.1.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

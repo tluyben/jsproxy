@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  jsproxy:
+    build: .
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./data:/app/data
+      - ./certs:/app/certs
+      - ./logs:/app/logs
+    environment:
+      - NODE_ENV=production
+      - HTTP_PORT=80
+      - HTTPS_PORT=443
+      - ENABLE_HTTPS=true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: SQLite browser for database management
+  sqlite-web:
+    image: coleifer/sqlite-web
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    command: ["sqlite_web", "/data/current.db", "-H", "0.0.0.0", "-p", "8080"]
+    depends_on:
+      - jsproxy
+    profiles:
+      - tools
+
+  # Development version with non-privileged ports
+  jsproxy-dev:
+    build: .
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    volumes:
+      - ./data:/app/data
+      - ./certs:/app/certs
+      - ./logs:/app/logs
+    environment:
+      - NODE_ENV=development
+      - HTTP_PORT=8080
+      - HTTPS_PORT=8443
+      - ENABLE_HTTPS=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    profiles:
+      - dev
+
+volumes:
+  data:
+  certs:
+  logs:
