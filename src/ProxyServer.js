@@ -9,7 +9,7 @@ class ProxyServer {
   constructor(logger) {
     this.logger = logger;
     this.db = new DatabaseManager(logger);
-    this.certManager = new CertificateManager(logger);
+    this.certManager = new CertificateManager(logger, this.db);
     this.proxy = httpProxy.createProxyServer({
       ws: true,
       changeOrigin: true,
@@ -117,6 +117,20 @@ class ProxyServer {
         return;
       }
 
+      // Handle ACME challenges - DO NOT proxy these
+      if (req.url && req.url.startsWith('/.well-known/acme-challenge/')) {
+        const token = req.url.split('/').pop();
+        const challenge = await this.certManager.getChallenge(token);
+        if (challenge) {
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(challenge);
+        } else {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Challenge not found');
+        }
+        return;
+      }
+
       const host = req.headers.host;
       if (!host) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -133,8 +147,9 @@ class ProxyServer {
         return;
       }
 
+      // Only generate certificates for domains in our database
       if (isHttps) {
-        await this.certManager.ensureCertificate(domain);
+        await this.certManager.ensureCertificate(domain, true); // true = domain is validated
       }
 
       const targetUrl = this.buildTargetUrl(mapping, req.url);
@@ -169,8 +184,9 @@ class ProxyServer {
         return;
       }
 
+      // Only generate certificates for domains in our database
       if (isHttps) {
-        await this.certManager.ensureCertificate(domain);
+        await this.certManager.ensureCertificate(domain, true); // true = domain is validated
       }
 
       const targetUrl = this.buildTargetUrl(mapping, req.url);

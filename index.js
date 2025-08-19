@@ -26,14 +26,21 @@ const logger = winston.createLogger({
 if (cluster.isMaster) {
   logger.info(`Master ${process.pid} is running`);
 
+  // Track worker IDs for respawning
+  const workerIds = new Map();
+  
   for (let i = 0; i < Math.min(numCPUs, 4); i++) {
-    cluster.fork();
+    const worker = cluster.fork({ WORKER_ID: i.toString() });
+    workerIds.set(worker.id, i);
   }
 
   cluster.on('exit', (worker, code, signal) => {
     logger.error(`Worker ${worker.process.pid} died with code ${code} and signal ${signal}`);
     logger.info('Starting a new worker');
-    cluster.fork();
+    const workerId = workerIds.get(worker.id) || 0;
+    workerIds.delete(worker.id);
+    const newWorker = cluster.fork({ WORKER_ID: workerId.toString() });
+    workerIds.set(newWorker.id, workerId);
   });
 
   cluster.on('listening', (worker, address) => {
@@ -53,6 +60,10 @@ if (cluster.isMaster) {
   
   async function startWorker() {
     try {
+      // Get worker ID
+      const workerId = parseInt(process.env.WORKER_ID || '0');
+      logger.info(`Worker ${process.pid} starting with ID: ${workerId}`);
+      
       const server = new ProxyServer(logger);
       await server.initialize();
       await server.start();

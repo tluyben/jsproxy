@@ -6,13 +6,18 @@ const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 class CertificateManager {
-  constructor(logger) {
+  constructor(logger, dbManager) {
     this.logger = logger;
+    this.db = dbManager; // Need access to check main domains
     this.certificates = new Map();
+    this.challenges = new Map(); // Store ACME challenges in memory
     this.certsDir = './certs';
     this.acmeClient = null;
     this.accountKey = null;
     this.processingDomains = new Set();
+    this.lastCertRequest = new Map(); // Track last cert request time per domain
+    this.certRequestCount = new Map(); // Track request count per domain
+    this.wildcardCerts = new Map(); // Track wildcard certificates
   }
 
   async initialize() {
@@ -30,10 +35,26 @@ class CertificateManager {
     }
   }
 
+  async acquireLock(lockPath, timeout = 5000) {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeout) {
+      try {
+        // Try to create lock file (will fail if exists)
+        await fs.writeFile(lockPath, process.pid.toString(), { flag: 'wx' });
+        return true;
+      } catch (error) {
+        // Lock exists, wait and retry
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    return false;
+  }
+
   async initializeAcmeClient() {
     try {
       const accountKeyPath = path.join(this.certsDir, 'account-key.pem');
       
+      // Read or create account key (this part was working)
       try {
         const accountKeyPem = await fs.readFile(accountKeyPath);
         this.accountKey = accountKeyPem;
@@ -43,26 +64,62 @@ class CertificateManager {
         await fs.writeFile(accountKeyPath, this.accountKey);
       }
 
-      // Use staging for development, production for real deployment
-      const directoryUrl = process.env.NODE_ENV === 'production' 
-        ? acme.directory.letsencrypt.production 
-        : acme.directory.letsencrypt.staging;
+      // ALWAYS use production certificates - staging certs are useless
+      const directoryUrl = acme.directory.letsencrypt.production;
 
       this.acmeClient = new acme.Client({
         directoryUrl,
         accountKey: this.accountKey
       });
 
+      // Check if we've already registered this account key
+      const accountRegisteredPath = path.join(this.certsDir, '.account-registered');
+      
       try {
-        await this.acmeClient.getAccountUrl();
-        this.logger.info('ACME client initialized with existing account');
+        await fs.access(accountRegisteredPath);
+        // Account already registered, just use it
+        this.logger.info('ACME account already registered - reusing');
       } catch (error) {
-        this.logger.info('Creating new ACME account');
-        await this.acmeClient.createAccount({
-          termsOfServiceAgreed: true,
-          contact: []
-        });
-        this.logger.info('ACME account created successfully');
+        // Need to register account with ACME server
+        const lockPath = path.join(this.certsDir, '.account-create.lock');
+        const hasLock = await this.acquireLock(lockPath, 5000);
+        
+        if (hasLock) {
+          try {
+            // Double check the flag file
+            try {
+              await fs.access(accountRegisteredPath);
+              this.logger.info('Account was just registered by another worker');
+            } catch (e) {
+              // Really need to create
+              this.logger.info('Registering ACME account (one time only)');
+              await this.acmeClient.createAccount({
+                termsOfServiceAgreed: true,
+                contact: []
+              });
+              
+              // Mark as registered
+              await fs.writeFile(accountRegisteredPath, new Date().toISOString());
+              this.logger.info('ACME account registered successfully');
+            }
+          } finally {
+            await fs.unlink(lockPath).catch(() => {});
+          }
+        } else {
+          // Another worker is creating, wait for the flag file
+          this.logger.info('Waiting for another worker to register account');
+          let attempts = 20;
+          while (attempts > 0) {
+            try {
+              await fs.access(accountRegisteredPath);
+              this.logger.info('Account registered by another worker');
+              break;
+            } catch (e) {
+              attempts--;
+              await new Promise(resolve => setTimeout(resolve, 100));
+            }
+          }
+        }
       }
     } catch (error) {
       this.logger.error('Failed to initialize ACME client:', error);
@@ -101,9 +158,30 @@ class CertificateManager {
 
   async isCertificateValid(certPem) {
     try {
-      const cert = crypto.createPublicKey(certPem);
+      // Parse certificate to check expiry
+      const certString = certPem.toString();
+      const cert = forge.pki.certificateFromPem(certString);
+      
+      const now = new Date();
+      const notAfter = new Date(cert.validity.notAfter);
+      const notBefore = new Date(cert.validity.notBefore);
+      
+      // Check if certificate is currently valid
+      if (now < notBefore || now > notAfter) {
+        this.logger.warn(`Certificate expired or not yet valid. Valid from ${notBefore} to ${notAfter}`);
+        return false;
+      }
+      
+      // Check if certificate expires in next 30 days (renew early)
+      const thirtyDaysFromNow = new Date(now.getTime() + (30 * 24 * 60 * 60 * 1000));
+      if (notAfter < thirtyDaysFromNow) {
+        this.logger.info(`Certificate expiring soon (${notAfter}), will renew`);
+        return false; // Trigger renewal
+      }
+      
       return true;
     } catch (error) {
+      this.logger.error('Error checking certificate validity:', error);
       return false;
     }
   }
@@ -236,8 +314,20 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   async getSNICallback() {
     return async (domain, callback) => {
       try {
-        const certificate = await this.ensureCertificate(domain);
-        callback(null, certificate);
+        // Check if domain is in database
+        const domainMapping = await this.db.getMapping(domain, '/');
+        const isDomainValidated = domainMapping !== null;
+        
+        const certificate = await this.ensureCertificate(domain, isDomainValidated);
+        
+        // SNI callback needs a SecureContext, not just cert/key
+        const tls = require('tls');
+        const context = tls.createSecureContext({
+          cert: certificate.cert,
+          key: certificate.key
+        });
+        
+        callback(null, context);
       } catch (error) {
         this.logger.error(`SNI callback error for ${domain}:`, error);
         callback(error);
@@ -245,17 +335,80 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     };
   }
 
-  async ensureCertificate(domain) {
+  async ensureCertificate(domain, isDomainValidated = false) {
+    // Return cached certificate if available
     if (this.certificates.has(domain)) {
       return this.certificates.get(domain);
     }
 
+    const mainDomain = this.getMainDomain(domain);
+    const isSubdomain = this.isSubdomain(domain);
+    
+    // If this is a subdomain, check if we have a wildcard cert for the main domain
+    if (isSubdomain && isDomainValidated) {
+      const wildcardCert = await this.getWildcardCertificate(mainDomain);
+      if (wildcardCert) {
+        this.logger.info(`Using wildcard certificate for ${domain} from *.${mainDomain}`);
+        this.certificates.set(domain, wildcardCert);
+        return wildcardCert;
+      }
+      
+      // Check if main domain exists in database
+      const mainDomainMapping = await this.db.getMapping(mainDomain, '/');
+      if (mainDomainMapping) {
+        this.logger.info(`Main domain ${mainDomain} exists in DB - will request wildcard certificate`);
+        // Continue to request wildcard cert below
+      }
+    }
+
+    // Check if certificate exists on disk
+    try {
+      const certPath = path.join(this.certsDir, `${domain}.crt`);
+      const keyPath = path.join(this.certsDir, `${domain}.key`);
+      const cert = await fs.readFile(certPath);
+      const key = await fs.readFile(keyPath);
+      
+      if (await this.isCertificateValid(cert)) {
+        this.certificates.set(domain, { cert, key });
+        this.logger.info(`Loaded certificate from disk for domain: ${domain}`);
+        return { cert, key };
+      }
+    } catch (error) {
+      // Certificate doesn't exist or is invalid, continue to obtain new one
+    }
+
+    // Only generate certificates for validated domains
+    if (!isDomainValidated) {
+      this.logger.warn(`Domain ${domain} not validated - using self-signed certificate`);
+      return await this.generateSelfSignedCertificate(domain);
+    }
+
+    // Rate limiting - prevent too many requests for same domain
+    const now = Date.now();
+    const lastRequest = this.lastCertRequest.get(domain) || 0;
+    const timeSinceLastRequest = now - lastRequest;
+    
+    // Limit: max 1 request per domain per 5 minutes
+    if (timeSinceLastRequest < 5 * 60 * 1000) {
+      this.logger.warn(`Rate limit: Too soon to request certificate for ${domain} (${Math.round(timeSinceLastRequest/1000)}s since last request)`);
+      return await this.generateSelfSignedCertificate(domain);
+    }
+
+    // Track daily request count (Let's Encrypt limit: 5 duplicate certs per week)
+    const requestCount = this.certRequestCount.get(domain) || 0;
+    if (requestCount >= 5) {
+      this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
+      return await this.generateSelfSignedCertificate(domain);
+    }
+
     if (this.processingDomains.has(domain)) {
       await this.waitForCertificateProcessing(domain);
-      return this.certificates.get(domain);
+      return this.certificates.get(domain) || await this.generateSelfSignedCertificate(domain);
     }
 
     this.processingDomains.add(domain);
+    this.lastCertRequest.set(domain, now);
+    this.certRequestCount.set(domain, requestCount + 1);
 
     try {
       const certificate = await this.obtainCertificate(domain);
@@ -264,6 +417,69 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     } finally {
       this.processingDomains.delete(domain);
     }
+  }
+
+  getMainDomain(domain) {
+    // Extract main domain from subdomain
+    // e.g., "sub.example.com" -> "example.com"
+    // e.g., "example.com" -> "example.com"
+    const parts = domain.split('.');
+    if (parts.length <= 2) {
+      return domain; // Already a main domain
+    }
+    
+    // Handle common TLDs including compound ones like .co.uk
+    const tldPatterns = [
+      /\.(co|ac|gov|org|net|edu|mil)\.\w+$/,  // compound TLDs
+      /\.\w+$/  // simple TLDs
+    ];
+    
+    for (const pattern of tldPatterns) {
+      const match = domain.match(pattern);
+      if (match) {
+        const tld = match[0];
+        const domainWithoutTld = domain.slice(0, -tld.length);
+        const domainParts = domainWithoutTld.split('.');
+        return domainParts[domainParts.length - 1] + tld;
+      }
+    }
+    
+    // Fallback: assume last two parts
+    return parts.slice(-2).join('.');
+  }
+
+  isSubdomain(domain) {
+    const mainDomain = this.getMainDomain(domain);
+    return domain !== mainDomain && domain !== `www.${mainDomain}`;
+  }
+
+  async getWildcardCertificate(mainDomain) {
+    // Check if we have a wildcard certificate for this main domain
+    const wildcardDomain = `*.${mainDomain}`;
+    
+    // Check memory cache
+    if (this.wildcardCerts.has(mainDomain)) {
+      return this.wildcardCerts.get(mainDomain);
+    }
+    
+    // Check disk for wildcard cert
+    try {
+      const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
+      const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
+      const cert = await fs.readFile(certPath);
+      const key = await fs.readFile(keyPath);
+      
+      if (await this.isCertificateValid(cert)) {
+        const certificate = { cert, key };
+        this.wildcardCerts.set(mainDomain, certificate);
+        this.logger.info(`Loaded wildcard certificate from disk for *.${mainDomain}`);
+        return certificate;
+      }
+    } catch (error) {
+      // Wildcard cert doesn't exist
+    }
+    
+    return null;
   }
 
   async waitForCertificateProcessing(domain, maxWait = 30000) {
@@ -283,11 +499,21 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
 
     try {
+      const mainDomain = this.getMainDomain(domain);
+      const isSubdomain = this.isSubdomain(domain);
+      let requestDomains = [domain];
+      let certFilename = domain;
+      
+      // DO NOT REQUEST WILDCARDS - they require DNS-01 challenge which needs DNS API access
+      // Just request the specific domain
+      requestDomains = [domain];
+      certFilename = domain;
+
       const privateKey = await acme.forge.createPrivateKey();
       
       const [key, csr] = await acme.forge.createCsr({
-        commonName: domain,
-        altNames: [domain]
+        commonName: requestDomains[0],
+        altNames: requestDomains
       }, privateKey);
 
       const cert = await this.acmeClient.auto({
@@ -298,15 +524,23 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         challengeRemoveFn: this.challengeRemoveFn.bind(this)
       });
 
-      const certPath = path.join(this.certsDir, `${domain}.crt`);
-      const keyPath = path.join(this.certsDir, `${domain}.key`);
+      const certPath = path.join(this.certsDir, `${certFilename}.crt`);
+      const keyPath = path.join(this.certsDir, `${certFilename}.key`);
 
       await fs.writeFile(certPath, cert);
       await fs.writeFile(keyPath, key);
 
-      this.logger.info(`Certificate obtained and saved for domain: ${domain}`);
+      this.logger.info(`Certificate obtained and saved: ${certFilename} for domains: ${requestDomains.join(', ')}`);
 
-      return { cert: Buffer.from(cert), key: Buffer.from(key) };
+      const certificate = { cert: Buffer.from(cert), key: Buffer.from(key) };
+      
+      // Cache wildcard cert if applicable
+      if (certFilename.startsWith('wildcard.')) {
+        const wildcardMainDomain = certFilename.replace('wildcard.', '').replace('.crt', '');
+        this.wildcardCerts.set(wildcardMainDomain, certificate);
+      }
+
+      return certificate;
     } catch (error) {
       this.logger.error(`Failed to obtain certificate for ${domain}:`, error);
       
@@ -316,17 +550,37 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
   }
 
+  async getChallenge(token) {
+    // First check in-memory challenges
+    if (this.challenges.has(token)) {
+      return this.challenges.get(token);
+    }
+    
+    // Also check file system for challenges created by other workers
+    const challengeFile = path.join(this.certsDir, '.well-known', 'acme-challenge', token);
+    try {
+      const challenge = await fs.readFile(challengeFile, 'utf8');
+      return challenge;
+    } catch (error) {
+      return null;
+    }
+  }
+
   async challengeCreateFn(authz, challenge, keyAuthorization) {
     this.logger.info(`Creating challenge for ${authz.identifier.value}: ${challenge.type}`);
 
     if (challenge.type === 'http-01') {
+      // Store in memory for this worker
+      this.challenges.set(challenge.token, keyAuthorization);
+      
+      // Also write to file system for other workers
       const challengePath = path.join(this.certsDir, '.well-known', 'acme-challenge');
       await fs.mkdir(challengePath, { recursive: true });
       
       const challengeFile = path.join(challengePath, challenge.token);
       await fs.writeFile(challengeFile, keyAuthorization);
       
-      this.logger.info(`HTTP challenge file created: ${challengeFile}`);
+      this.logger.info(`HTTP challenge created: token=${challenge.token}`);
     }
   }
 
@@ -334,10 +588,14 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     this.logger.info(`Removing challenge for ${authz.identifier.value}: ${challenge.type}`);
 
     if (challenge.type === 'http-01') {
+      // Remove from memory
+      this.challenges.delete(challenge.token);
+      
+      // Remove from file system
       const challengeFile = path.join(this.certsDir, '.well-known', 'acme-challenge', challenge.token);
       try {
         await fs.unlink(challengeFile);
-        this.logger.info(`HTTP challenge file removed: ${challengeFile}`);
+        this.logger.info(`HTTP challenge removed: token=${challenge.token}`);
       } catch (error) {
         this.logger.warn(`Failed to remove challenge file:`, error);
       }
