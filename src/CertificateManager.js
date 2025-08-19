@@ -1,4 +1,5 @@
 const acme = require('acme-client');
+const forge = require('node-forge');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
@@ -128,22 +129,90 @@ class CertificateManager {
 
   async generateSelfSignedCertificate(commonName) {
     try {
-      const key = await acme.forge.createPrivateKey();
+      // Generate a key pair
+      const keys = forge.pki.rsa.generateKeyPair(2048);
       
-      // Create a proper self-signed certificate using forge
-      const cert = await acme.forge.createCertificate({
-        commonName: commonName || 'localhost',
-        altNames: [commonName || 'localhost']
-      }, key, key);
+      // Create a certificate
+      const cert = forge.pki.createCertificate();
+      cert.publicKey = keys.publicKey;
+      cert.serialNumber = '01';
+      cert.validity.notBefore = new Date();
+      cert.validity.notAfter = new Date();
+      cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 1);
+      
+      const attrs = [{
+        name: 'commonName',
+        value: commonName || 'localhost'
+      }, {
+        name: 'countryName',
+        value: 'US'
+      }, {
+        shortName: 'ST',
+        value: 'California'
+      }, {
+        name: 'localityName',
+        value: 'San Francisco'
+      }, {
+        name: 'organizationName',
+        value: 'Test'
+      }, {
+        shortName: 'OU',
+        value: 'Test'
+      }];
+      
+      cert.setSubject(attrs);
+      cert.setIssuer(attrs);
+      cert.setExtensions([{
+        name: 'basicConstraints',
+        cA: true
+      }, {
+        name: 'keyUsage',
+        keyCertSign: true,
+        digitalSignature: true,
+        nonRepudiation: true,
+        keyEncipherment: true,
+        dataEncipherment: true
+      }, {
+        name: 'extKeyUsage',
+        serverAuth: true,
+        clientAuth: true,
+        codeSigning: true,
+        emailProtection: true,
+        timeStamping: true
+      }, {
+        name: 'nsCertType',
+        client: true,
+        server: true,
+        email: true,
+        objsign: true,
+        sslCA: true,
+        emailCA: true,
+        objCA: true
+      }, {
+        name: 'subjectAltName',
+        altNames: [{
+          type: 2, // DNS
+          value: commonName || 'localhost'
+        }]
+      }, {
+        name: 'subjectKeyIdentifier'
+      }]);
+      
+      // Sign the certificate with its own key (self-signed)
+      cert.sign(keys.privateKey, forge.md.sha256.create());
+      
+      // Convert to PEM format
+      const certPem = forge.pki.certificateToPem(cert);
+      const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
       
       return { 
-        cert: Buffer.from(cert), 
-        key: Buffer.from(key) 
+        cert: Buffer.from(certPem), 
+        key: Buffer.from(keyPem) 
       };
     } catch (error) {
       this.logger.error('Failed to generate self-signed certificate:', error);
       
-      // Ultimate fallback - create minimal working cert
+      // Ultimate fallback - create minimal working cert using acme.forge
       const key = await acme.forge.createPrivateKey();
       const cert = `-----BEGIN CERTIFICATE-----
 MIICljCCAX4CCQCKvJPJ9VJd8TANBgkqhkiG9w0BAQsFADA1MQswCQYDVQQGEwJV

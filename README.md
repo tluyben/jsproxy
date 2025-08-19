@@ -91,7 +91,38 @@ CREATE TABLE mappings (
 
 ### Adding Mappings
 
-Connect to the database and add mappings:
+#### Using the CLI Script (Recommended)
+
+```bash
+# Add domain with port
+node scripts/add-mapping.js example.com 3000
+
+# Add with frontend path mapping
+node scripts/add-mapping.js example.com 3000 --frontend /app
+
+# Add with backend API path
+node scripts/add-mapping.js example.com 3000 --backend /api
+
+# Add with both frontend and backend paths
+node scripts/add-mapping.js example.com 3000 --frontend / --backend /api
+
+# Use same path for both
+node scripts/add-mapping.js example.com 3000 --both /
+
+# List all mappings
+node scripts/add-mapping.js --list
+
+# Delete a mapping
+node scripts/add-mapping.js example.com --delete
+
+# Add and reload proxy automatically
+node scripts/add-mapping.js example.com 3000 --frontend / --reload
+
+# Show help
+node scripts/add-mapping.js --help
+```
+
+#### Using SQLite CLI
 
 ```bash
 # Using SQLite CLI

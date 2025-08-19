@@ -69,8 +69,16 @@ class ProxyServer {
 
     if (enableHttps) {
       try {
+        const defaultCert = await this.certManager.getDefaultCertificate();
+        const sniCallback = await this.certManager.getSNICallback();
+        
+        const httpsOptions = {
+          ...defaultCert,
+          SNICallback: sniCallback
+        };
+        
         this.httpsServer = https.createServer(
-          await this.certManager.getDefaultCertificate(),
+          httpsOptions,
           (req, res) => {
             this.handleRequest(req, res, true);
           }
@@ -90,14 +98,9 @@ class ProxyServer {
             resolve();
           });
         });
-
-        // Set up SNI callback
-        const sniCallback = await this.certManager.getSNICallback();
-        if (sniCallback) {
-          this.httpsServer.addContext('*', sniCallback);
-        }
       } catch (error) {
-        this.logger.warn('HTTPS server could not be started:', error.message);
+        this.logger.warn('HTTPS server could not be started:', error.message || error);
+        this.logger.error('HTTPS startup error details:', error);
         this.logger.info('To enable HTTPS in development, set ENABLE_HTTPS=true');
       }
     } else {
