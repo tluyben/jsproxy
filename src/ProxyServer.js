@@ -14,7 +14,8 @@ class ProxyServer {
       ws: true,
       changeOrigin: true,
       timeout: 30000,
-      proxyTimeout: 30000
+      proxyTimeout: 30000,
+      xfwd: true  // Automatically adds X-Forwarded-For, X-Forwarded-Port, X-Forwarded-Proto
     });
     
     this.httpServer = null;
@@ -23,6 +24,23 @@ class ProxyServer {
   }
 
   setupProxyErrorHandling() {
+    // Set proper forwarding headers before proxying
+    this.proxy.on('proxyReq', (proxyReq, req, res, options) => {
+      // Preserve the original host
+      const originalHost = req.headers.host;
+      if (originalHost) {
+        proxyReq.setHeader('X-Forwarded-Host', originalHost);
+        // Keep the Host header as the original domain
+        proxyReq.setHeader('Host', originalHost);
+      }
+      
+      // Set the protocol based on whether this is HTTPS
+      const protocol = req.connection.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+      proxyReq.setHeader('X-Forwarded-Proto', protocol);
+      
+      // X-Forwarded-For is handled by xfwd: true
+    });
+    
     this.proxy.on('error', (err, req, res) => {
       this.logger.error('Proxy error:', err);
       if (res && !res.headersSent) {
