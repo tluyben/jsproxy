@@ -152,12 +152,23 @@ class ProxyServer {
         await this.certManager.ensureCertificate(domain, true); // true = domain is validated
       }
 
-      const targetUrl = this.buildTargetUrl(mapping, req.url);
-      
-      this.proxy.web(req, res, {
-        target: targetUrl,
-        secure: false
-      });
+      // For simple port forwarding (no URI mapping), just proxy directly
+      if (!mapping.front_uri && !mapping.back_uri) {
+        const target = `http://localhost:${mapping.back_port}`;
+        this.proxy.web(req, res, {
+          target: target,
+          secure: false,
+          changeOrigin: true
+        });
+      } else {
+        // Complex URI mapping
+        const targetUrl = this.buildTargetUrl(mapping, req.url);
+        this.proxy.web(req, res, {
+          target: targetUrl,
+          secure: false,
+          changeOrigin: true
+        });
+      }
 
     } catch (error) {
       this.logger.error('Request handling error:', error);
@@ -189,12 +200,23 @@ class ProxyServer {
         await this.certManager.ensureCertificate(domain, true); // true = domain is validated
       }
 
-      const targetUrl = this.buildTargetUrl(mapping, req.url);
-      
-      this.proxy.ws(req, socket, head, {
-        target: targetUrl,
-        secure: false
-      });
+      // For simple port forwarding (no URI mapping), just proxy directly
+      if (!mapping.front_uri && !mapping.back_uri) {
+        const target = `http://localhost:${mapping.back_port}`;
+        this.proxy.ws(req, socket, head, {
+          target: target,
+          secure: false,
+          changeOrigin: true
+        });
+      } else {
+        // Complex URI mapping
+        const targetUrl = this.buildTargetUrl(mapping, req.url);
+        this.proxy.ws(req, socket, head, {
+          target: targetUrl,
+          secure: false,
+          changeOrigin: true
+        });
+      }
 
     } catch (error) {
       this.logger.error('WebSocket handling error:', error);
@@ -205,24 +227,33 @@ class ProxyServer {
   buildTargetUrl(mapping, requestUrl) {
     let targetPath = requestUrl;
     
-    // Handle front_uri to back_uri mapping
+    // Only modify path if we have actual URI mappings
     if (mapping.front_uri && mapping.front_uri !== '') {
       // Create pattern to match front_uri at the beginning of the path
       const frontUri = mapping.front_uri.startsWith('/') ? mapping.front_uri : `/${mapping.front_uri}`;
-      const backUri = mapping.back_uri.startsWith('/') ? mapping.back_uri : `/${mapping.back_uri}`;
       
-      if (requestUrl.startsWith(frontUri)) {
-        // Replace front_uri with back_uri
-        targetPath = requestUrl.replace(frontUri, backUri);
-      } else if (requestUrl.startsWith(frontUri.substring(1))) {
-        // Handle case where front_uri has leading slash but requestUrl doesn't
-        targetPath = requestUrl.replace(frontUri.substring(1), backUri);
+      if (mapping.back_uri && mapping.back_uri !== '') {
+        const backUri = mapping.back_uri.startsWith('/') ? mapping.back_uri : `/${mapping.back_uri}`;
+        
+        if (requestUrl.startsWith(frontUri)) {
+          // Replace front_uri with back_uri
+          targetPath = requestUrl.replace(frontUri, backUri);
+        } else if (requestUrl.startsWith(frontUri.substring(1))) {
+          // Handle case where front_uri has leading slash but requestUrl doesn't
+          targetPath = requestUrl.replace(frontUri.substring(1), backUri);
+        }
+      } else {
+        // Remove front_uri from path (back_uri is empty)
+        if (requestUrl.startsWith(frontUri)) {
+          targetPath = requestUrl.substring(frontUri.length) || '/';
+        }
       }
     } else if (mapping.back_uri && mapping.back_uri !== '') {
       // If no front_uri but there's a back_uri, prepend it
       const backUri = mapping.back_uri.startsWith('/') ? mapping.back_uri : `/${mapping.back_uri}`;
       targetPath = `${backUri}${requestUrl}`;
     }
+    // If both front_uri and back_uri are empty, don't modify the path at all
     
     // Clean up multiple slashes and ensure it starts with /
     targetPath = targetPath.replace(/\/+/g, '/');
