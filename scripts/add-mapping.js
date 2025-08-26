@@ -14,6 +14,7 @@ Options:
   --frontend <path>    Add frontend URI mapping (e.g., /app)
   --backend <path>     Add backend URI mapping (e.g., /api)
   --both <path>        Add both frontend and backend with same path
+  --server <url>       Set backend server (default: http://localhost)
   --delete             Delete the domain mapping instead of adding
   --list               List all current mappings
   --reload             Show confirmation that changes are active (automatic)
@@ -28,6 +29,9 @@ Examples:
 
   # Add domain with backend mapping  
   node scripts/add-mapping.js example.com 3000 --backend /api
+
+  # Add domain with external backend server
+  node scripts/add-mapping.js example.com 3000 --server https://api.example.com
 
   # Add domain with both frontend and backend
   node scripts/add-mapping.js example.com 3000 --frontend / --backend /api
@@ -59,13 +63,13 @@ function listMappings() {
   const db = connectDB();
   
   console.log('\nCurrent domain mappings:\n');
-  console.log('%-30s %-10s %-15s %-15s %s'.replace(/%(-?\d+)s/g, (match, width) => {
+  console.log('%-30s %-10s %-15s %-15s %-20s %s'.replace(/%(-?\d+)s/g, (match, width) => {
     return `%${width}s`;
-  }), 'Domain', 'Port', 'Frontend', 'Backend', 'Created');
-  console.log('-'.repeat(80));
+  }), 'Domain', 'Port', 'Frontend', 'Backend', 'Server', 'Created');
+  console.log('-'.repeat(100));
   
   db.all(`
-    SELECT domain, back_port, front_uri, back_uri, created_at 
+    SELECT domain, back_port, front_uri, back_uri, backend, created_at 
     FROM mappings 
     ORDER BY domain
   `, (err, rows) => {
@@ -80,11 +84,12 @@ function listMappings() {
     } else {
       rows.forEach(row => {
         console.log(
-          '%-30s %-10s %-15s %-15s %s'
+          '%-30s %-10s %-15s %-15s %-20s %s'
             .replace('%-30s', row.domain.padEnd(30))
             .replace('%-10s', (row.back_port || '-').toString().padEnd(10))
             .replace('%-15s', (row.front_uri || '-').padEnd(15))
             .replace('%-15s', (row.back_uri || '-').padEnd(15))
+            .replace('%-20s', (row.backend || 'http://localhost').padEnd(20))
             .replace('%s', new Date(row.created_at).toLocaleString())
         );
       });
@@ -114,7 +119,7 @@ function deleteDomain(domain) {
   });
 }
 
-function addMapping(domain, port, frontendPath, backendPath) {
+function addMapping(domain, port, frontendPath, backendPath, backendServer) {
   const db = connectDB();
   
   // First check if domain exists
@@ -142,6 +147,10 @@ function addMapping(domain, port, frontendPath, backendPath) {
         updates.push('back_uri = ?');
         params.push(backendPath || '');
       }
+      if (backendServer !== undefined) {
+        updates.push('backend = ?');
+        params.push(backendServer || null);
+      }
       
       updates.push('updated_at = CURRENT_TIMESTAMP');
       params.push(domain);
@@ -160,6 +169,7 @@ function addMapping(domain, port, frontendPath, backendPath) {
           if (port) console.log(`  Port: ${port}`);
           if (frontendPath) console.log(`  Frontend: ${frontendPath}`);
           if (backendPath) console.log(`  Backend: ${backendPath}`);
+          if (backendServer) console.log(`  Server: ${backendServer}`);
           console.log('\n✓ Changes are active immediately - no reload needed');
           
           db.close();
@@ -169,9 +179,9 @@ function addMapping(domain, port, frontendPath, backendPath) {
       // Insert new - need to generate an ID
       const id = require('crypto').randomUUID();
       db.run(
-        `INSERT INTO mappings (id, domain, back_port, front_uri, back_uri, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-        [id, domain, port || 0, frontendPath || '', backendPath || ''],
+        `INSERT INTO mappings (id, domain, back_port, front_uri, back_uri, backend, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        [id, domain, port || 0, frontendPath || '', backendPath || '', backendServer || null],
         (err) => {
           if (err) {
             console.error('Error adding mapping:', err.message);
@@ -183,6 +193,7 @@ function addMapping(domain, port, frontendPath, backendPath) {
           if (port) console.log(`  Port: ${port}`);
           if (frontendPath) console.log(`  Frontend: ${frontendPath}`);
           if (backendPath) console.log(`  Backend: ${backendPath}`);
+          if (backendServer) console.log(`  Server: ${backendServer}`);
           console.log('\n✓ Changes are active immediately - no reload needed');
           
           db.close();
@@ -226,6 +237,7 @@ if (shouldDelete) {
 const port = args[1] ? parseInt(args[1]) : null;
 let frontendPath = null;
 let backendPath = null;
+let backendServer = null;
 
 for (let i = 2; i < args.length; i++) {
   switch (args[i]) {
@@ -240,6 +252,9 @@ for (let i = 2; i < args.length; i++) {
       frontendPath = path;
       backendPath = path;
       break;
+    case '--server':
+      backendServer = args[++i];
+      break;
   }
 }
 
@@ -249,7 +264,7 @@ if (!port && !frontendPath && !backendPath) {
   process.exit(1);
 }
 
-addMapping(domain, port, frontendPath, backendPath);
+addMapping(domain, port, frontendPath, backendPath, backendServer);
 
 if (shouldReload) {
   setTimeout(reloadProxy, 100);

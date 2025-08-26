@@ -9,6 +9,7 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 - **High Availability**: Cluster-based architecture with worker process management
 - **Zero Downtime**: Hot database replacement without service interruption  
 - **Flexible Routing**: Domain and URI-based traffic routing
+- **External Backend Support**: Proxy to remote servers, not just localhost
 - **SQLite Backend**: WAL mode for concurrent reads during updates
 - **Docker Ready**: Complete containerization with docker-compose
 - **Comprehensive Testing**: Full test suite with integration tests
@@ -84,6 +85,7 @@ CREATE TABLE mappings (
   front_uri TEXT NOT NULL,       -- Frontend URI path (e.g., "v1/users")
   back_port INTEGER NOT NULL,    -- Backend port (e.g., 3000)
   back_uri TEXT NOT NULL,        -- Backend URI path (e.g., "api/v1/users")
+  backend TEXT DEFAULT NULL,     -- Backend server URL (e.g., "https://api.example.com", defaults to "http://localhost")
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -105,6 +107,12 @@ node scripts/add-mapping.js example.com 3000 --backend /api
 
 # Add with both frontend and backend paths
 node scripts/add-mapping.js example.com 3000 --frontend / --backend /api
+
+# Add with external backend server
+node scripts/add-mapping.js example.com 3000 --server https://api.example.com
+
+# Add with external backend and path mapping
+node scripts/add-mapping.js example.com 3000 --backend /api --server https://backend.example.com
 
 # Use same path for both
 node scripts/add-mapping.js example.com 3000 --both /
@@ -129,12 +137,16 @@ node scripts/add-mapping.js --help
 sqlite3 ./data/current.db
 
 # Add a mapping
-INSERT INTO mappings (id, domain, front_uri, back_port, back_uri) 
-VALUES ('550e8400-e29b-41d4-a716-446655440000', 'api.example.com', '', 3000, '');
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend) 
+VALUES ('550e8400-e29b-41d4-a716-446655440000', 'api.example.com', '', 3000, '', NULL);
+
+# Add with external backend server
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend) 
+VALUES ('550e8400-e29b-41d4-a716-446655440002', 'external.example.com', '', 3000, '', 'https://api.external.com');
 
 # Add API version routing
-INSERT INTO mappings (id, domain, front_uri, back_port, back_uri) 
-VALUES ('550e8400-e29b-41d4-a716-446655440001', 'app.example.com', 'api/v1', 3001, 'v1');
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend) 
+VALUES ('550e8400-e29b-41d4-a716-446655440001', 'app.example.com', 'api/v1', 3001, 'v1', NULL);
 ```
 
 ### Using SQLite Web Interface
@@ -148,11 +160,13 @@ open http://localhost:8080
 
 ## Routing Examples
 
-| Request | Domain | URI | Backend | Result |
-|---------|---------|-----|---------|---------|
-| `GET https://api.example.com/users` | api.example.com | `` | :3000 | `GET http://localhost:3000/users` |
-| `GET https://app.example.com/api/v1/data` | app.example.com | api/v1 | :3001 | `GET http://localhost:3001/v1/data` |
-| `GET https://app.example.com/api/v2/data` | app.example.com | api/v2 | :3002 | `GET http://localhost:3002/v2/data` |
+| Request | Domain | URI | Backend | Server | Result |
+|---------|---------|-----|---------|--------|---------|
+| `GET https://api.example.com/users` | api.example.com | `` | :3000 | - | `GET http://localhost:3000/users` |
+| `GET https://app.example.com/api/v1/data` | app.example.com | api/v1 | :3001 | - | `GET http://localhost:3001/v1/data` |
+| `GET https://app.example.com/api/v2/data` | app.example.com | api/v2 | :3002 | - | `GET http://localhost:3002/v2/data` |
+| `GET https://external.example.com/users` | external.example.com | `` | :3000 | https://api.external.com | `GET https://api.external.com:3000/users` |
+| `GET https://remote.example.com/api/data` | remote.example.com | api | :8080 | https://backend.com | `GET https://backend.com:8080/data` |
 
 The system matches the longest `front_uri` first, allowing for hierarchical routing.
 
@@ -372,7 +386,7 @@ The `DatabaseManager` class provides methods for managing mappings:
 
 ```javascript
 // Add new mapping
-await db.addMapping(domain, frontUri, backPort, backUri);
+await db.addMapping(domain, frontUri, backPort, backUri, backend);
 
 // Get mapping for request
 const mapping = await db.getMapping(domain, requestUrl);

@@ -15,6 +15,7 @@ class DatabaseManager {
     await this.connectToDatabase();
     await this.enableWALMode();
     await this.createMappingsTable();
+    await this.addBackendColumnIfMissing();
   }
 
   async ensureDataDirectory() {
@@ -63,6 +64,7 @@ class DatabaseManager {
         front_uri TEXT NOT NULL,
         back_port INTEGER NOT NULL,
         back_uri TEXT NOT NULL,
+        backend TEXT DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
@@ -102,6 +104,37 @@ class DatabaseManager {
     }
   }
 
+  async addBackendColumnIfMissing() {
+    const checkColumnSQL = "PRAGMA table_info(mappings)";
+    
+    return new Promise((resolve, reject) => {
+      this.db.all(checkColumnSQL, (err, columns) => {
+        if (err) {
+          this.logger.error('Error checking table columns:', err);
+          reject(err);
+          return;
+        }
+        
+        const hasBackendColumn = columns.some(col => col.name === 'backend');
+        
+        if (!hasBackendColumn) {
+          const addColumnSQL = "ALTER TABLE mappings ADD COLUMN backend TEXT DEFAULT NULL";
+          this.db.run(addColumnSQL, (err) => {
+            if (err) {
+              this.logger.error('Error adding backend column:', err);
+              reject(err);
+            } else {
+              this.logger.info('Added backend column to mappings table');
+              resolve();
+            }
+          });
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
   async getMapping(domain, requestUrl) {
     const sql = `
       SELECT * FROM mappings 
@@ -137,19 +170,19 @@ class DatabaseManager {
     });
   }
 
-  async addMapping(domain, frontUri, backPort, backUri) {
+  async addMapping(domain, frontUri, backPort, backUri, backend = null) {
     const id = uuidv4();
     const sql = `
-      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
+      VALUES (?, ?, ?, ?, ?, ?)
     `;
 
     return new Promise((resolve, reject) => {
-      this.db.run(sql, [id, domain, frontUri, backPort, backUri], function(err) {
+      this.db.run(sql, [id, domain, frontUri, backPort, backUri, backend], function(err) {
         if (err) {
           reject(err);
         } else {
-          resolve({ id, domain, front_uri: frontUri, back_port: backPort, back_uri: backUri });
+          resolve({ id, domain, front_uri: frontUri, back_port: backPort, back_uri: backUri, backend });
         }
       });
     });

@@ -172,7 +172,8 @@ class ProxyServer {
 
       // For simple port forwarding (no URI mapping), just proxy directly
       if (!mapping.front_uri && !mapping.back_uri) {
-        const target = `http://localhost:${mapping.back_port}`;
+        const backend = mapping.backend || 'http://localhost';
+        const target = `${backend}:${mapping.back_port}`;
         this.proxy.web(req, res, {
           target: target,
           secure: false,
@@ -220,7 +221,8 @@ class ProxyServer {
 
       // For simple port forwarding (no URI mapping), just proxy directly
       if (!mapping.front_uri && !mapping.back_uri) {
-        const target = `http://localhost:${mapping.back_port}`;
+        const backend = mapping.backend || 'http://localhost';
+        const target = `${backend}:${mapping.back_port}`;
         this.proxy.ws(req, socket, head, {
           target: target,
           secure: false,
@@ -279,7 +281,8 @@ class ProxyServer {
       targetPath = '/' + targetPath;
     }
     
-    return `http://localhost:${mapping.back_port}${targetPath}`;
+    const backend = mapping.backend || 'http://localhost';
+    return `${backend}:${mapping.back_port}${targetPath}`;
   }
 
   async stop() {
