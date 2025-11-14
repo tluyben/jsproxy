@@ -161,28 +161,62 @@ class CertificateManager {
       // Parse certificate to check expiry
       const certString = certPem.toString();
       const cert = forge.pki.certificateFromPem(certString);
-      
+
       const now = new Date();
       const notAfter = new Date(cert.validity.notAfter);
       const notBefore = new Date(cert.validity.notBefore);
-      
+
       // Check if certificate is currently valid
       if (now < notBefore || now > notAfter) {
         this.logger.warn(`Certificate expired or not yet valid. Valid from ${notBefore} to ${notAfter}`);
         return false;
       }
-      
+
       // Check if certificate expires in next 30 days (renew early)
       const thirtyDaysFromNow = new Date(now.getTime() + (30 * 24 * 60 * 60 * 1000));
       if (notAfter < thirtyDaysFromNow) {
         this.logger.info(`Certificate expiring soon (${notAfter}), will renew`);
         return false; // Trigger renewal
       }
-      
+
       return true;
     } catch (error) {
       this.logger.error('Error checking certificate validity:', error);
       return false;
+    }
+  }
+
+  async isRealCertificate(certPem) {
+    try {
+      // Parse certificate to check if it's CA-signed (not self-signed)
+      const certString = certPem.toString();
+      const cert = forge.pki.certificateFromPem(certString);
+
+      // Self-signed certificates have subject === issuer
+      const subject = cert.subject.attributes;
+      const issuer = cert.issuer.attributes;
+
+      // Check if subject and issuer are different (CA-signed)
+      // For self-signed certs, they will be identical
+      const subjectStr = subject.map(attr => `${attr.name}=${attr.value}`).sort().join(',');
+      const issuerStr = issuer.map(attr => `${attr.name}=${attr.value}`).sort().join(',');
+
+      if (subjectStr === issuerStr) {
+        // Self-signed certificate
+        return false;
+      }
+
+      // Additionally check for our test self-signed markers
+      const orgName = subject.find(attr => attr.name === 'organizationName');
+      if (orgName && orgName.value === 'Test') {
+        return false; // Our self-signed cert
+      }
+
+      // This is a CA-signed certificate (like Let's Encrypt)
+      return true;
+    } catch (error) {
+      this.logger.error('Error checking if certificate is real:', error);
+      return false; // Assume self-signed on error
     }
   }
 
@@ -336,14 +370,56 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   async ensureCertificate(domain, isDomainValidated = false) {
-    // Return cached certificate if available
-    if (this.certificates.has(domain)) {
-      return this.certificates.get(domain);
+    // ALWAYS check disk first for real certificates - don't trust cache blindly
+    // This prevents serving stale self-signed certs when valid ones exist on disk
+    const certPath = path.join(this.certsDir, `${domain}.crt`);
+    const keyPath = path.join(this.certsDir, `${domain}.key`);
+
+    try {
+      const cert = await fs.readFile(certPath);
+      const key = await fs.readFile(keyPath);
+
+      if (await this.isCertificateValid(cert)) {
+        // Check if this is a real (CA-signed) certificate vs self-signed
+        const isRealCert = await this.isRealCertificate(cert);
+
+        // If we have a real cert on disk, ALWAYS use it and update cache
+        if (isRealCert) {
+          this.certificates.set(domain, { cert, key });
+          this.logger.info(`Using valid CA-signed certificate from disk for domain: ${domain}`);
+          return { cert, key };
+        }
+
+        // If disk has self-signed but cache has something, check if cache is better
+        if (this.certificates.has(domain)) {
+          const cached = this.certificates.get(domain);
+          const cachedIsReal = await this.isRealCertificate(cached.cert);
+          if (cachedIsReal) {
+            // Cache has real cert, disk has self-signed - use cache
+            return cached;
+          }
+        }
+
+        // Both are self-signed or only disk exists - use disk version
+        this.certificates.set(domain, { cert, key });
+        return { cert, key };
+      }
+    } catch (error) {
+      // Certificate doesn't exist on disk, check cache
+      if (this.certificates.has(domain)) {
+        const cached = this.certificates.get(domain);
+        // Only use cached if it's valid
+        if (await this.isCertificateValid(cached.cert)) {
+          return cached;
+        }
+        // Cached cert is invalid, remove it
+        this.certificates.delete(domain);
+      }
     }
 
     const mainDomain = this.getMainDomain(domain);
     const isSubdomain = this.isSubdomain(domain);
-    
+
     // If this is a subdomain, check if we have a wildcard cert for the main domain
     if (isSubdomain && isDomainValidated) {
       const wildcardCert = await this.getWildcardCertificate(mainDomain);
@@ -352,29 +428,13 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         this.certificates.set(domain, wildcardCert);
         return wildcardCert;
       }
-      
+
       // Check if main domain exists in database
       const mainDomainMapping = await this.db.getMapping(mainDomain, '/');
       if (mainDomainMapping) {
         this.logger.info(`Main domain ${mainDomain} exists in DB - will request wildcard certificate`);
         // Continue to request wildcard cert below
       }
-    }
-
-    // Check if certificate exists on disk
-    try {
-      const certPath = path.join(this.certsDir, `${domain}.crt`);
-      const keyPath = path.join(this.certsDir, `${domain}.key`);
-      const cert = await fs.readFile(certPath);
-      const key = await fs.readFile(keyPath);
-      
-      if (await this.isCertificateValid(cert)) {
-        this.certificates.set(domain, { cert, key });
-        this.logger.info(`Loaded certificate from disk for domain: ${domain}`);
-        return { cert, key };
-      }
-    } catch (error) {
-      // Certificate doesn't exist or is invalid, continue to obtain new one
     }
 
     // Only generate certificates for validated domains
