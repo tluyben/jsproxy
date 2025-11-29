@@ -386,7 +386,7 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         // If we have a real cert on disk, ALWAYS use it and update cache
         if (isRealCert) {
           this.certificates.set(domain, { cert, key });
-          this.logger.info(`Using valid CA-signed certificate from disk for domain: ${domain}`);
+          //this.logger.info(`Using valid CA-signed certificate from disk for domain: ${domain}`);
           return { cert, key };
         }
 
