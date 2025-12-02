@@ -150,7 +150,13 @@ class ProxyServer {
       }
 
       // Redirect HTTP to HTTPS if FORCE_HTTPS is enabled
-      if (!isHttps && process.env.FORCE_HTTPS === 'true') {
+      // Check multiple headers set by reverse proxies (nginx, caddy, cloudflare, haproxy, etc.)
+      const isSecure = isHttps ||
+        req.connection.encrypted ||
+        req.headers['x-forwarded-proto'] === 'https' ||
+        req.headers['x-forwarded-ssl'] === 'on' ||
+        req.headers['front-end-https'] === 'on';
+      if (!isSecure && process.env.FORCE_HTTPS === 'true') {
         const host = req.headers.host;
         const httpsPort = process.env.HTTPS_PORT || (process.env.NODE_ENV === 'production' ? 443 : 8443);
         const hostWithoutPort = host ? host.split(':')[0] : '';
