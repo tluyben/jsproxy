@@ -149,6 +149,18 @@ class ProxyServer {
         return;
       }
 
+      // Redirect HTTP to HTTPS if FORCE_HTTPS is enabled
+      if (!isHttps && process.env.FORCE_HTTPS === 'true') {
+        const host = req.headers.host;
+        const httpsPort = process.env.HTTPS_PORT || (process.env.NODE_ENV === 'production' ? 443 : 8443);
+        const hostWithoutPort = host ? host.split(':')[0] : '';
+        const portSuffix = httpsPort === 443 || httpsPort === '443' ? '' : `:${httpsPort}`;
+        const redirectUrl = `https://${hostWithoutPort}${portSuffix}${req.url}`;
+        res.writeHead(301, { 'Location': redirectUrl });
+        res.end();
+        return;
+      }
+
       const host = req.headers.host;
       if (!host) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
