@@ -1,3 +1,4 @@
+require('dotenv').config();
 const cluster = require('cluster');
 const numCPUs = require('os').cpus().length;
 const winston = require('winston');

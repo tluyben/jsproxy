@@ -8,7 +8,7 @@
     "dev": "node --watch index.js",
     "dev:80": "HTTP_PORT=80 HTTPS_PORT=443 ENABLE_HTTPS=false npm run dev",
     "dev:443": "HTTP_PORT=80 HTTPS_PORT=443 ENABLE_HTTPS=true npm run dev",
-    "dev:custom": "HTTP_PORT=3000 HTTPS_PORT=3443 ENABLE_HTTPS=false npm run dev", 
+    "dev:custom": "HTTP_PORT=3000 HTTPS_PORT=3443 ENABLE_HTTPS=false npm run dev",
     "start:prod": "NODE_ENV=production HTTP_PORT=80 HTTPS_PORT=443 ENABLE_HTTPS=true npm start",
     "test": "jest",
     "test:watch": "jest --watch",
@@ -29,21 +29,22 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "acme-client": "^5.3.0",
+    "dotenv": "^17.3.1",
     "http-proxy": "^1.18.1",
     "sqlite3": "^5.1.6",
-    "acme-client": "^5.3.0",
     "uuid": "^9.0.1",
     "winston": "^3.11.0"
   },
   "devDependencies": {
-    "jest": "^29.7.0",
-    "supertest": "^6.3.3",
-    "ws": "^8.14.2",
     "eslint": "^8.57.0",
     "eslint-config-standard": "^17.1.0",
     "eslint-plugin-import": "^2.29.1",
     "eslint-plugin-n": "^16.6.2",
-    "eslint-plugin-promise": "^6.1.1"
+    "eslint-plugin-promise": "^6.1.1",
+    "jest": "^29.7.0",
+    "supertest": "^6.3.3",
+    "ws": "^8.14.2"
   },
   "engines": {
     "node": ">=20.0.0"

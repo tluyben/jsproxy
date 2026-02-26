@@ -7,7 +7,7 @@ class DatabaseManager {
   constructor(logger) {
     this.logger = logger;
     this.db = null;
-    this.dbPath = './data/current.db';
+    this.dbPath = process.env.DB_PATH || './data/current.db';
   }
 
   async initialize() {

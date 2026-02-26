@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const { execSync } = require('child_process');
 
-const dbPath = path.join(__dirname, '..', 'data', 'current.db');
+const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'current.db');
 
 function printUsage() {
   console.log(`
