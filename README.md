@@ -72,6 +72,8 @@ HTTPS_PORT=8443                    # HTTPS port (default: 8443 dev, 443 prod)
 HTTP_HOST=0.0.0.0                  # Bind address (default: 0.0.0.0)
 ENABLE_HTTPS=true|false            # Enable HTTPS (default: false dev, true prod)
 DB_PATH=./data/current.db         # Path to SQLite database file
+CACHE_HEADERS=true|false           # Inject Cache-Control headers on GET responses (default: false)
+CACHE_EXPIRY=60                    # Cache expiry in minutes; omit or -1 for aggressive infinite cache
 ```
 
 ## Configuration
@@ -279,6 +281,8 @@ NODE_ENV=production        # Environment mode
 LOG_LEVEL=info            # Logging level
 HTTP_HOST=0.0.0.0         # Bind address (default: 0.0.0.0)
 DB_PATH=./data/current.db # Path to SQLite database file
+CACHE_HEADERS=true|false  # Inject Cache-Control headers on GET responses (default: false)
+CACHE_EXPIRY=60           # Cache expiry in minutes; omit or -1 for aggressive infinite cache
 ACME_DIRECTORY_URL=...    # ACME server URL (defaults to Let's Encrypt)
 ```
 

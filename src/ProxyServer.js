@@ -41,6 +41,20 @@ class ProxyServer {
       // X-Forwarded-For is handled by xfwd: true
     });
     
+    this.proxy.on('proxyRes', (proxyRes, req, res) => {
+      if (req.method === 'GET' && process.env.CACHE_HEADERS === 'true') {
+        const expiry = process.env.CACHE_EXPIRY;
+        const infinite = !expiry || expiry === '-1';
+        const cacheControl = infinite
+          ? 'public, max-age=31536000, immutable'
+          : `public, max-age=${parseInt(expiry, 10) * 60}`;
+        proxyRes.headers['cache-control'] = cacheControl;
+        if (infinite) {
+          proxyRes.headers['expires'] = 'Thu, 31 Dec 2099 23:59:59 GMT';
+        }
+      }
+    });
+
     this.proxy.on('error', (err, req, res) => {
       this.logger.error('Proxy error:', err);
       if (res && !res.headersSent) {
