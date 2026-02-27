@@ -68,6 +68,7 @@ class ProxyServer {
     const isProduction = process.env.NODE_ENV === 'production';
     const httpPort = process.env.HTTP_PORT || (isProduction ? 80 : 8080);
     const httpsPort = process.env.HTTPS_PORT || (isProduction ? 443 : 8443);
+    const httpHost = process.env.HTTP_HOST || '0.0.0.0';
     const enableHttps = process.env.ENABLE_HTTPS !== 'false' && (isProduction || process.env.ENABLE_HTTPS === 'true');
 
     this.httpServer = http.createServer((req, res) => {
@@ -79,8 +80,8 @@ class ProxyServer {
     });
 
     await new Promise((resolve) => {
-      this.httpServer.listen(httpPort, () => {
-        this.logger.info(`HTTP server listening on port ${httpPort}`);
+      this.httpServer.listen(httpPort, httpHost, () => {
+        this.logger.info(`HTTP server listening on ${httpHost}:${httpPort}`);
         resolve();
       });
     });
@@ -111,8 +112,8 @@ class ProxyServer {
         });
         
         await new Promise((resolve) => {
-          this.httpsServer.listen(httpsPort, () => {
-            this.logger.info(`HTTPS server listening on port ${httpsPort}`);
+          this.httpsServer.listen(httpsPort, httpHost, () => {
+            this.logger.info(`HTTPS server listening on ${httpHost}:${httpsPort}`);
             resolve();
           });
         });

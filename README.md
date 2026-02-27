@@ -68,8 +68,10 @@ The proxy server supports flexible port configuration through environment variab
 ```bash
 NODE_ENV=development|production    # Environment mode
 HTTP_PORT=8080                     # HTTP port (default: 8080 dev, 80 prod)
-HTTPS_PORT=8443                    # HTTPS port (default: 8443 dev, 443 prod)  
-ENABLE_HTTPS=true|false           # Enable HTTPS (default: false dev, true prod)
+HTTPS_PORT=8443                    # HTTPS port (default: 8443 dev, 443 prod)
+HTTP_HOST=0.0.0.0                  # Bind address (default: 0.0.0.0)
+ENABLE_HTTPS=true|false            # Enable HTTPS (default: false dev, true prod)
+DB_PATH=./data/current.db         # Path to SQLite database file
 ```
 
 ## Configuration
@@ -275,6 +277,8 @@ Master Process
 ```bash
 NODE_ENV=production        # Environment mode
 LOG_LEVEL=info            # Logging level
+HTTP_HOST=0.0.0.0         # Bind address (default: 0.0.0.0)
+DB_PATH=./data/current.db # Path to SQLite database file
 ACME_DIRECTORY_URL=...    # ACME server URL (defaults to Let's Encrypt)
 ```
 
