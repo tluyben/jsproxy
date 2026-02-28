@@ -18,6 +18,8 @@ class CertificateManager {
     this.lastCertRequest = new Map(); // Track last cert request time per domain
     this.certRequestCount = new Map(); // Track request count per domain
     this.wildcardCerts = new Map(); // Track wildcard certificates
+    this.acmeCapable = new Map(); // Cache HTTP-01 reachability test results per domain
+    this.testChallenges = new Map(); // In-flight test challenge tokens
   }
 
   async initialize() {
@@ -397,6 +399,14 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return cert;
     }
 
+    // Test HTTP-01 reachability before attempting ACME
+    const capable = await this.testAcmeCapability(domain);
+    if (!capable) {
+      const cert = await this.generateSelfSignedCertificate(domain);
+      this.certificates.set(domain, cert);
+      return cert;
+    }
+
     // Rate limiting - prevent too many requests for same domain
     const now = Date.now();
     const lastRequest = this.lastCertRequest.get(domain) || 0;
@@ -404,13 +414,17 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
 
     if (timeSinceLastRequest < 5 * 60 * 1000) {
       this.logger.warn(`Rate limit: Too soon to request certificate for ${domain} (${Math.round(timeSinceLastRequest/1000)}s since last request)`);
-      return await this.generateSelfSignedCertificate(domain);
+      const cert = await this.generateSelfSignedCertificate(domain);
+      this.certificates.set(domain, cert);
+      return cert;
     }
 
     const requestCount = this.certRequestCount.get(domain) || 0;
     if (requestCount >= 5) {
       this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
-      return await this.generateSelfSignedCertificate(domain);
+      const cert = await this.generateSelfSignedCertificate(domain);
+      this.certificates.set(domain, cert);
+      return cert;
     }
 
     if (this.processingDomains.has(domain)) {
@@ -594,6 +608,53 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
 
     return null;
+  }
+
+  getTestChallenge(token) {
+    return this.testChallenges.get(token) || null;
+  }
+
+  async testAcmeCapability(domain) {
+    if (this.acmeCapable.has(domain)) {
+      return this.acmeCapable.get(domain);
+    }
+
+    const token = crypto.randomBytes(16).toString('hex');
+    const value = crypto.randomBytes(16).toString('hex');
+    this.testChallenges.set(token, value);
+
+    let capable = false;
+    try {
+      const http = require('http');
+      const result = await new Promise((resolve) => {
+        const req = http.get(
+          `http://${domain}/.well-known/test-challenge/${token}`,
+          { timeout: 5000 },
+          (res) => {
+            let body = '';
+            res.on('data', chunk => body += chunk);
+            res.on('end', () => resolve({ status: res.statusCode, body }));
+          }
+        );
+        req.on('error', () => resolve({ status: 0, body: '' }));
+        req.on('timeout', () => { req.destroy(); resolve({ status: 0, body: '' }); });
+      });
+
+      capable = result.status === 200 && result.body === value;
+    } catch (e) {
+      capable = false;
+    } finally {
+      this.testChallenges.delete(token);
+    }
+
+    if (capable) {
+      this.logger.info(`ACME HTTP-01 reachability confirmed for ${domain}`);
+    } else {
+      this.logger.warn(`ACME HTTP-01 not reachable for ${domain} — will use self-signed certificate permanently`);
+    }
+
+    this.acmeCapable.set(domain, capable);
+    return capable;
   }
 
   async waitForCertificateProcessing(domain, maxWait = 30000) {

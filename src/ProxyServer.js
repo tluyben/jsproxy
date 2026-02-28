@@ -150,6 +150,20 @@ class ProxyServer {
         return;
       }
 
+      // Handle ACME reachability test — DO NOT proxy these
+      if (req.url && req.url.startsWith('/.well-known/test-challenge/')) {
+        const token = req.url.split('/').pop();
+        const value = this.certManager.getTestChallenge(token);
+        if (value) {
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(value);
+        } else {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not found');
+        }
+        return;
+      }
+
       // Handle ACME challenges - DO NOT proxy these
       if (req.url && req.url.startsWith('/.well-known/acme-challenge/')) {
         const token = req.url.split('/').pop();
