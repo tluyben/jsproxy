@@ -35,20 +35,6 @@ class CertificateManager {
     }
   }
 
-  async acquireLock(lockPath, timeout = 5000) {
-    const startTime = Date.now();
-    while (Date.now() - startTime < timeout) {
-      try {
-        // Try to create lock file (will fail if exists)
-        await fs.writeFile(lockPath, process.pid.toString(), { flag: 'wx' });
-        return true;
-      } catch (error) {
-        // Lock exists, wait and retry
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-    }
-    return false;
-  }
 
   async initializeAcmeClient() {
     try {
@@ -72,55 +58,13 @@ class CertificateManager {
         accountKey: this.accountKey
       });
 
-      // Check if we've already registered this account key
-      const accountRegisteredPath = path.join(this.certsDir, '.account-registered');
-      
-      try {
-        await fs.access(accountRegisteredPath);
-        // Account already registered, just use it
-        this.logger.info('ACME account already registered - reusing');
-      } catch (error) {
-        // Need to register account with ACME server
-        const lockPath = path.join(this.certsDir, '.account-create.lock');
-        const hasLock = await this.acquireLock(lockPath, 5000);
-        
-        if (hasLock) {
-          try {
-            // Double check the flag file
-            try {
-              await fs.access(accountRegisteredPath);
-              this.logger.info('Account was just registered by another worker');
-            } catch (e) {
-              // Really need to create
-              this.logger.info('Registering ACME account (one time only)');
-              await this.acmeClient.createAccount({
-                termsOfServiceAgreed: true,
-                contact: []
-              });
-              
-              // Mark as registered
-              await fs.writeFile(accountRegisteredPath, new Date().toISOString());
-              this.logger.info('ACME account registered successfully');
-            }
-          } finally {
-            await fs.unlink(lockPath).catch(() => {});
-          }
-        } else {
-          // Another worker is creating, wait for the flag file
-          this.logger.info('Waiting for another worker to register account');
-          let attempts = 20;
-          while (attempts > 0) {
-            try {
-              await fs.access(accountRegisteredPath);
-              this.logger.info('Account registered by another worker');
-              break;
-            } catch (e) {
-              attempts--;
-              await new Promise(resolve => setTimeout(resolve, 100));
-            }
-          }
-        }
-      }
+      // createAccount is idempotent — returns existing account if already registered,
+      // and crucially sets the account URL on this client instance (required for createOrder)
+      await this.acmeClient.createAccount({
+        termsOfServiceAgreed: true,
+        contact: []
+      });
+      this.logger.info('ACME account ready');
     } catch (error) {
       this.logger.error('Failed to initialize ACME client:', error);
       this.acmeClient = null;
