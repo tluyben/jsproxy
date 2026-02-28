@@ -492,10 +492,14 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
 
     // Check memory cache first
     if (this.wildcardCerts.has(mainDomain)) {
-      return this.wildcardCerts.get(mainDomain);
+      const cached = this.wildcardCerts.get(mainDomain);
+      if (await this.isCertificateValid(cached.cert)) {
+        return cached;
+      }
+      this.wildcardCerts.delete(mainDomain);
     }
 
-    // Check disk for wildcard cert
+    // Check disk for existing valid cert
     try {
       const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
       const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
@@ -518,34 +522,75 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return cert;
     }
 
-    const now = Date.now();
-    const lastRequest = this.lastCertRequest.get(wildcardDomain) || 0;
-    const timeSinceLastRequest = now - lastRequest;
-
-    if (timeSinceLastRequest < 5 * 60 * 1000) {
-      this.logger.warn(`Rate limit: Too soon to request wildcard certificate for ${wildcardDomain} (${Math.round(timeSinceLastRequest/1000)}s since last request)`);
+    if (!this.acmeClient) {
+      this.logger.warn(`ACME client not available for ${wildcardDomain} - using self-signed`);
       return await this.generateSelfSignedCertificate(wildcardDomain);
     }
 
-    const requestCount = this.certRequestCount.get(wildcardDomain) || 0;
-    if (requestCount >= 5) {
-      this.logger.error(`Rate limit: Too many wildcard certificate requests for ${wildcardDomain} this week`);
-      return await this.generateSelfSignedCertificate(wildcardDomain);
+    // Load or create pending DNS-01 order
+    const pendingFile = path.join(this.certsDir, `wildcard.${mainDomain}.pending.json`);
+    let pending = null;
+
+    try {
+      const data = await fs.readFile(pendingFile, 'utf8');
+      pending = JSON.parse(data);
+      if (new Date(pending.expiresAt) < new Date()) {
+        this.logger.info(`Pending wildcard order for ${wildcardDomain} expired, creating new one`);
+        pending = null;
+        await fs.unlink(pendingFile).catch(() => {});
+      }
+    } catch (e) {
+      // No pending file yet
     }
 
+    if (!pending) {
+      if (this.processingDomains.has(wildcardDomain)) {
+        await this.waitForCertificateProcessing(wildcardDomain);
+        return this.wildcardCerts.get(mainDomain) || await this.generateSelfSignedCertificate(wildcardDomain);
+      }
+      this.processingDomains.add(wildcardDomain);
+      try {
+        pending = await this.createWildcardOrder(mainDomain);
+        await fs.writeFile(pendingFile, JSON.stringify(pending, null, 2));
+      } catch (e) {
+        this.logger.error(`Failed to create wildcard ACME order for ${wildcardDomain}:`, e);
+        return await this.generateSelfSignedCertificate(wildcardDomain);
+      } finally {
+        this.processingDomains.delete(wildcardDomain);
+      }
+    }
+
+    // Check if the DNS TXT record has been set
+    const isReady = await this.checkDnsTxtRecord(pending.txtRecordName, pending.txtRecordValue);
+
+    if (!isReady) {
+      this.logger.error(
+        `[ACTION REQUIRED] Add this DNS TXT record to get a wildcard certificate for ${wildcardDomain}:\n` +
+        `  Name:  ${pending.txtRecordName}\n` +
+        `  Value: ${pending.txtRecordValue}`
+      );
+      const cert = await this.generateSelfSignedCertificate(wildcardDomain);
+      this.wildcardCerts.set(mainDomain, cert);
+      return cert;
+    }
+
+    // DNS record is in place — complete the order
     if (this.processingDomains.has(wildcardDomain)) {
       await this.waitForCertificateProcessing(wildcardDomain);
       return this.wildcardCerts.get(mainDomain) || await this.generateSelfSignedCertificate(wildcardDomain);
     }
 
     this.processingDomains.add(wildcardDomain);
-    this.lastCertRequest.set(wildcardDomain, now);
-    this.certRequestCount.set(wildcardDomain, requestCount + 1);
-
     try {
-      const certificate = await this.obtainWildcardCertificate(mainDomain);
+      const certificate = await this.completePendingWildcardOrder(mainDomain, pending);
       this.wildcardCerts.set(mainDomain, certificate);
+      await fs.unlink(pendingFile).catch(() => {});
       return certificate;
+    } catch (e) {
+      this.logger.error(`Failed to complete wildcard order for ${wildcardDomain}:`, e);
+      // Remove pending so a fresh order is created next time
+      await fs.unlink(pendingFile).catch(() => {});
+      return await this.generateSelfSignedCertificate(wildcardDomain);
     } finally {
       this.processingDomains.delete(wildcardDomain);
     }
@@ -663,51 +708,66 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
   }
 
-  async obtainWildcardCertificate(mainDomain) {
-    this.logger.info(`Obtaining wildcard certificate for domain: *.${mainDomain}`);
+  async createWildcardOrder(mainDomain) {
+    this.logger.info(`Creating wildcard ACME order for *.${mainDomain}`);
 
-    if (!this.acmeClient) {
-      this.logger.warn(`ACME client not available, generating self-signed certificate for *.${mainDomain}`);
-      return await this.generateSelfSignedCertificate(`*.${mainDomain}`);
+    const order = await this.acmeClient.createOrder({
+      identifiers: [{ type: 'dns', value: `*.${mainDomain}` }]
+    });
+
+    const authorizations = await this.acmeClient.getAuthorizations(order);
+
+    for (const authz of authorizations) {
+      const challenge = authz.challenges.find(c => c.type === 'dns-01');
+      if (challenge) {
+        const txtValue = await this.acmeClient.getChallengeKeyAuthorization(challenge);
+        return {
+          mainDomain,
+          txtRecordName: `_acme-challenge.${mainDomain}`,
+          txtRecordValue: txtValue,
+          createdAt: new Date().toISOString(),
+          expiresAt: order.expires || new Date(Date.now() + 6 * 24 * 60 * 60 * 1000).toISOString(),
+          order: { url: order.url, finalize: order.finalize },
+          authz: { url: authz.url, identifier: authz.identifier },
+          challenge: { type: challenge.type, url: challenge.url, token: challenge.token, status: challenge.status }
+        };
+      }
     }
 
+    throw new Error(`No dns-01 challenge found for *.${mainDomain}`);
+  }
+
+  async checkDnsTxtRecord(recordName, expectedValue) {
     try {
-      const wildcardDomain = `*.${mainDomain}`;
-      const requestDomains = [wildcardDomain];
-      const certFilename = `wildcard.${mainDomain}`;
-
-      const privateKey = await acme.forge.createPrivateKey();
-
-      const [key, csr] = await acme.forge.createCsr({
-        commonName: wildcardDomain,
-        altNames: requestDomains
-      }, privateKey);
-
-      const cert = await this.acmeClient.auto({
-        csr,
-        email: null,
-        termsOfServiceAgreed: true,
-        challengeCreateFn: this.challengeCreateFn.bind(this),
-        challengeRemoveFn: this.challengeRemoveFn.bind(this)
-      });
-
-      const certPath = path.join(this.certsDir, `${certFilename}.crt`);
-      const keyPath = path.join(this.certsDir, `${certFilename}.key`);
-
-      await fs.writeFile(certPath, cert);
-      await fs.writeFile(keyPath, key);
-
-      this.logger.info(`Wildcard certificate obtained and saved: ${certFilename} for domain: *.${mainDomain}`);
-
-      const certificate = { cert: Buffer.from(cert), key: Buffer.from(key) };
-
-      return certificate;
-    } catch (error) {
-      this.logger.error(`Failed to obtain wildcard certificate for *.${mainDomain}:`, error);
-
-      this.logger.info(`Falling back to self-signed certificate for *.${mainDomain}`);
-      return await this.generateSelfSignedCertificate(`*.${mainDomain}`);
+      const output = execSync(`dig +short TXT ${recordName}`, { timeout: 5000 }).toString();
+      return output.includes(`"${expectedValue}"`);
+    } catch (e) {
+      return false;
     }
+  }
+
+  async completePendingWildcardOrder(mainDomain, pending) {
+    this.logger.info(`DNS record verified — completing wildcard ACME order for *.${mainDomain}`);
+
+    const privateKey = await acme.forge.createPrivateKey();
+    const [key, csr] = await acme.forge.createCsr({
+      commonName: `*.${mainDomain}`,
+      altNames: [`*.${mainDomain}`]
+    }, privateKey);
+
+    await this.acmeClient.completeChallenge(pending.challenge);
+    await this.acmeClient.waitForValidStatus(pending.authz);
+
+    const finalizedOrder = await this.acmeClient.finalizeOrder(pending.order, csr);
+    const cert = await this.acmeClient.getCertificate(finalizedOrder);
+
+    const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
+    const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
+    await fs.writeFile(certPath, cert);
+    await fs.writeFile(keyPath, key);
+
+    this.logger.info(`Wildcard certificate obtained and saved for *.${mainDomain}`);
+    return { cert: Buffer.from(cert), key: Buffer.from(key) };
   }
 
   async getChallenge(token) {
