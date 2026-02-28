@@ -90,6 +90,7 @@ describe('CertificateManager', () => {
     
     const mockCert = { cert: 'existing-cert', key: 'existing-key' };
     certManager.certificates.set('example.com', mockCert);
+    jest.spyOn(certManager, 'isCertificateValid').mockResolvedValue(true);
     
     const certificate = await certManager.ensureCertificate('example.com');
     expect(certificate).toBe(mockCert);

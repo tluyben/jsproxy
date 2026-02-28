@@ -370,8 +370,25 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   async ensureCertificate(domain, isDomainValidated = false) {
-    // ALWAYS check disk first for real certificates - don't trust cache blindly
-    // This prevents serving stale self-signed certs when valid ones exist on disk
+    // If domain is a wildcard pattern (e.g., *.example.com), handle directly
+    if (domain.startsWith('*.')) {
+      const mainDomain = domain.replace('*.', '');
+      return await this.ensureWildcardCertificate(mainDomain, isDomainValidated);
+    }
+
+    // Check memory cache first
+    if (this.certificates.has(domain)) {
+      const cached = this.certificates.get(domain);
+      try {
+        if (await this.isCertificateValid(cached.cert)) {
+          return cached;
+        }
+      } catch (error) {
+        this.logger.warn(`Invalid cached certificate for ${domain}, removing from cache`);
+      }
+      this.certificates.delete(domain);
+    }
+
     const certPath = path.join(this.certsDir, `${domain}.crt`);
     const keyPath = path.join(this.certsDir, `${domain}.key`);
 
@@ -380,39 +397,30 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       const key = await fs.readFile(keyPath);
 
       if (await this.isCertificateValid(cert)) {
-        // Check if this is a real (CA-signed) certificate vs self-signed
         const isRealCert = await this.isRealCertificate(cert);
 
-        // If we have a real cert on disk, ALWAYS use it and update cache
         if (isRealCert) {
           this.certificates.set(domain, { cert, key });
-          //this.logger.info(`Using valid CA-signed certificate from disk for domain: ${domain}`);
           return { cert, key };
         }
 
-        // If disk has self-signed but cache has something, check if cache is better
         if (this.certificates.has(domain)) {
           const cached = this.certificates.get(domain);
           const cachedIsReal = await this.isRealCertificate(cached.cert);
           if (cachedIsReal) {
-            // Cache has real cert, disk has self-signed - use cache
             return cached;
           }
         }
 
-        // Both are self-signed or only disk exists - use disk version
         this.certificates.set(domain, { cert, key });
         return { cert, key };
       }
     } catch (error) {
-      // Certificate doesn't exist on disk, check cache
       if (this.certificates.has(domain)) {
         const cached = this.certificates.get(domain);
-        // Only use cached if it's valid
         if (await this.isCertificateValid(cached.cert)) {
           return cached;
         }
-        // Cached cert is invalid, remove it
         this.certificates.delete(domain);
       }
     }
@@ -421,40 +429,33 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     const isSubdomain = this.isSubdomain(domain);
 
     // If this is a subdomain, check if we have a wildcard cert for the main domain
-    if (isSubdomain && isDomainValidated) {
+    if (isSubdomain) {
       const wildcardCert = await this.getWildcardCertificate(mainDomain);
       if (wildcardCert) {
         this.logger.info(`Using wildcard certificate for ${domain} from *.${mainDomain}`);
         this.certificates.set(domain, wildcardCert);
         return wildcardCert;
       }
-
-      // Check if main domain exists in database
-      const mainDomainMapping = await this.db.getMapping(mainDomain, '/');
-      if (mainDomainMapping) {
-        this.logger.info(`Main domain ${mainDomain} exists in DB - will request wildcard certificate`);
-        // Continue to request wildcard cert below
-      }
     }
 
     // Only generate certificates for validated domains
     if (!isDomainValidated) {
       this.logger.warn(`Domain ${domain} not validated - using self-signed certificate`);
-      return await this.generateSelfSignedCertificate(domain);
+      const cert = await this.generateSelfSignedCertificate(domain);
+      this.certificates.set(domain, cert);
+      return cert;
     }
 
     // Rate limiting - prevent too many requests for same domain
     const now = Date.now();
     const lastRequest = this.lastCertRequest.get(domain) || 0;
     const timeSinceLastRequest = now - lastRequest;
-    
-    // Limit: max 1 request per domain per 5 minutes
+
     if (timeSinceLastRequest < 5 * 60 * 1000) {
       this.logger.warn(`Rate limit: Too soon to request certificate for ${domain} (${Math.round(timeSinceLastRequest/1000)}s since last request)`);
       return await this.generateSelfSignedCertificate(domain);
     }
 
-    // Track daily request count (Let's Encrypt limit: 5 duplicate certs per week)
     const requestCount = this.certRequestCount.get(domain) || 0;
     if (requestCount >= 5) {
       this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
@@ -476,6 +477,70 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return certificate;
     } finally {
       this.processingDomains.delete(domain);
+    }
+  }
+
+  async ensureWildcardCertificate(mainDomain, isDomainValidated = false) {
+    const wildcardDomain = `*.${mainDomain}`;
+
+    // Check memory cache first
+    if (this.wildcardCerts.has(mainDomain)) {
+      return this.wildcardCerts.get(mainDomain);
+    }
+
+    // Check disk for wildcard cert
+    try {
+      const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
+      const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
+      const cert = await fs.readFile(certPath);
+      const key = await fs.readFile(keyPath);
+
+      if (await this.isCertificateValid(cert)) {
+        const certificate = { cert, key };
+        this.wildcardCerts.set(mainDomain, certificate);
+        this.logger.info(`Using cached wildcard certificate for ${wildcardDomain}`);
+        return certificate;
+      }
+    } catch (error) {
+    }
+
+    if (!isDomainValidated) {
+      this.logger.warn(`Wildcard domain ${wildcardDomain} not validated - using self-signed certificate`);
+      const cert = await this.generateSelfSignedCertificate(wildcardDomain);
+      this.wildcardCerts.set(mainDomain, cert);
+      return cert;
+    }
+
+    const now = Date.now();
+    const lastRequest = this.lastCertRequest.get(wildcardDomain) || 0;
+    const timeSinceLastRequest = now - lastRequest;
+
+    if (timeSinceLastRequest < 5 * 60 * 1000) {
+      this.logger.warn(`Rate limit: Too soon to request wildcard certificate for ${wildcardDomain} (${Math.round(timeSinceLastRequest/1000)}s since last request)`);
+      return await this.generateSelfSignedCertificate(wildcardDomain);
+    }
+
+    const requestCount = this.certRequestCount.get(wildcardDomain) || 0;
+    if (requestCount >= 5) {
+      this.logger.error(`Rate limit: Too many wildcard certificate requests for ${wildcardDomain} this week`);
+      return await this.generateSelfSignedCertificate(wildcardDomain);
+    }
+
+    if (this.processingDomains.has(wildcardDomain)) {
+      await this.waitForCertificateProcessing(wildcardDomain);
+      return this.wildcardCerts.get(mainDomain) || await this.generateSelfSignedCertificate(wildcardDomain);
+    }
+
+    this.processingDomains.add(wildcardDomain);
+    this.lastCertRequest.set(wildcardDomain, now);
+    this.certRequestCount.set(wildcardDomain, requestCount + 1);
+
+    try {
+      const certificate = await this.obtainWildcardCertificate(mainDomain);
+      this.wildcardCerts.set(mainDomain, certificate);
+      return certificate;
+    } finally {
+      this.processingDomains.delete(wildcardDomain);
     }
   }
 
@@ -552,25 +617,17 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   async obtainCertificate(domain) {
     this.logger.info(`Obtaining certificate for domain: ${domain}`);
 
-    // If ACME client is not available, return self-signed certificate
     if (!this.acmeClient) {
       this.logger.warn(`ACME client not available, generating self-signed certificate for ${domain}`);
       return await this.generateSelfSignedCertificate(domain);
     }
 
     try {
-      const mainDomain = this.getMainDomain(domain);
-      const isSubdomain = this.isSubdomain(domain);
-      let requestDomains = [domain];
-      let certFilename = domain;
-      
-      // DO NOT REQUEST WILDCARDS - they require DNS-01 challenge which needs DNS API access
-      // Just request the specific domain
-      requestDomains = [domain];
-      certFilename = domain;
+      const requestDomains = [domain];
+      const certFilename = domain;
 
       const privateKey = await acme.forge.createPrivateKey();
-      
+
       const [key, csr] = await acme.forge.createCsr({
         commonName: requestDomains[0],
         altNames: requestDomains
@@ -593,20 +650,60 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       this.logger.info(`Certificate obtained and saved: ${certFilename} for domains: ${requestDomains.join(', ')}`);
 
       const certificate = { cert: Buffer.from(cert), key: Buffer.from(key) };
-      
-      // Cache wildcard cert if applicable
-      if (certFilename.startsWith('wildcard.')) {
-        const wildcardMainDomain = certFilename.replace('wildcard.', '').replace('.crt', '');
-        this.wildcardCerts.set(wildcardMainDomain, certificate);
-      }
 
       return certificate;
     } catch (error) {
       this.logger.error(`Failed to obtain certificate for ${domain}:`, error);
-      
-      // Fallback to self-signed certificate
+
       this.logger.info(`Falling back to self-signed certificate for ${domain}`);
       return await this.generateSelfSignedCertificate(domain);
+    }
+  }
+
+  async obtainWildcardCertificate(mainDomain) {
+    this.logger.info(`Obtaining wildcard certificate for domain: *.${mainDomain}`);
+
+    if (!this.acmeClient) {
+      this.logger.warn(`ACME client not available, generating self-signed certificate for *.${mainDomain}`);
+      return await this.generateSelfSignedCertificate(`*.${mainDomain}`);
+    }
+
+    try {
+      const wildcardDomain = `*.${mainDomain}`;
+      const requestDomains = [wildcardDomain];
+      const certFilename = `wildcard.${mainDomain}`;
+
+      const privateKey = await acme.forge.createPrivateKey();
+
+      const [key, csr] = await acme.forge.createCsr({
+        commonName: wildcardDomain,
+        altNames: requestDomains
+      }, privateKey);
+
+      const cert = await this.acmeClient.auto({
+        csr,
+        email: null,
+        termsOfServiceAgreed: true,
+        challengeCreateFn: this.challengeCreateFn.bind(this),
+        challengeRemoveFn: this.challengeRemoveFn.bind(this)
+      });
+
+      const certPath = path.join(this.certsDir, `${certFilename}.crt`);
+      const keyPath = path.join(this.certsDir, `${certFilename}.key`);
+
+      await fs.writeFile(certPath, cert);
+      await fs.writeFile(keyPath, key);
+
+      this.logger.info(`Wildcard certificate obtained and saved: ${certFilename} for domain: *.${mainDomain}`);
+
+      const certificate = { cert: Buffer.from(cert), key: Buffer.from(key) };
+
+      return certificate;
+    } catch (error) {
+      this.logger.error(`Failed to obtain wildcard certificate for *.${mainDomain}:`, error);
+
+      this.logger.info(`Falling back to self-signed certificate for *.${mainDomain}`);
+      return await this.generateSelfSignedCertificate(`*.${mainDomain}`);
     }
   }
 

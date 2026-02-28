@@ -148,8 +148,37 @@ class DatabaseManager {
         if (err) {
           this.logger.error('Error getting mapping:', err);
           reject(err);
+          return;
+        }
+
+        if (row) {
+          resolve(row);
+          return;
+        }
+
+        // No exact match, try wildcard match
+        const parts = domain.split('.');
+        if (parts.length > 1) {
+          parts.shift();
+          const wildcardDomain = `*.${parts.join('.')}`;
+
+          const wildcardSql = `
+            SELECT * FROM mappings 
+            WHERE domain = ? AND (? LIKE '/' || front_uri || '%' OR front_uri = '')
+            ORDER BY LENGTH(front_uri) DESC 
+            LIMIT 1
+          `;
+
+          this.db.get(wildcardSql, [wildcardDomain, requestUrl], (wildErr, wildcardRow) => {
+            if (wildErr) {
+              this.logger.error('Error getting wildcard mapping:', wildErr);
+              reject(wildErr);
+              return;
+            }
+            resolve(wildcardRow || null);
+          });
         } else {
-          resolve(row || null);
+          resolve(null);
         }
       });
     });
