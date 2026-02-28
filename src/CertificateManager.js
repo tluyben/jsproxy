@@ -508,14 +508,11 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     const isReady = await this.checkDnsTxtRecord(pending.txtRecordName, pending.txtRecordValue);
 
     if (!isReady) {
-      this.logger.error(
-        `[ACTION REQUIRED] Add this DNS TXT record to get a wildcard certificate for ${wildcardDomain}:\n` +
-        `  Name:  ${pending.txtRecordName}\n` +
-        `  Value: ${pending.txtRecordValue}`
-      );
-      const cert = await this.generateSelfSignedCertificate(wildcardDomain);
-      this.wildcardCerts.set(mainDomain, cert);
-      return cert;
+      this.logger.error(`[ACTION REQUIRED] Add this DNS TXT record to issue a wildcard certificate for ${wildcardDomain}:`);
+      this.logger.error(`  Type:  TXT`);
+      this.logger.error(`  Name:  _acme-challenge`);
+      this.logger.error(`  Value: ${pending.txtRecordValue}`);
+      return await this.generateSelfSignedCertificate(wildcardDomain);
     }
 
     // DNS record is in place — complete the order
