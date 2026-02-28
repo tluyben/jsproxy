@@ -351,8 +351,14 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         // Check if domain is in database
         const domainMapping = await this.db.getMapping(domain, '/');
         const isDomainValidated = domainMapping !== null;
-        
-        const certificate = await this.ensureCertificate(domain, isDomainValidated);
+
+        // If mapping is for a wildcard domain, use the wildcard certificate
+        let certDomain = domain;
+        if (domainMapping && domainMapping.domain.startsWith('*.') && !domain.startsWith('*')) {
+          certDomain = domainMapping.domain;
+        }
+
+        const certificate = await this.ensureCertificate(certDomain, isDomainValidated);
         
         // SNI callback needs a SecureContext, not just cert/key
         const tls = require('tls');
@@ -389,6 +395,20 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       this.certificates.delete(domain);
     }
 
+    // If this is a subdomain, check if we have a wildcard cert for the main domain
+    const mainDomain = this.getMainDomain(domain);
+    const isSubdomain = domain !== mainDomain;
+
+    if (isSubdomain) {
+      const wildcardCert = await this.getWildcardCertificate(mainDomain);
+      if (wildcardCert) {
+        this.logger.info(`Using wildcard certificate for ${domain} from *.${mainDomain}`);
+        this.certificates.set(domain, wildcardCert);
+        return wildcardCert;
+      }
+    }
+
+    // Check disk for exact domain cert
     const certPath = path.join(this.certsDir, `${domain}.crt`);
     const keyPath = path.join(this.certsDir, `${domain}.key`);
 
@@ -422,19 +442,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
           return cached;
         }
         this.certificates.delete(domain);
-      }
-    }
-
-    const mainDomain = this.getMainDomain(domain);
-    const isSubdomain = this.isSubdomain(domain);
-
-    // If this is a subdomain, check if we have a wildcard cert for the main domain
-    if (isSubdomain) {
-      const wildcardCert = await this.getWildcardCertificate(mainDomain);
-      if (wildcardCert) {
-        this.logger.info(`Using wildcard certificate for ${domain} from *.${mainDomain}`);
-        this.certificates.set(domain, wildcardCert);
-        return wildcardCert;
       }
     }
 
@@ -579,21 +586,18 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   async getWildcardCertificate(mainDomain) {
-    // Check if we have a wildcard certificate for this main domain
-    const wildcardDomain = `*.${mainDomain}`;
-    
     // Check memory cache
     if (this.wildcardCerts.has(mainDomain)) {
       return this.wildcardCerts.get(mainDomain);
     }
-    
+
     // Check disk for wildcard cert
     try {
       const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
       const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
       const cert = await fs.readFile(certPath);
       const key = await fs.readFile(keyPath);
-      
+
       if (await this.isCertificateValid(cert)) {
         const certificate = { cert, key };
         this.wildcardCerts.set(mainDomain, certificate);
@@ -601,9 +605,8 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         return certificate;
       }
     } catch (error) {
-      // Wildcard cert doesn't exist
     }
-    
+
     return null;
   }
 

@@ -191,7 +191,7 @@ class ProxyServer {
 
       const domain = host.split(':')[0];
       const mapping = await this.db.getMapping(domain, req.url);
-      
+
       if (!mapping) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
@@ -200,7 +200,9 @@ class ProxyServer {
 
       // Only generate certificates for domains in our database
       if (isHttps) {
-        await this.certManager.ensureCertificate(domain, true); // true = domain is validated
+        // If mapping is for a wildcard domain, ensure wildcard certificate
+        const certDomain = mapping.domain.startsWith('*.') ? mapping.domain : domain;
+        await this.certManager.ensureCertificate(certDomain, true); // true = domain is validated
       }
 
       // For simple port forwarding (no URI mapping), just proxy directly
@@ -241,7 +243,7 @@ class ProxyServer {
 
       const domain = host.split(':')[0];
       const mapping = await this.db.getMapping(domain, req.url);
-      
+
       if (!mapping) {
         socket.destroy();
         return;
@@ -249,7 +251,9 @@ class ProxyServer {
 
       // Only generate certificates for domains in our database
       if (isHttps) {
-        await this.certManager.ensureCertificate(domain, true); // true = domain is validated
+        // If mapping is for a wildcard domain, ensure wildcard certificate
+        const certDomain = mapping.domain.startsWith('*.') ? mapping.domain : domain;
+        await this.certManager.ensureCertificate(certDomain, true); // true = domain is validated
       }
 
       // For simple port forwarding (no URI mapping), just proxy directly
