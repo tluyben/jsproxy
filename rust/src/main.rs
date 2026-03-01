@@ -33,6 +33,10 @@ struct Args {
     #[arg(long, env = "FORCE_HTTPS", default_value = "false")]
     force_https: bool,
 
+    /// Host to bind to
+    #[arg(long, env = "HTTP_HOST", default_value = "0.0.0.0")]
+    http_host: String,
+
     /// Database path
     #[arg(long, env = "DB_PATH", default_value = "./data/current.db")]
     db_path: PathBuf,
@@ -106,6 +110,7 @@ async fn main() -> Result<()> {
         https_port: args.https_port,
         enable_https: args.enable_https,
         force_https: args.force_https,
+        http_host: args.http_host,
     };
 
     // Create and run proxy server

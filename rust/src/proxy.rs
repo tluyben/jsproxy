@@ -27,6 +27,7 @@ pub struct ProxyConfig {
     pub https_port: u16,
     pub enable_https: bool,
     pub force_https: bool,
+    pub http_host: String,
 }
 
 impl Default for ProxyConfig {
@@ -36,6 +37,7 @@ impl Default for ProxyConfig {
             https_port: 8443,
             enable_https: false,
             force_https: false,
+            http_host: "0.0.0.0".to_string(),
         }
     }
 }
@@ -63,7 +65,7 @@ impl ProxyServer {
 
     /// Start the proxy server
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let http_addr: SocketAddr = format!("0.0.0.0:{}", self.config.http_port).parse()?;
+        let http_addr: SocketAddr = format!("{}:{}", self.config.http_host, self.config.http_port).parse()?;
 
         info!("Proxy server starting on HTTP:{}", self.config.http_port);
 
@@ -155,6 +157,15 @@ impl ProxyServer {
         // Health check endpoint
         if path == "/health" {
             return Ok(Self::text_response(StatusCode::OK, "OK"));
+        }
+
+        // ACME reachability test endpoint — DO NOT proxy
+        if path.starts_with("/.well-known/test-challenge/") {
+            let token = path.strip_prefix("/.well-known/test-challenge/").unwrap_or("");
+            if let Some(value) = cert_manager.get_test_challenge(token) {
+                return Ok(Self::text_response(StatusCode::OK, &value));
+            }
+            return Ok(Self::error_response(StatusCode::NOT_FOUND, "Not found"));
         }
 
         // ACME challenge endpoint
@@ -283,6 +294,7 @@ impl ProxyServer {
         remote_addr: SocketAddr,
         is_https: bool,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        let is_get = req.method() == hyper::Method::GET;
         let original_host = req.headers()
             .get(HOST)
             .and_then(|h| h.to_str().ok())
@@ -389,6 +401,18 @@ impl ProxyServer {
 
         for (key, value) in parts.headers.iter() {
             builder = builder.header(key, value);
+        }
+
+        // Apply cache headers for GET responses when CACHE_HEADERS=true
+        if is_get && std::env::var("CACHE_HEADERS").ok().as_deref() == Some("true") {
+            let expiry = std::env::var("CACHE_EXPIRY").ok();
+            let infinite = expiry.as_deref().map(|e| e == "-1" || e.is_empty()).unwrap_or(true);
+            if infinite {
+                builder = builder.header("cache-control", "public, max-age=31536000, immutable");
+                builder = builder.header("expires", "Thu, 31 Dec 2099 23:59:59 GMT");
+            } else if let Some(mins) = expiry.as_deref().and_then(|e| e.parse::<u64>().ok()) {
+                builder = builder.header("cache-control", format!("public, max-age={}", mins * 60));
+            }
         }
 
         let response = builder.body(Self::full_body(body_bytes))

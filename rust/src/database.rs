@@ -100,20 +100,47 @@ impl DatabaseManager {
     }
 
     /// Find a mapping for a given domain and path
-    /// Uses longest-match-first algorithm for front_uri
+    /// Uses longest-match-first algorithm for front_uri.
+    /// Falls back to wildcard domain (*.parent.com) if no exact match found.
     pub fn find_mapping(&self, domain: &str, path: &str) -> Result<Option<Mapping>> {
         let conn = self.conn.lock();
 
-        let mut stmt = conn.prepare(
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, created_at, updated_at
+        let sql = "SELECT id, domain, front_uri, back_port, back_uri, backend, created_at, updated_at
              FROM mappings
              WHERE domain = ?1
              AND (?2 LIKE '/' || front_uri || '%' OR front_uri = '')
              ORDER BY LENGTH(front_uri) DESC
-             LIMIT 1"
-        )?;
+             LIMIT 1";
 
-        let mapping = stmt.query_row(params![domain, path], |row| {
+        // First try exact domain match
+        let mapping = {
+            let mut stmt = conn.prepare(sql)?;
+            stmt.query_row(params![domain, path], |row| {
+                Ok(Mapping {
+                    id: row.get(0)?,
+                    domain: row.get(1)?,
+                    front_uri: row.get(2)?,
+                    back_port: row.get(3)?,
+                    back_uri: row.get(4)?,
+                    backend: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            }).optional()?
+        };
+
+        if mapping.is_some() {
+            return Ok(mapping);
+        }
+
+        // No exact match — try wildcard domain (*.parent.com)
+        let wildcard_domain = match domain.splitn(2, '.').nth(1) {
+            Some(parent) => format!("*.{}", parent),
+            None => return Ok(None),
+        };
+
+        let mut wstmt = conn.prepare(sql)?;
+        let wildcard_mapping = wstmt.query_row(params![wildcard_domain, path], |row| {
             Ok(Mapping {
                 id: row.get(0)?,
                 domain: row.get(1)?,
@@ -126,7 +153,7 @@ impl DatabaseManager {
             })
         }).optional()?;
 
-        Ok(mapping)
+        Ok(wildcard_mapping)
     }
 
     /// Check if a domain exists in the mappings

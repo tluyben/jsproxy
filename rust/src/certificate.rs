@@ -27,6 +27,8 @@ struct RateLimitState {
 pub struct CertificateManager {
     certs_dir: PathBuf,
     acme_challenges: DashMap<String, AcmeChallenge>,
+    /// In-flight ACME HTTP-01 reachability test challenges: token -> value
+    test_challenges: DashMap<String, String>,
     rate_limits: DashMap<String, RateLimitState>,
     #[allow(dead_code)]
     acme_directory_url: String,
@@ -47,6 +49,7 @@ impl CertificateManager {
         let manager = Self {
             certs_dir,
             acme_challenges: DashMap::new(),
+            test_challenges: DashMap::new(),
             rate_limits: DashMap::new(),
             acme_directory_url: acme_directory_url.unwrap_or_else(|| {
                 "https://acme-v02.api.letsencrypt.org/directory".to_string()
@@ -139,6 +142,21 @@ impl CertificateManager {
                 weekly_count: 1,
                 week_start: now,
             });
+    }
+
+    /// Store an ACME HTTP-01 reachability test challenge
+    pub fn store_test_challenge(&self, token: &str, value: &str) {
+        self.test_challenges.insert(token.to_string(), value.to_string());
+    }
+
+    /// Get an ACME HTTP-01 reachability test challenge value
+    pub fn get_test_challenge(&self, token: &str) -> Option<String> {
+        self.test_challenges.get(token).map(|v| v.clone())
+    }
+
+    /// Remove an ACME HTTP-01 reachability test challenge
+    pub fn remove_test_challenge(&self, token: &str) {
+        self.test_challenges.remove(token);
     }
 
     /// Store ACME challenge token

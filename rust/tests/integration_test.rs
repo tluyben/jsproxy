@@ -95,6 +95,7 @@ async fn setup_proxy(
         https_port: http_port + 1,
         enable_https: false,
         force_https: false,
+        http_host: "0.0.0.0".to_string(),
     };
 
     Arc::new(ProxyServer::new(config, db_manager, cert_manager))
