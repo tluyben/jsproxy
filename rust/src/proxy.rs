@@ -5,6 +5,7 @@ use crate::certificate::CertificateManager;
 use crate::database::{DatabaseManager, Mapping};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use dashmap::DashMap;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::header::{HOST, UPGRADE, CONNECTION};
@@ -15,10 +16,13 @@ use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 use url::Url;
+
+const DEAD_PORT_TTL: Duration = Duration::from_secs(30);
 
 /// Proxy server configuration
 #[derive(Clone)]
@@ -47,6 +51,10 @@ pub struct ProxyServer {
     config: ProxyConfig,
     db_manager: Arc<DatabaseManager>,
     cert_manager: Arc<CertificateManager>,
+    /// HA: dead port tracking. Key: "{mapping_id}:{port}", Value: time of death.
+    dead_ports: DashMap<String, Instant>,
+    /// HA: round-robin counters per mapping ID.
+    rr_counters: DashMap<String, usize>,
 }
 
 impl ProxyServer {
@@ -60,7 +68,35 @@ impl ProxyServer {
             config,
             db_manager,
             cert_manager,
+            dead_ports: DashMap::new(),
+            rr_counters: DashMap::new(),
         }
+    }
+
+    // ── HA helpers ──────────────────────────────────────────────────────────
+
+    fn is_port_dead(&self, mapping_id: &str, port: u16) -> bool {
+        let key = format!("{}:{}", mapping_id, port);
+        if let Some(dead_at) = self.dead_ports.get(&key) {
+            if dead_at.elapsed() < DEAD_PORT_TTL {
+                return true;
+            }
+            drop(dead_at);
+            self.dead_ports.remove(&key);
+        }
+        false
+    }
+
+    fn mark_port_dead(&self, mapping_id: &str, port: u16) {
+        warn!("HA: marking port {} dead for mapping {}", port, mapping_id);
+        self.dead_ports.insert(format!("{}:{}", mapping_id, port), Instant::now());
+    }
+
+    fn next_rr_index(&self, mapping_id: &str, count: usize) -> usize {
+        let mut entry = self.rr_counters.entry(mapping_id.to_string()).or_insert(0);
+        let idx = *entry % count;
+        *entry = idx + 1;
+        idx
     }
 
     /// Start the proxy server
@@ -84,12 +120,10 @@ impl ProxyServer {
 
         loop {
             let (stream, remote_addr) = listener.accept().await?;
-            let db = self.db_manager.clone();
-            let cert = self.cert_manager.clone();
-            let config = self.config.clone();
+            let proxy = self.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(stream, remote_addr, db, cert, config).await {
+                if let Err(e) = Self::handle_connection(stream, remote_addr, proxy).await {
                     debug!("HTTP connection error from {}: {}", remote_addr, e);
                 }
             });
@@ -100,9 +134,7 @@ impl ProxyServer {
     async fn handle_connection(
         stream: TcpStream,
         remote_addr: SocketAddr,
-        db_manager: Arc<DatabaseManager>,
-        cert_manager: Arc<CertificateManager>,
-        config: ProxyConfig,
+        proxy: Arc<Self>,
     ) -> Result<()> {
         let io = TokioIo::new(stream);
 
@@ -112,11 +144,9 @@ impl ProxyServer {
             .serve_connection(
                 io,
                 service_fn(move |req| {
-                    let db = db_manager.clone();
-                    let cert = cert_manager.clone();
-                    let cfg = config.clone();
+                    let p = proxy.clone();
                     async move {
-                        Self::handle_request(req, remote_addr, db, cert, cfg).await
+                        Self::handle_request(req, remote_addr, p).await
                     }
                 }),
             )
@@ -128,11 +158,9 @@ impl ProxyServer {
     async fn handle_request(
         req: Request<Incoming>,
         remote_addr: SocketAddr,
-        db_manager: Arc<DatabaseManager>,
-        cert_manager: Arc<CertificateManager>,
-        config: ProxyConfig,
+        proxy: Arc<Self>,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
-        match Self::process_request(req, remote_addr, &db_manager, &cert_manager, &config).await {
+        match proxy.process_request(req, remote_addr).await {
             Ok(response) => Ok(response),
             Err(e) => {
                 error!("Request error: {}", e);
@@ -143,12 +171,13 @@ impl ProxyServer {
 
     /// Process request
     async fn process_request(
+        self: &Arc<Self>,
         req: Request<Incoming>,
         remote_addr: SocketAddr,
-        db_manager: &DatabaseManager,
-        cert_manager: &CertificateManager,
-        config: &ProxyConfig,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        let db_manager = &self.db_manager;
+        let cert_manager = &self.cert_manager;
+        let config = &self.config;
         let path = req.uri().path().to_string();
         let method = req.method().clone();
 
@@ -203,6 +232,11 @@ impl ProxyServer {
         // Check for WebSocket upgrade
         if Self::is_websocket_upgrade(&req) {
             return Self::handle_websocket_proxy(req, &mapping, remote_addr, false).await;
+        }
+
+        // HA round-robin across multiple ports
+        if mapping.back_ports.is_some() {
+            return self.ha_proxy_request(req, &mapping, remote_addr, false).await;
         }
 
         // Proxy the request
@@ -421,6 +455,168 @@ impl ProxyServer {
         Ok(response)
     }
 
+    /// Try a single backend port; returns (status, headers, body) or an error.
+    async fn try_port(
+        method: hyper::Method,
+        uri: Uri,
+        headers: hyper::HeaderMap,
+        body_bytes: Bytes,
+        host: String,
+        port: u16,
+        remote_addr: SocketAddr,
+        is_https: bool,
+    ) -> Result<(StatusCode, hyper::HeaderMap, Bytes)> {
+        let addr = format!("{}:{}", host, port);
+        let stream = TcpStream::connect(&addr).await
+            .map_err(|e| anyhow!("connect {}: {}", addr, e))?;
+
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .version(Version::HTTP_11);
+
+        for (key, value) in headers.iter() {
+            if key != HOST {
+                builder = builder.header(key, value);
+            }
+        }
+
+        // Patch Host to point at this specific port
+        builder = builder.header(HOST, format!("{}:{}", host, port));
+        builder = builder.header("X-Forwarded-For", remote_addr.ip().to_string());
+        builder = builder.header("X-Forwarded-Proto", if is_https { "https" } else { "http" });
+
+        let proxy_req = builder.body(Full::new(body_bytes))
+            .context("Failed to build proxy request")?;
+
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await
+            .context("Handshake failed")?;
+
+        tokio::spawn(async move { let _ = conn.await; });
+
+        let response = sender.send_request(proxy_req).await
+            .context("send_request failed")?;
+
+        let (parts, body) = response.into_parts();
+        let body_bytes = body.collect().await
+            .context("Failed to read response body")?.to_bytes();
+
+        Ok((parts.status, parts.headers, body_bytes))
+    }
+
+    /// HA round-robin proxy: tries ports in order, first 2xx wins;
+    /// falls back to best response by status class.
+    async fn ha_proxy_request(
+        self: &Arc<Self>,
+        req: Request<Incoming>,
+        mapping: &Mapping,
+        remote_addr: SocketAddr,
+        is_https: bool,
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        let back_ports_str = mapping.back_ports.as_deref().unwrap_or("");
+        let all_ports: Vec<u16> = back_ports_str
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+
+        if all_ports.is_empty() {
+            return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, "HA: no ports configured"));
+        }
+
+        // Collect request parts upfront so body can be replayed
+        let original_host = req.headers()
+            .get(HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let path = req.uri().path().to_string();
+        let query = req.uri().query().map(|q| q.to_string());
+        let rewritten_path = Self::rewrite_path(&path, mapping);
+        let uri_str = match query.as_deref() {
+            Some(q) => format!("{}?{}", rewritten_path, q),
+            None => rewritten_path,
+        };
+        let uri: Uri = uri_str.parse().context("Invalid URI")?;
+
+        let (parts, body) = req.into_parts();
+        let body_bytes = body.collect().await
+            .context("Failed to read request body")?.to_bytes();
+
+        let backend = mapping.backend.as_deref().unwrap_or("http://localhost");
+        let backend_url: Url = backend.parse().unwrap_or_else(|_| "http://localhost".parse().unwrap());
+        let backend_host = backend_url.host_str().unwrap_or("localhost").to_string();
+
+        // Build alive port list in round-robin order
+        let alive: Vec<u16> = all_ports.iter()
+            .copied()
+            .filter(|&p| !self.is_port_dead(&mapping.id, p))
+            .collect();
+
+        let ordered: Vec<u16> = if alive.is_empty() {
+            all_ports.clone()
+        } else {
+            let start = self.next_rr_index(&mapping.id, alive.len());
+            alive[start..].iter().chain(alive[..start].iter()).copied().collect()
+        };
+
+        let mut results: Vec<(StatusCode, hyper::HeaderMap, Bytes)> = Vec::new();
+
+        for &port in &ordered {
+            match Self::try_port(
+                parts.method.clone(),
+                uri.clone(),
+                parts.headers.clone(),
+                body_bytes.clone(),
+                backend_host.clone(),
+                port,
+                remote_addr,
+                is_https,
+            ).await {
+                Ok((status, headers, body)) => {
+                    if status.is_success() {
+                        // First 2xx wins immediately
+                        return Ok(Self::build_response(status, headers, body));
+                    }
+                    results.push((status, headers, body));
+                }
+                Err(e) => {
+                    // Treat connection-level failures as dead ports
+                    let msg = e.to_string();
+                    if msg.contains("connect") || msg.contains("refused") || msg.contains("os error") {
+                        self.mark_port_dead(&mapping.id, port);
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
+            return Ok(Self::error_response(StatusCode::BAD_GATEWAY, "Bad Gateway: all backends unavailable"));
+        }
+
+        // Pick best by status class: 2xx < 3xx < 4xx < 5xx
+        results.sort_by_key(|(s, _, _)| s.as_u16());
+        let (status, headers, body) = results.remove(0);
+        Ok(Self::build_response(status, headers, body))
+    }
+
+    /// Build a response from raw parts (used by HA path)
+    fn build_response(
+        status: StatusCode,
+        headers: hyper::HeaderMap,
+        body: Bytes,
+    ) -> Response<BoxBody<Bytes, hyper::Error>> {
+        let skip = ["transfer-encoding", "connection", "keep-alive", "upgrade", "trailer"];
+        let mut builder = Response::builder().status(status);
+        for (key, value) in headers.iter() {
+            if !skip.contains(&key.as_str()) {
+                builder = builder.header(key, value);
+            }
+        }
+        builder.body(Self::full_body(body)).unwrap()
+    }
+
     /// Handle WebSocket proxy
     async fn handle_websocket_proxy(
         req: Request<Incoming>,
@@ -565,6 +761,7 @@ mod tests {
             back_port: 3000,
             back_uri: "v1".to_string(),
             backend: None,
+            back_ports: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -581,6 +778,7 @@ mod tests {
             back_port: 3000,
             back_uri: "".to_string(),
             backend: None,
+            back_ports: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -597,6 +795,7 @@ mod tests {
             back_port: 3000,
             back_uri: "api".to_string(),
             backend: None,
+            back_ports: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -613,6 +812,7 @@ mod tests {
             back_port: 3000,
             back_uri: "".to_string(),
             backend: None,
+            back_ports: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -629,6 +829,7 @@ mod tests {
             back_port: 3000,
             back_uri: "v1".to_string(),
             backend: None,
+            back_ports: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -648,6 +849,7 @@ mod tests {
             back_port: 8080,
             back_uri: "".to_string(),
             backend: Some("https://api.external.com".to_string()),
+            back_ports: None,
             created_at: String::new(),
             updated_at: String::new(),
         };

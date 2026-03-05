@@ -17,6 +17,9 @@ pub struct Mapping {
     pub back_port: u16,
     pub back_uri: String,
     pub backend: Option<String>,
+    /// HA: comma-separated list of backend ports (e.g. "3000,3001,3002").
+    /// When set, overrides `back_port` and enables round-robin load balancing.
+    pub back_ports: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -69,11 +72,28 @@ impl DatabaseManager {
                 back_port INTEGER NOT NULL,
                 back_uri TEXT NOT NULL,
                 backend TEXT DEFAULT NULL,
+                back_ports TEXT DEFAULT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],
         )?;
+
+        // Migration: add back_ports column to existing databases
+        let has_back_ports: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('mappings') WHERE name='back_ports'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) > 0;
+
+        if !has_back_ports {
+            conn.execute(
+                "ALTER TABLE mappings ADD COLUMN back_ports TEXT DEFAULT NULL",
+                [],
+            )?;
+        }
 
         // Create indexes for faster lookups
         conn.execute(
@@ -105,7 +125,7 @@ impl DatabaseManager {
     pub fn find_mapping(&self, domain: &str, path: &str) -> Result<Option<Mapping>> {
         let conn = self.conn.lock();
 
-        let sql = "SELECT id, domain, front_uri, back_port, back_uri, backend, created_at, updated_at
+        let sql = "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports, created_at, updated_at
              FROM mappings
              WHERE domain = ?1
              AND (?2 LIKE '/' || front_uri || '%' OR front_uri = '')
@@ -123,8 +143,9 @@ impl DatabaseManager {
                     back_port: row.get(3)?,
                     back_uri: row.get(4)?,
                     backend: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    back_ports: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
                 })
             }).optional()?
         };
@@ -148,8 +169,9 @@ impl DatabaseManager {
                 back_port: row.get(3)?,
                 back_uri: row.get(4)?,
                 backend: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
+                back_ports: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         }).optional()?;
 
@@ -177,6 +199,7 @@ impl DatabaseManager {
         back_port: u16,
         back_uri: &str,
         backend: Option<&str>,
+        back_ports: Option<&str>,
     ) -> Result<Mapping> {
         let conn = self.conn.lock();
         let id = Uuid::new_v4().to_string();
@@ -186,9 +209,9 @@ impl DatabaseManager {
         let back_uri = back_uri.trim_start_matches('/').trim_end_matches('/');
 
         conn.execute(
-            "INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, domain, front_uri, back_port as i32, back_uri, backend],
+            "INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, back_ports)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, domain, front_uri, back_port as i32, back_uri, backend, back_ports],
         )?;
 
         Ok(Mapping {
@@ -198,6 +221,7 @@ impl DatabaseManager {
             back_port,
             back_uri: back_uri.to_string(),
             backend: backend.map(|s| s.to_string()),
+            back_ports: back_ports.map(|s| s.to_string()),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         })
@@ -292,10 +316,10 @@ impl DatabaseManager {
         let mut mappings = Vec::new();
 
         let sql = if domain.is_some() {
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, created_at, updated_at
+            "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports, created_at, updated_at
              FROM mappings WHERE domain = ?1 ORDER BY domain, front_uri"
         } else {
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, created_at, updated_at
+            "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports, created_at, updated_at
              FROM mappings ORDER BY domain, front_uri"
         };
 
@@ -316,8 +340,9 @@ impl DatabaseManager {
                 back_port: row.get(3)?,
                 back_uri: row.get(4)?,
                 backend: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
+                back_ports: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
             });
         }
 
@@ -329,7 +354,7 @@ impl DatabaseManager {
         let conn = self.conn.lock();
 
         let mapping = conn.query_row(
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, created_at, updated_at
+            "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports, created_at, updated_at
              FROM mappings WHERE id = ?1",
             params![id],
             |row| {
@@ -340,8 +365,9 @@ impl DatabaseManager {
                     back_port: row.get(3)?,
                     back_uri: row.get(4)?,
                     backend: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    back_ports: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
                 })
             },
         ).optional()?;
@@ -355,7 +381,7 @@ impl DatabaseManager {
         let front_uri = front_uri.trim_start_matches('/').trim_end_matches('/');
 
         let mapping = conn.query_row(
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, created_at, updated_at
+            "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports, created_at, updated_at
              FROM mappings WHERE domain = ?1 AND front_uri = ?2",
             params![domain, front_uri],
             |row| {
@@ -366,8 +392,9 @@ impl DatabaseManager {
                     back_port: row.get(3)?,
                     back_uri: row.get(4)?,
                     backend: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    back_ports: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
                 })
             },
         ).optional()?;
@@ -408,7 +435,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db = DatabaseManager::new(&db_path).unwrap();
 
-        db.add_mapping("example.com", "api/v1", 3000, "v1", None).unwrap();
+        db.add_mapping("example.com", "api/v1", 3000, "v1", None, None).unwrap();
 
         let mapping = db.find_mapping("example.com", "/api/v1/users").unwrap();
         assert!(mapping.is_some());
@@ -424,8 +451,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db = DatabaseManager::new(&db_path).unwrap();
 
-        db.add_mapping("example.com", "api", 3000, "", None).unwrap();
-        db.add_mapping("example.com", "api/v1", 3001, "v1", None).unwrap();
+        db.add_mapping("example.com", "api", 3000, "", None, None).unwrap();
+        db.add_mapping("example.com", "api/v1", 3001, "v1", None, None).unwrap();
 
         // Should match api/v1 (longer match)
         let mapping = db.find_mapping("example.com", "/api/v1/users").unwrap();

@@ -33,7 +33,7 @@ enum Commands {
         /// Domain name (e.g., api.example.com)
         domain: String,
 
-        /// Backend port
+        /// Backend port (used when --ports is not set)
         port: u16,
 
         /// Frontend URI path (without leading slash)
@@ -51,6 +51,10 @@ enum Commands {
         /// External backend server URL (e.g., https://api.external.com)
         #[arg(short = 's', long)]
         server: Option<String>,
+
+        /// HA: comma-separated list of backend ports for round-robin (e.g., 3000,3001,3002)
+        #[arg(long)]
+        ports: Option<String>,
     },
 
     /// Update an existing mapping
@@ -118,11 +122,12 @@ fn main() -> Result<()> {
             backend,
             both,
             server,
+            ports,
         } => {
             let front_uri = both.as_ref().or(frontend.as_ref()).map(|s| s.as_str()).unwrap_or("");
             let back_uri = both.as_ref().or(backend.as_ref()).map(|s| s.as_str()).unwrap_or("");
 
-            let mapping = db.add_mapping(&domain, front_uri, port, back_uri, server.as_deref())?;
+            let mapping = db.add_mapping(&domain, front_uri, port, back_uri, server.as_deref(), ports.as_deref())?;
 
             println!("Added mapping:");
             print_mapping(&mapping);
@@ -191,6 +196,7 @@ fn main() -> Result<()> {
                             "back_port": m.back_port,
                             "back_uri": m.back_uri,
                             "backend": m.backend,
+                            "back_ports": m.back_ports,
                             "created_at": m.created_at,
                             "updated_at": m.updated_at,
                         })
@@ -225,7 +231,11 @@ fn print_mapping(mapping: &rustproxy::Mapping) {
     println!("  ID:         {}", mapping.id);
     println!("  Domain:     {}", mapping.domain);
     println!("  Front URI:  /{}", mapping.front_uri);
-    println!("  Back Port:  {}", mapping.back_port);
+    if let Some(ref ports) = mapping.back_ports {
+        println!("  HA Ports:   {} (round-robin)", ports);
+    } else {
+        println!("  Back Port:  {}", mapping.back_port);
+    }
     println!("  Back URI:   /{}", mapping.back_uri);
     if let Some(ref backend) = mapping.backend {
         println!("  Backend:    {}", backend);

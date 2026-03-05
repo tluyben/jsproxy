@@ -12,6 +12,7 @@ A resilient HTTP/HTTPS reverse proxy server written in Rust. This is a 100% comp
 - **ACME challenge handling** for Let's Encrypt integration
 - **X-Forwarded-* headers** for proper upstream communication
 - **Longest-match-first** routing algorithm
+- **High Availability**: multi-port round-robin load balancing with automatic dead-port detection
 
 ## Quick Start
 
@@ -111,6 +112,9 @@ make mapping-add DOMAIN=api.example.com PORT=3000 FRONTEND=api/v1 BACKEND=v1
 
 # External backend
 make mapping-add DOMAIN=external.example.com PORT=8080 SERVER=https://api.external.com
+
+# HA round-robin across 3 ports
+cargo run --bin rustproxy-mapping -- add ha.example.com 3000 --ports 3000,3001,3002
 ```
 
 ### List mappings
@@ -154,9 +158,10 @@ CREATE TABLE mappings (
     id TEXT PRIMARY KEY,
     domain TEXT NOT NULL,
     front_uri TEXT NOT NULL,
-    back_port INTEGER NOT NULL,
+    back_port INTEGER NOT NULL,    -- used when back_ports is NULL
     back_uri TEXT NOT NULL,
     backend TEXT DEFAULT NULL,
+    back_ports TEXT DEFAULT NULL,  -- HA: comma-separated ports, e.g. "3000,3001,3002"
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -170,11 +175,27 @@ CREATE TABLE mappings (
 | `GET https://app.example.com/api/v1/data` | app.example.com | `api/v1` | 3001 | `v1` | - | `http://localhost:3001/v1/data` |
 | `GET https://ext.example.com/users` | ext.example.com | `` | 8080 | `` | https://api.ext.com | `https://api.ext.com:8080/users` |
 
+## High Availability / Load Balancing
+
+When a mapping has `back_ports` set, the proxy load-balances across those ports instead of using `back_port`.
+
+**Per-request behaviour:**
+
+1. Dead ports (connection refused / OS error) are filtered out in-memory and retried after **30 seconds**.
+2. Alive ports are tried in round-robin order starting from the current position.
+3. The **first 2xx response wins** and is returned immediately.
+4. If no 2xx is found, all ports are tried and the best response is returned by status class: `2xx > 3xx > 4xx > 5xx`.
+5. If all ports are unreachable, returns `502 Bad Gateway`.
+
+Connection-refused failures are **instant**, so a fully-down cluster fails in microseconds.
+
+> Note: WebSocket connections always use the single `back_port` — HA is HTTP only.
+
 ## Compatibility with jsproxy
 
 RustProxy is designed to be 100% compatible with jsproxy:
 
-- ✅ Same database schema
+- ✅ Same database schema (including `back_ports` HA column)
 - ✅ Same routing algorithm (longest-match-first)
 - ✅ Same path rewriting logic
 - ✅ Same health endpoint (`/health`)
@@ -182,6 +203,7 @@ RustProxy is designed to be 100% compatible with jsproxy:
 - ✅ Same ACME challenge handling
 - ✅ Same WebSocket proxying
 - ✅ Same CLI mapping tool interface
+- ✅ Same HA round-robin load balancing behaviour
 
 You can switch between jsproxy and RustProxy using the same database file.
 
