@@ -399,6 +399,14 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return cert;
     }
 
+    // Skip ACME for non-public domains (no dot, private TLDs, IPs)
+    if (!this.isPublicDomain(domain)) {
+      this.logger.info(`Domain ${domain} is not a public FQDN — using self-signed certificate`);
+      const cert = await this.generateSelfSignedCertificate(domain);
+      this.certificates.set(domain, cert);
+      return cert;
+    }
+
     // Test HTTP-01 reachability before attempting ACME
     const capable = await this.testAcmeCapability(domain);
     if (!capable) {
@@ -475,6 +483,13 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
 
     if (!isDomainValidated) {
       this.logger.warn(`Wildcard domain ${wildcardDomain} not validated - using self-signed certificate`);
+      const cert = await this.generateSelfSignedCertificate(wildcardDomain);
+      this.wildcardCerts.set(mainDomain, cert);
+      return cert;
+    }
+
+    if (!this.isPublicDomain(mainDomain)) {
+      this.logger.info(`Domain ${wildcardDomain} is not a public FQDN — using self-signed certificate`);
       const cert = await this.generateSelfSignedCertificate(wildcardDomain);
       this.wildcardCerts.set(mainDomain, cert);
       return cert;
@@ -583,6 +598,25 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   isSubdomain(domain) {
     const mainDomain = this.getMainDomain(domain);
     return domain !== mainDomain && domain !== `www.${mainDomain}`;
+  }
+
+  isPublicDomain(domain) {
+    // Single-label hostnames (no dot) are never valid for ACME
+    if (!domain.includes('.')) return false;
+
+    // Plain IPv4 addresses
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(domain)) return false;
+
+    // Private / special-use TLDs that Let's Encrypt will never issue for
+    const privateSuffixes = [
+      '.local', '.localhost', '.internal', '.lan', '.test',
+      '.example', '.invalid', '.home', '.corp', '.localdomain',
+      '.intranet', '.private',
+    ];
+    const lower = domain.toLowerCase();
+    if (privateSuffixes.some(s => lower.endsWith(s))) return false;
+
+    return true;
   }
 
   async getWildcardCertificate(mainDomain) {

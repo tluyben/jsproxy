@@ -6,8 +6,8 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 
 - **Multi-protocol Support**: HTTP, HTTPS, and WebSocket proxying
 - **Automatic SSL**: Let's Encrypt integration for automatic certificate generation
-- **High Availability**: Cluster-based architecture with worker process management
-- **Zero Downtime**: Hot database replacement without service interruption  
+- **High Availability**: Cluster-based architecture with worker process management; multi-port round-robin load balancing with automatic dead-port detection
+- **Zero Downtime**: Hot database replacement without service interruption
 - **Flexible Routing**: Domain and URI-based traffic routing
 - **External Backend Support**: Proxy to remote servers, not just localhost
 - **SQLite Backend**: WAL mode for concurrent reads during updates
@@ -87,9 +87,10 @@ CREATE TABLE mappings (
   id TEXT PRIMARY KEY,           -- UUID
   domain TEXT NOT NULL,          -- Frontend domain (e.g., "api.example.com")
   front_uri TEXT NOT NULL,       -- Frontend URI path (e.g., "v1/users")
-  back_port INTEGER NOT NULL,    -- Backend port (e.g., 3000)
+  back_port INTEGER NOT NULL,    -- Backend port (e.g., 3000) — used when back_ports is NULL
   back_uri TEXT NOT NULL,        -- Backend URI path (e.g., "api/v1/users")
   backend TEXT DEFAULT NULL,     -- Backend server URL (e.g., "https://api.example.com", defaults to "http://localhost")
+  back_ports TEXT DEFAULT NULL,  -- HA: comma-separated ports (e.g., "3000,3001,3002"); overrides back_port when set
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -141,16 +142,20 @@ node scripts/add-mapping.js --help
 sqlite3 ./data/current.db
 
 # Add a mapping
-INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend) 
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
 VALUES ('550e8400-e29b-41d4-a716-446655440000', 'api.example.com', '', 3000, '', NULL);
 
 # Add with external backend server
-INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend) 
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
 VALUES ('550e8400-e29b-41d4-a716-446655440002', 'external.example.com', '', 3000, '', 'https://api.external.com');
 
 # Add API version routing
-INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend) 
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
 VALUES ('550e8400-e29b-41d4-a716-446655440001', 'app.example.com', 'api/v1', 3001, 'v1', NULL);
+
+# Add HA mapping with round-robin across 3 ports
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, back_ports)
+VALUES ('550e8400-e29b-41d4-a716-446655440003', 'ha.example.com', '', 3000, '', NULL, '3000,3001,3002');
 ```
 
 ### Using SQLite Web Interface
@@ -173,6 +178,28 @@ open http://localhost:8080
 | `GET https://remote.example.com/api/data` | remote.example.com | api | :8080 | https://backend.com | `GET https://backend.com:8080/data` |
 
 The system matches the longest `front_uri` first, allowing for hierarchical routing.
+
+## High Availability / Load Balancing
+
+When a mapping has `back_ports` set (comma-separated list), the proxy load-balances across those ports instead of using `back_port`.
+
+**Behaviour per request:**
+
+1. Dead ports (connection refused / DNS failure) are filtered out in-memory; they are retried after **30 seconds**.
+2. The remaining alive ports are tried in round-robin order starting from the current position.
+3. The **first 2xx response wins** and is returned immediately.
+4. If no 2xx is found, all ports are tried and the best response is returned by status class: `2xx > 3xx > 4xx > 5xx`.
+5. If all ports are unreachable, returns `502 Bad Gateway`.
+
+Connection-refused failures are **instant** (no timeout), so a fully-down cluster fails in microseconds.
+
+```sql
+-- Example: domain.com load-balanced across ports 3000, 3001, 3002
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, back_ports)
+VALUES (uuid(), 'domain.com', '', 3000, '', NULL, '3000,3001,3002');
+```
+
+> Note: WebSocket connections always use the single `back_port` path — HA is HTTP/HTTPS only.
 
 ## Hot Database Replacement
 
@@ -393,8 +420,11 @@ MIT License - see LICENSE file for details.
 The `DatabaseManager` class provides methods for managing mappings:
 
 ```javascript
-// Add new mapping
+// Add new mapping (single port)
 await db.addMapping(domain, frontUri, backPort, backUri, backend);
+
+// Add HA mapping (round-robin across multiple ports)
+await db.addMapping(domain, frontUri, backPort, backUri, backend, '3000,3001,3002');
 
 // Get mapping for request
 const mapping = await db.getMapping(domain, requestUrl);

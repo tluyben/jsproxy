@@ -10,6 +10,12 @@ class ProxyServer {
     this.logger = logger;
     this.db = new DatabaseManager(logger);
     this.certManager = new CertificateManager(logger, this.db);
+
+    // HA state
+    this.deadPorts = new Map();   // `${mappingId}:${port}` -> timestamp
+    this.rrCounters = new Map();  // mappingId -> counter
+    this.DEAD_PORT_TTL = 30000;   // ms before re-trying a dead port
+
     this.proxy = httpProxy.createProxyServer({
       ws: true,
       changeOrigin: true,
@@ -219,6 +225,12 @@ class ProxyServer {
         await this.certManager.ensureCertificate(certDomain, true); // true = domain is validated
       }
 
+      // HA round-robin across multiple ports
+      if (mapping.back_ports) {
+        await this.haRequest(mapping, req, res);
+        return;
+      }
+
       // For simple port forwarding (no URI mapping), just proxy directly
       if (!mapping.front_uri && !mapping.back_uri) {
         const backend = mapping.backend || 'http://localhost';
@@ -295,45 +307,177 @@ class ProxyServer {
     }
   }
 
-  buildTargetUrl(mapping, requestUrl) {
+  buildTargetPath(mapping, requestUrl) {
     let targetPath = requestUrl;
-    
-    // Only modify path if we have actual URI mappings
+
     if (mapping.front_uri && mapping.front_uri !== '') {
-      // Create pattern to match front_uri at the beginning of the path
       const frontUri = mapping.front_uri.startsWith('/') ? mapping.front_uri : `/${mapping.front_uri}`;
-      
+
       if (mapping.back_uri && mapping.back_uri !== '') {
         const backUri = mapping.back_uri.startsWith('/') ? mapping.back_uri : `/${mapping.back_uri}`;
-        
         if (requestUrl.startsWith(frontUri)) {
-          // Replace front_uri with back_uri
           targetPath = requestUrl.replace(frontUri, backUri);
         } else if (requestUrl.startsWith(frontUri.substring(1))) {
-          // Handle case where front_uri has leading slash but requestUrl doesn't
           targetPath = requestUrl.replace(frontUri.substring(1), backUri);
         }
       } else {
-        // Remove front_uri from path (back_uri is empty)
         if (requestUrl.startsWith(frontUri)) {
           targetPath = requestUrl.substring(frontUri.length) || '/';
         }
       }
     } else if (mapping.back_uri && mapping.back_uri !== '') {
-      // If no front_uri but there's a back_uri, prepend it
       const backUri = mapping.back_uri.startsWith('/') ? mapping.back_uri : `/${mapping.back_uri}`;
       targetPath = `${backUri}${requestUrl}`;
     }
-    // If both front_uri and back_uri are empty, don't modify the path at all
-    
-    // Clean up multiple slashes and ensure it starts with /
+
     targetPath = targetPath.replace(/\/+/g, '/');
     if (!targetPath.startsWith('/')) {
       targetPath = '/' + targetPath;
     }
-    
+    return targetPath;
+  }
+
+  buildTargetUrl(mapping, requestUrl) {
+    const targetPath = this.buildTargetPath(mapping, requestUrl);
     const backend = mapping.backend || 'http://localhost';
     return `${backend}:${mapping.back_port}${targetPath}`;
+  }
+
+  // ── HA helpers ────────────────────────────────────────────────────────────
+
+  isPortDead(mappingId, port) {
+    const key = `${mappingId}:${port}`;
+    const deadAt = this.deadPorts.get(key);
+    if (!deadAt) return false;
+    if (Date.now() - deadAt > this.DEAD_PORT_TTL) {
+      this.deadPorts.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  markPortDead(mappingId, port) {
+    this.logger.warn(`HA: marking port ${port} dead for mapping ${mappingId}`);
+    this.deadPorts.set(`${mappingId}:${port}`, Date.now());
+  }
+
+  nextRRIndex(mappingId, count) {
+    const i = (this.rrCounters.get(mappingId) || 0) % count;
+    this.rrCounters.set(mappingId, i + 1);
+    return i;
+  }
+
+  bufferBody(req) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', reject);
+    });
+  }
+
+  tryPort(mapping, port, req, body) {
+    return new Promise((resolve, reject) => {
+      const backend = mapping.backend || 'http://localhost';
+      const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
+      const isHttps = backendUrl.protocol === 'https:';
+      const lib = isHttps ? https : http;
+
+      const targetPath = (!mapping.front_uri && !mapping.back_uri)
+        ? req.url
+        : this.buildTargetPath(mapping, req.url);
+
+      const headers = Object.assign({}, req.headers);
+      headers['host'] = `${backendUrl.hostname}:${port}`;
+      headers['x-forwarded-host'] = req.headers.host || '';
+      headers['x-forwarded-proto'] = req.connection.encrypted ? 'https' : 'http';
+      if (body.length > 0) headers['content-length'] = body.length;
+      else delete headers['content-length'];
+
+      const proxyReq = lib.request({
+        hostname: backendUrl.hostname,
+        port,
+        path: targetPath,
+        method: req.method,
+        headers,
+        timeout: 10000,
+      }, (proxyRes) => {
+        const chunks = [];
+        proxyRes.on('data', chunk => chunks.push(chunk));
+        proxyRes.on('end', () => resolve({
+          port,
+          statusCode: proxyRes.statusCode,
+          headers: proxyRes.headers,
+          body: Buffer.concat(chunks),
+        }));
+        proxyRes.on('error', reject);
+      });
+
+      proxyReq.on('timeout', () => {
+        proxyReq.destroy();
+        const err = new Error('Connection timeout');
+        err.code = 'ETIMEOUT';
+        reject(err);
+      });
+      proxyReq.on('error', reject);
+
+      if (body.length > 0) proxyReq.write(body);
+      proxyReq.end();
+    });
+  }
+
+  sendHAResponse(res, result) {
+    const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
+    const headers = {};
+    for (const [k, v] of Object.entries(result.headers)) {
+      if (!skip.has(k.toLowerCase())) headers[k] = v;
+    }
+    res.writeHead(result.statusCode, headers);
+    res.end(result.body);
+  }
+
+  async haRequest(mapping, req, res) {
+    const ports = mapping.back_ports
+      .split(',')
+      .map(p => parseInt(p.trim(), 10))
+      .filter(p => !isNaN(p));
+
+    const body = await this.bufferBody(req);
+
+    // Build ordered port list starting from round-robin position, skipping dead ones
+    let alive = ports.filter(p => !this.isPortDead(mapping.id, p));
+    if (alive.length === 0) alive = [...ports]; // all dead → try anyway
+
+    const start = this.nextRRIndex(mapping.id, alive.length);
+    const ordered = [...alive.slice(start), ...alive.slice(0, start)];
+
+    const results = [];
+
+    for (const port of ordered) {
+      try {
+        const result = await this.tryPort(mapping, port, req, body);
+        results.push(result);
+        if (result.statusCode >= 200 && result.statusCode < 300) {
+          this.sendHAResponse(res, result);
+          return;
+        }
+      } catch (err) {
+        if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+          this.markPortDead(mapping.id, port);
+        }
+        // other errors (ETIMEOUT etc.) don't permanently kill the port
+      }
+    }
+
+    if (results.length === 0) {
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end('Bad Gateway: all backends unavailable');
+      return;
+    }
+
+    // Pick best by status class: 2xx < 3xx < 4xx < 5xx
+    results.sort((a, b) => Math.floor(a.statusCode / 100) - Math.floor(b.statusCode / 100));
+    this.sendHAResponse(res, results[0]);
   }
 
   async stop() {
