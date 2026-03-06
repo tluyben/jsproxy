@@ -226,7 +226,7 @@ class ProxyServer {
       }
 
       // HA round-robin across multiple ports
-      if (mapping.back_ports) {
+      if (String(mapping.back_port).includes(',')) {
         await this.haRequest(mapping, req, res);
         return;
       }
@@ -437,7 +437,7 @@ class ProxyServer {
   }
 
   async haRequest(mapping, req, res) {
-    const ports = mapping.back_ports
+    const ports = String(mapping.back_port)
       .split(',')
       .map(p => parseInt(p.trim(), 10))
       .filter(p => !isNaN(p));
