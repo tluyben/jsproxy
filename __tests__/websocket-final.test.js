@@ -330,29 +330,25 @@ describe('WebSocket Proxy - Production Ready Tests', () => {
     ws.on('error', done);
     setTimeout(() => done(new Error('Large message timeout')), 10000);
   });
-});
 
-describe('HTTP Request Handling on Same Proxy', () => {
   test('✅ HTTP requests work alongside WebSocket on same proxy', (done) => {
-    // Create HTTP request to same backend
     const req = http.request({
       hostname: 'localhost',
       port: 9100,
       path: '/',
       method: 'GET',
-      headers: {
-        'Host': 'websocket.test.com'
-      }
+      headers: { 'Host': 'websocket.test.com' }
     }, (res) => {
       let data = '';
-      res.on('data', (chunk) => data += chunk);
+      res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
-        expect(data).toBe('HTTP Backend OK');
-        expect(res.statusCode).toBe(200);
-        done();
+        try {
+          expect(res.statusCode).toBe(200);
+          expect(data).toBe('HTTP Backend OK');
+          done();
+        } catch (e) { done(e); }
       });
     });
-
     req.on('error', done);
     req.end();
   });

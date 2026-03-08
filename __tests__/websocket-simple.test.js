@@ -180,17 +180,27 @@ describe('Simple WebSocket Test', () => {
     }, 8000);
   }, 10000);
 
-  test('should handle HTTP requests to same backend', async () => {
+  test('should handle HTTP requests to same backend', (done) => {
     console.log('Testing HTTP to same backend...');
-    
-    const response = await fetch('http://localhost:9090/', {
-      headers: {
-        'Host': 'test.example.com'
-      }
+
+    const http = require('http');
+    const req = http.request({
+      hostname: 'localhost',
+      port: 9090,
+      path: '/',
+      headers: { Host: 'test.example.com' }
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => {
+        try {
+          expect(res.statusCode).toBe(200);
+          expect(body).toBe('HTTP backend working');
+          done();
+        } catch (e) { done(e); }
+      });
     });
-    
-    expect(response.ok).toBe(true);
-    const text = await response.text();
-    expect(text).toBe('HTTP backend working');
+    req.on('error', done);
+    req.end();
   });
 });

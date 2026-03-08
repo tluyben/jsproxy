@@ -137,9 +137,9 @@ class DatabaseManager {
 
   async getMapping(domain, requestUrl) {
     const sql = `
-      SELECT * FROM mappings 
+      SELECT * FROM mappings
       WHERE domain = ? AND (? LIKE '/' || front_uri || '%' OR front_uri = '')
-      ORDER BY LENGTH(front_uri) DESC 
+      ORDER BY LENGTH(front_uri) DESC
       LIMIT 1
     `;
 
@@ -163,9 +163,9 @@ class DatabaseManager {
           const wildcardDomain = `*.${parts.join('.')}`;
 
           const wildcardSql = `
-            SELECT * FROM mappings 
+            SELECT * FROM mappings
             WHERE domain = ? AND (? LIKE '/' || front_uri || '%' OR front_uri = '')
-            ORDER BY LENGTH(front_uri) DESC 
+            ORDER BY LENGTH(front_uri) DESC
             LIMIT 1
           `;
 
@@ -186,7 +186,7 @@ class DatabaseManager {
 
   async getAllMappings() {
     const sql = 'SELECT * FROM mappings ORDER BY domain, front_uri';
-    
+
     return new Promise((resolve, reject) => {
       this.db.all(sql, [], (err, rows) => {
         if (err) {

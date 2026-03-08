@@ -282,24 +282,19 @@ class ProxyServer {
         await this.certManager.ensureCertificate(certDomain, true); // true = domain is validated
       }
 
-      // For simple port forwarding (no URI mapping), just proxy directly
-      if (!mapping.front_uri && !mapping.back_uri) {
-        const backend = mapping.backend || 'http://localhost';
-        const target = `${backend}:${mapping.back_port}`;
-        this.proxy.ws(req, socket, head, {
-          target: target,
-          secure: false,
-          changeOrigin: true
-        });
-      } else {
-        // Complex URI mapping
-        const targetUrl = this.buildTargetUrl(mapping, req.url);
-        this.proxy.ws(req, socket, head, {
-          target: targetUrl,
-          secure: false,
-          changeOrigin: true
-        });
+      // Rewrite req.url to the remapped path (http-proxy joins target.path + req.url,
+      // so keep target as host:port only to avoid doubling the path).
+      if (mapping.front_uri || mapping.back_uri) {
+        req.url = this.buildTargetPath(mapping, req.url);
       }
+
+      const backend = mapping.backend || 'http://localhost';
+      const target = `${backend}:${mapping.back_port}`;
+      this.proxy.ws(req, socket, head, {
+        target,
+        secure: false,
+        changeOrigin: true
+      });
 
     } catch (error) {
       this.logger.error('WebSocket handling error:', error);
@@ -482,9 +477,11 @@ class ProxyServer {
 
   async stop() {
     if (this.httpServer) {
+      this.httpServer.closeAllConnections();
       await new Promise((resolve) => this.httpServer.close(resolve));
     }
     if (this.httpsServer) {
+      this.httpsServer.closeAllConnections();
       await new Promise((resolve) => this.httpsServer.close(resolve));
     }
     await this.db.close();

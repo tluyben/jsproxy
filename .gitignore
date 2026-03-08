@@ -98,3 +98,4 @@ certs/
 # OS
 .DS_Store
 Thumbs.db
+/dist

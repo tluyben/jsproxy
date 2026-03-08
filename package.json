@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "A resilient HTTP/HTTPS proxy server with WebSocket support and automatic SSL certificate generation",
   "main": "index.js",
+  "bin": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
@@ -16,7 +17,25 @@
     "lint:fix": "eslint . --fix",
     "docker:dev": "docker-compose --profile dev up jsproxy-dev",
     "docker:prod": "docker-compose up jsproxy",
-    "docker:tools": "docker-compose --profile tools up"
+    "docker:tools": "docker-compose --profile tools up",
+    "build:linux-x86": "pkg . --target node20-linux-x64 --output dist/jsproxy-linux-x86",
+    "build:linux-arm": "pkg . --target node20-linux-arm64 --output dist/jsproxy-linux-arm",
+    "build:macosx-arm": "pkg . --target node20-macos-arm64 --output dist/jsproxy-macosx-arm",
+    "release:linux-x86": "npm run build:linux-x86 && node scripts/release.js linux-x86",
+    "release:linux-arm": "npm run build:linux-arm && node scripts/release.js linux-arm",
+    "release:macosx-arm": "npm run build:macosx-arm && node scripts/release.js macosx-arm"
+  },
+  "pkg": {
+    "assets": [
+      "node_modules/sqlite3/build/Release/*.node",
+      "node_modules/axios/dist/node/*.cjs"
+    ],
+    "scripts": [],
+    "targets": [
+      "node20-linux-x64",
+      "node20-linux-arm64",
+      "node20-macos-arm64"
+    ]
   },
   "keywords": [
     "proxy",
@@ -37,6 +56,7 @@
     "winston": "^3.11.0"
   },
   "devDependencies": {
+    "@yao-pkg/pkg": "^5.12.0",
     "eslint": "^8.57.0",
     "eslint-config-standard": "^17.1.0",
     "eslint-plugin-import": "^2.29.1",
@@ -48,5 +68,9 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "overrides": {
+    "tar": "^7.5.10",
+    "@tootallnate/once": "^3.0.1"
   }
 }

@@ -60,7 +60,7 @@ describe('DatabaseManager', () => {
     const mapping = await dbManager.addMapping('example.com', 'api', 3000, 'v1');
     expect(mapping.domain).toBe('example.com');
     expect(mapping.front_uri).toBe('api');
-    expect(mapping.back_port).toBe(3000);
+    expect(mapping.back_port).toBe('3000');
     expect(mapping.back_uri).toBe('v1');
 
     const retrieved = await dbManager.getMapping('example.com', '/api/users');
@@ -76,7 +76,7 @@ describe('DatabaseManager', () => {
     await dbManager.addMapping('example.com', 'api/users', 3002, 'v2');
 
     const mapping = await dbManager.getMapping('example.com', '/api/users/123');
-    expect(mapping.back_port).toBe(3002);
+    expect(mapping.back_port).toBe('3002');
     expect(mapping.front_uri).toBe('api/users');
   });
 

@@ -1,5 +1,9 @@
 module.exports = {
   testEnvironment: 'node',
+  maxWorkers: 1,
+  moduleNameMapper: {
+    '^acme-client$': '<rootDir>/__mocks__/acme-client.js'
+  },
   collectCoverage: true,
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'lcov', 'html'],

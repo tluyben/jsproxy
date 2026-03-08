@@ -168,7 +168,9 @@ describe('WebSocket Proxy Tests', () => {
   });
 
   test('should handle WebSocket routing based on domain', (done) => {
-    const ws = new WebSocket('ws://localhost:9080/', {
+    // api.example.com has no URI mapping (front_uri='', back_uri='').
+    // The backend WS server only accepts '/ws', so connect to that path directly.
+    const ws = new WebSocket('ws://localhost:9080/ws', {
       headers: {
         'Host': 'api.example.com'
       }
@@ -183,10 +185,10 @@ describe('WebSocket Proxy Tests', () => {
 
     ws.on('message', (data) => {
       const message = JSON.parse(data.toString());
-      
+
       if (message.type === 'welcome') {
         expect(message.backend).toBe('http');
-        expect(message.path).toBe('/');
+        expect(message.path).toBe('/ws');
       }
       
       if (message.type === 'echo') {

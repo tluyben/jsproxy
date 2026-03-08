@@ -65,16 +65,16 @@ describe('Integration Tests', () => {
 
     const mapping1 = await dbManager.getMapping('api.example.com', '/test');
     expect(mapping1).toBeDefined();
-    expect(mapping1.back_port).toBe(3001);
+    expect(mapping1.back_port).toBe('3001');
 
     const mapping2 = await dbManager.getMapping('app.example.com', '/api/v1/users');
     expect(mapping2).toBeDefined();
-    expect(mapping2.back_port).toBe(3001);
+    expect(mapping2.back_port).toBe('3001');
     expect(mapping2.back_uri).toBe('v1');
 
     const mapping3 = await dbManager.getMapping('app.example.com', '/api/v2/users');
     expect(mapping3).toBeDefined();
-    expect(mapping3.back_port).toBe(3002);
+    expect(mapping3.back_port).toBe('3002');
     expect(mapping3.back_uri).toBe('v2');
   });
 
@@ -115,7 +115,7 @@ describe('Integration Tests', () => {
     await dbManager.addMapping('example.com', 'api/users', 3002, 'v2');
 
     const mapping = await dbManager.getMapping('example.com', '/api/users/123');
-    expect(mapping.back_port).toBe(3002);
+    expect(mapping.back_port).toBe('3002');
     expect(mapping.front_uri).toBe('api/users');
   });
 });
