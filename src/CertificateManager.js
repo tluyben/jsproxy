@@ -14,7 +14,8 @@ class CertificateManager {
     this.certsDir = './certs';
     this.acmeClient = null;
     this.accountKey = null;
-    this.processingDomains = new Set();
+    this.processingDomains = new Set(); // used by wildcard path
+    this.pendingCerts = new Map(); // domain -> Promise<{cert,key}> for in-flight ACME requests
     this.lastCertRequest = new Map(); // Track last cert request time per domain
     this.certRequestCount = new Map(); // Track request count per domain
     this.wildcardCerts = new Map(); // Track wildcard certificates
@@ -415,42 +416,47 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return cert;
     }
 
-    // Rate limiting - prevent too many requests for same domain
+    // If ACME is already in-flight, join it — no self-signed fallback while waiting
+    if (this.pendingCerts.has(domain)) {
+      this.logger.info(`Joining in-flight certificate request for ${domain}`);
+      return await this.pendingCerts.get(domain);
+    }
+
+    // Rate limiting — only blocks starting a *new* ACME request
     const now = Date.now();
     const lastRequest = this.lastCertRequest.get(domain) || 0;
     const timeSinceLastRequest = now - lastRequest;
 
     if (timeSinceLastRequest < 5 * 60 * 1000) {
       this.logger.warn(`Rate limit: Too soon to request certificate for ${domain} (${Math.round(timeSinceLastRequest/1000)}s since last request)`);
-      const cert = await this.generateSelfSignedCertificate(domain);
-      this.certificates.set(domain, cert);
-      return cert;
+      return await this.generateSelfSignedCertificate(domain);
     }
 
     const requestCount = this.certRequestCount.get(domain) || 0;
     if (requestCount >= 5) {
       this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
-      const cert = await this.generateSelfSignedCertificate(domain);
-      this.certificates.set(domain, cert);
-      return cert;
+      return await this.generateSelfSignedCertificate(domain);
     }
 
-    if (this.processingDomains.has(domain)) {
-      await this.waitForCertificateProcessing(domain);
-      return this.certificates.get(domain) || await this.generateSelfSignedCertificate(domain);
-    }
-
-    this.processingDomains.add(domain);
+    // Start ACME and store the Promise — concurrent requests will join it above
     this.lastCertRequest.set(domain, now);
     this.certRequestCount.set(domain, requestCount + 1);
 
-    try {
-      const certificate = await this.obtainCertificate(domain);
-      this.certificates.set(domain, certificate);
-      return certificate;
-    } finally {
-      this.processingDomains.delete(domain);
-    }
+    const certPromise = this.obtainCertificate(domain)
+      .then(certificate => {
+        this.certificates.set(domain, certificate);
+        return certificate;
+      })
+      .catch(async (err) => {
+        this.logger.error(`ACME failed for ${domain}, falling back to self-signed:`, err);
+        return await this.generateSelfSignedCertificate(domain);
+      })
+      .finally(() => {
+        this.pendingCerts.delete(domain);
+      });
+
+    this.pendingCerts.set(domain, certPromise);
+    return await certPromise;
   }
 
   async ensureWildcardCertificate(mainDomain, isDomainValidated = false) {
