@@ -435,13 +435,17 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
 
     if (timeSinceLastRequest < 5 * 60 * 1000) {
       this.logger.warn(`Rate limit: Too soon to request certificate for ${domain} (${Math.round(timeSinceLastRequest/1000)}s since last request)`);
-      return await this.generateSelfSignedCertificate(domain);
+      const cert = await this.generateSelfSignedCertificate(domain);
+      this.certificates.set(domain, cert);
+      return cert;
     }
 
     const requestCount = this.certRequestCount.get(domain) || 0;
     if (requestCount >= 5) {
       this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
-      return await this.generateSelfSignedCertificate(domain);
+      const cert = await this.generateSelfSignedCertificate(domain);
+      this.certificates.set(domain, cert);
+      return cert;
     }
 
     // Start ACME and store the Promise — concurrent requests will join it above
