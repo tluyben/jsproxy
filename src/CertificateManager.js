@@ -416,10 +416,16 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return cert;
     }
 
-    // If ACME is already in-flight, join it — no self-signed fallback while waiting
+    // If ACME is already in-flight, join it — wait up to 30s then give up
     if (this.pendingCerts.has(domain)) {
       this.logger.info(`Joining in-flight certificate request for ${domain}`);
-      return await this.pendingCerts.get(domain);
+      const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(null), 30000));
+      const cert = await Promise.race([this.pendingCerts.get(domain), timeoutPromise]);
+      if (cert) return cert;
+      // ACME is stuck — stop joining it so future requests don't wait again
+      this.logger.warn(`ACME stuck for ${domain} after 30s, giving up on this attempt`);
+      this.pendingCerts.delete(domain);
+      return await this.generateSelfSignedCertificate(domain);
     }
 
     // Rate limiting — only blocks starting a *new* ACME request
