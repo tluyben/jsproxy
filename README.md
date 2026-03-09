@@ -9,6 +9,7 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 - **High Availability**: Cluster-based architecture with worker process management; multi-port round-robin load balancing with automatic dead-port detection
 - **Zero Downtime**: Hot database replacement without service interruption
 - **Flexible Routing**: Domain and URI-based traffic routing
+- **IP Allowlisting**: Per-mapping IP restrictions with CIDR range support, works transparently behind nginx
 - **External Backend Support**: Proxy to remote servers, not just localhost
 - **SQLite Backend**: WAL mode for concurrent reads during updates
 - **Docker Ready**: Complete containerization with docker-compose
@@ -87,10 +88,10 @@ CREATE TABLE mappings (
   id TEXT PRIMARY KEY,           -- UUID
   domain TEXT NOT NULL,          -- Frontend domain (e.g., "api.example.com")
   front_uri TEXT NOT NULL,       -- Frontend URI path (e.g., "v1/users")
-  back_port INTEGER NOT NULL,    -- Backend port (e.g., 3000) — used when back_ports is NULL
+  back_port TEXT NOT NULL,       -- Backend port (e.g., 3000); comma-separated for HA (e.g., "3000,3001,3002")
   back_uri TEXT NOT NULL,        -- Backend URI path (e.g., "api/v1/users")
   backend TEXT DEFAULT NULL,     -- Backend server URL (e.g., "https://api.example.com", defaults to "http://localhost")
-  back_ports TEXT DEFAULT NULL,  -- HA: comma-separated ports (e.g., "3000,3001,3002"); overrides back_port when set
+  allowed_ips TEXT DEFAULT NULL, -- IP allowlist: comma-separated IPs/CIDRs; NULL or empty = allow all
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -141,7 +142,7 @@ node scripts/add-mapping.js --help
 # Using SQLite CLI
 sqlite3 ./data/current.db
 
-# Add a mapping
+# Add a mapping (open to all IPs)
 INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
 VALUES ('550e8400-e29b-41d4-a716-446655440000', 'api.example.com', '', 3000, '', NULL);
 
@@ -154,8 +155,12 @@ INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
 VALUES ('550e8400-e29b-41d4-a716-446655440001', 'app.example.com', 'api/v1', 3001, 'v1', NULL);
 
 # Add HA mapping with round-robin across 3 ports
-INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, back_ports)
-VALUES ('550e8400-e29b-41d4-a716-446655440003', 'ha.example.com', '', 3000, '', NULL, '3000,3001,3002');
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
+VALUES ('550e8400-e29b-41d4-a716-446655440003', 'ha.example.com', '', '3000,3001,3002', '', NULL);
+
+# Add mapping restricted to specific IPs / ranges
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips)
+VALUES ('550e8400-e29b-41d4-a716-446655440004', 'admin.example.com', '', 4000, '', NULL, '10.0.0.5,192.168.1.0/24');
 ```
 
 ### Using SQLite Web Interface
@@ -178,6 +183,38 @@ open http://localhost:8080
 | `GET https://remote.example.com/api/data` | remote.example.com | api | :8080 | https://backend.com | `GET https://backend.com:8080/data` |
 
 The system matches the longest `front_uri` first, allowing for hierarchical routing.
+
+## IP Allowlisting
+
+Each mapping can optionally restrict access to specific IPs or CIDR ranges via the `allowed_ips` column.
+
+- **NULL or empty** — all IPs allowed (default, fully backward compatible)
+- **Set** — only listed IPs/ranges are allowed; everything else gets `403 Forbidden`
+
+Supported formats (comma-separated):
+
+| Format | Example | Matches |
+|--------|---------|---------|
+| Single IP | `192.168.1.5` | Exact address |
+| CIDR range | `192.168.1.0/24` | 192.168.1.0 – 192.168.1.255 |
+| Mixed | `10.0.0.5,192.168.0.0/16` | Both |
+
+Works transparently behind nginx — the real client IP is read from the `X-Forwarded-For` header when present, falling back to the direct socket address.
+
+```bash
+# Nginx config — pass the real client IP through
+proxy_set_header X-Forwarded-For $remote_addr;
+```
+
+```sql
+-- Restrict admin panel to office subnet + one jump host
+UPDATE mappings SET allowed_ips = '203.0.113.10,10.0.0.0/8' WHERE domain = 'admin.example.com';
+
+-- Remove restriction (allow all again)
+UPDATE mappings SET allowed_ips = NULL WHERE domain = 'admin.example.com';
+```
+
+WebSocket connections respect the same allowlist — blocked connections receive `403 Forbidden` before the upgrade is completed.
 
 ## High Availability / Load Balancing
 
@@ -288,9 +325,10 @@ Master Process
 1. **Request Reception**: Worker receives HTTP/HTTPS request
 2. **Domain Resolution**: Extract domain from Host header
 3. **Database Query**: Find matching mapping by domain + URI
-4. **SSL Handling**: Ensure certificate exists for HTTPS requests
-5. **Proxy Forward**: Forward request to backend service
-6. **Response Return**: Stream response back to client
+4. **IP Check**: If `allowed_ips` is set, verify client IP — return `403` if not allowed
+5. **SSL Handling**: Ensure certificate exists for HTTPS requests
+6. **Proxy Forward**: Forward request to backend service
+7. **Response Return**: Stream response back to client
 
 ### Error Handling
 
@@ -420,11 +458,14 @@ MIT License - see LICENSE file for details.
 The `DatabaseManager` class provides methods for managing mappings:
 
 ```javascript
-// Add new mapping (single port)
+// Add new mapping (single port, open to all IPs)
 await db.addMapping(domain, frontUri, backPort, backUri, backend);
 
-// Add HA mapping (round-robin across multiple ports)
-await db.addMapping(domain, frontUri, backPort, backUri, backend, '3000,3001,3002');
+// Add mapping with IP allowlist
+await db.addMapping(domain, frontUri, backPort, backUri, backend, '10.0.0.0/8,203.0.113.5');
+
+// Add HA mapping (comma-separated ports in backPort)
+await db.addMapping(domain, frontUri, '3000,3001,3002', backUri, backend);
 
 // Get mapping for request
 const mapping = await db.getMapping(domain, requestUrl);

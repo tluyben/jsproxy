@@ -16,6 +16,7 @@ class DatabaseManager {
     await this.enableWALMode();
     await this.createMappingsTable();
     await this.addBackendColumnIfMissing();
+    await this.addAllowedIpsColumnIfMissing();
   }
 
   async ensureDataDirectory() {
@@ -65,6 +66,7 @@ class DatabaseManager {
         back_port TEXT NOT NULL,
         back_uri TEXT NOT NULL,
         backend TEXT DEFAULT NULL,
+        allowed_ips TEXT DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
@@ -135,6 +137,19 @@ class DatabaseManager {
     });
   }
 
+  async addAllowedIpsColumnIfMissing() {
+    return new Promise((resolve, reject) => {
+      this.db.all('PRAGMA table_info(mappings)', (err, columns) => {
+        if (err) { reject(err); return; }
+        if (columns.some(col => col.name === 'allowed_ips')) { resolve(); return; }
+        this.db.run('ALTER TABLE mappings ADD COLUMN allowed_ips TEXT DEFAULT NULL', (err2) => {
+          if (err2) { this.logger.error('Error adding allowed_ips column:', err2); reject(err2); }
+          else { this.logger.info('Added allowed_ips column to mappings table'); resolve(); }
+        });
+      });
+    });
+  }
+
   async getMapping(domain, requestUrl) {
     const sql = `
       SELECT * FROM mappings
@@ -199,19 +214,19 @@ class DatabaseManager {
     });
   }
 
-  async addMapping(domain, frontUri, backPort, backUri, backend = null) {
+  async addMapping(domain, frontUri, backPort, backUri, backend = null, allowedIps = null) {
     const id = uuidv4();
     const sql = `
-      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `;
 
     return new Promise((resolve, reject) => {
-      this.db.run(sql, [id, domain, frontUri, String(backPort), backUri, backend], function(err) {
+      this.db.run(sql, [id, domain, frontUri, String(backPort), backUri, backend, allowedIps], function(err) {
         if (err) {
           reject(err);
         } else {
-          resolve({ id, domain, front_uri: frontUri, back_port: String(backPort), back_uri: backUri, backend });
+          resolve({ id, domain, front_uri: frontUri, back_port: String(backPort), back_uri: backUri, backend, allowed_ips: allowedIps });
         }
       });
     });

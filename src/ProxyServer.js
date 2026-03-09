@@ -218,6 +218,12 @@ class ProxyServer {
         return;
       }
 
+      if (!this.isIpAllowed(this.getClientIp(req), mapping.allowed_ips)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden');
+        return;
+      }
+
       // Only generate certificates for domains in our database
       if (isHttps) {
         // If mapping is for a wildcard domain, ensure wildcard certificate
@@ -271,6 +277,12 @@ class ProxyServer {
       const mapping = await this.db.getMapping(domain, req.url);
 
       if (!mapping) {
+        socket.destroy();
+        return;
+      }
+
+      if (!this.isIpAllowed(this.getClientIp(req), mapping.allowed_ips)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nForbidden');
         socket.destroy();
         return;
       }
@@ -473,6 +485,40 @@ class ProxyServer {
     // Pick best by status class: 2xx < 3xx < 4xx < 5xx
     results.sort((a, b) => Math.floor(a.statusCode / 100) - Math.floor(b.statusCode / 100));
     this.sendHAResponse(res, results[0]);
+  }
+
+  // ── IP allowlist helpers ───────────────────────────────────────────────────
+
+  getClientIp(req) {
+    const xff = req.headers['x-forwarded-for'];
+    if (xff) return xff.split(',')[0].trim();
+    const addr = req.socket && req.socket.remoteAddress;
+    // Strip IPv6-mapped IPv4 prefix (::ffff:1.2.3.4 -> 1.2.3.4)
+    if (addr && addr.startsWith('::ffff:')) return addr.slice(7);
+    return addr;
+  }
+
+  isIpAllowed(clientIp, allowedIps) {
+    if (!allowedIps || allowedIps.trim() === '') return true;
+    const entries = allowedIps.split(',').map(s => s.trim()).filter(Boolean);
+    return entries.some(entry => {
+      if (entry.includes('/')) return this._ipInCidr(clientIp, entry);
+      return clientIp === entry;
+    });
+  }
+
+  _ipInCidr(ip, cidr) {
+    try {
+      const [range, bits] = cidr.split('/');
+      const mask = bits ? (~0 << (32 - parseInt(bits, 10))) >>> 0 : 0xFFFFFFFF;
+      return (this._ipToInt(ip) & mask) === (this._ipToInt(range) & mask);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  _ipToInt(ip) {
+    return ip.split('.').reduce((acc, octet) => (acc * 256) + parseInt(octet, 10), 0) >>> 0;
   }
 
   async stop() {
