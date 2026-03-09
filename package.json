@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "A resilient HTTP/HTTPS proxy server with WebSocket support and automatic SSL certificate generation",
   "main": "index.js",
-  "bin": "index.js",
+  "bin": {"jsproxy": "index.js"},
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
