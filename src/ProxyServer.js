@@ -449,6 +449,17 @@ class ProxyServer {
       .map(p => parseInt(p.trim(), 10))
       .filter(p => !isNaN(p));
 
+    // SSE (and other streaming) can't be buffered for failover — stream directly
+    // via http-proxy using one round-robin selected port.
+    if (req.headers.accept && req.headers.accept.includes('text/event-stream')) {
+      const alive = ports.filter(p => !this.isPortDead(mapping.id, p));
+      const pool = alive.length > 0 ? alive : ports;
+      const port = pool[this.nextRRIndex(mapping.id, pool.length)];
+      const backend = mapping.backend || 'http://localhost';
+      this.proxy.web(req, res, { target: `${backend}:${port}`, secure: false, changeOrigin: true });
+      return;
+    }
+
     const body = await this.bufferBody(req);
 
     // Build ordered port list starting from round-robin position, skipping dead ones

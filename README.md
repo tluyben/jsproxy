@@ -238,6 +238,8 @@ VALUES (uuid(), 'domain.com', '', 3000, '', NULL, '3000,3001,3002');
 
 > Note: WebSocket connections always use the single `back_port` path — HA is HTTP/HTTPS only.
 
+> Note: **SSE (Server-Sent Events)** and other streaming responses skip the buffered failover logic. The proxy detects `Accept: text/event-stream` and routes the request directly to one round-robin selected port via streaming. Dead-port filtering still applies, but there is no retry — mid-stream failover is impossible regardless.
+
 ## Hot Database Replacement
 
 Replace the database contents without downtime:
