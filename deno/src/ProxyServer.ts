@@ -135,22 +135,30 @@ export default class ProxyServer {
       try {
         // Deno uses rustls (not OpenSSL), which requires the certificate to be
         // selected before the TLS handshake — there is no mid-handshake callback.
-        // node:https SNICallback is silently ignored. Fix: use a raw TCP server,
-        // peek at the TLS ClientHello to extract the SNI hostname, then wrap the
-        // socket with the correct cert via node:tls.TLSSocket.
+        // node:https SNICallback is silently ignored.
+        //
+        // Fix (3-layer approach):
+        //   1. Raw TCP on :443 → extract SNI from ClientHello
+        //   2. Per-domain tls.createServer on localhost → TLS termination with right cert
+        //   3. Per-domain tls.createServer callback → TCP-proxy plaintext to innerHttpPort
+        //
+        // Emitting the TLS socket directly onto an http.Server via emit("connection")
+        // does not work in Deno (the HTTP parser doesn't pick it up). Proxying the
+        // decrypted stream to a real http.Server on a fixed localhost port is reliable.
 
-        // Inner HTTP server handles already-decrypted HTTPS traffic.
+        // Single plain-HTTP server that handles all decrypted HTTPS traffic.
+        const innerHttpPort = 17_999;
         const innerHttpsServer = http.createServer((req, res) => {
           this.handleRequest(req, res, true);
         });
         innerHttpsServer.on("upgrade", (req, socket, head) => {
           this.handleWebSocket(req, socket, head, true);
         });
+        await new Promise<void>((resolve) =>
+          innerHttpsServer.listen(innerHttpPort, "127.0.0.1", resolve)
+        );
 
-        // Registry of per-cert internal TLS servers on localhost.
-        // Key = domain name; each server uses the cert for that domain.
-        // Avoids creating a new server per connection while still supporting
-        // multiple certs (one per unique domain).
+        // Registry of per-cert TLS terminators on localhost.
         const domainServers = new Map<string, { server: tls.Server; port: number }>();
         let nextInternalPort = 18_000;
 
@@ -165,8 +173,12 @@ export default class ProxyServer {
           const tlsServer = tls.createServer(
             { cert: certificate.cert, key: certificate.key },
             (tlsSock: tls.TLSSocket) => {
-              tlsSock.on("error", () => {});
-              innerHttpsServer.emit("connection", tlsSock);
+              // Proxy the decrypted stream to the inner plain-HTTP server.
+              const inner = net.connect(innerHttpPort, "127.0.0.1");
+              tlsSock.pipe(inner);
+              inner.pipe(tlsSock);
+              tlsSock.on("error", () => inner.destroy());
+              inner.on("error", () => tlsSock.destroy());
             },
           );
           await new Promise<void>((resolve) => tlsServer.listen(port, "127.0.0.1", resolve));
