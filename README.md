@@ -529,6 +529,76 @@ docker-compose ps
 LOG_LEVEL=debug npm start
 ```
 
+## Deno / Single Binary
+
+The `deno/` directory is a self-contained Deno port of jsproxy. It produces
+a single native binary using `deno compile` — no Node.js, no `node_modules`,
+no install step on the target machine.
+
+### What's different
+
+| Aspect | Node.js version | Deno version |
+|--------|----------------|--------------|
+| Runtime | Node.js ≥ 20 | Deno ≥ 2.0 |
+| SQLite driver | `npm:sqlite3` (native addon) | `jsr:@db/sqlite` (Deno FFI) |
+| Multi-process | `cluster` module (up to 4 workers) | Single process — run multiple copies behind a load-balancer |
+| `.env` loading | `npm:dotenv` | `jsr:@std/dotenv` |
+| System requirement | Node.js | `libsqlite3` on the target (present on all Linux/macOS) |
+
+Everything else — database schema, cert directory layout, environment
+variables, routing behaviour, HA, webhook interceptor — is identical.
+
+### Requirements
+
+- [Deno 2.0+](https://deno.com) (`curl -fsSL https://deno.land/install.sh | sh`)
+- `libsqlite3` on the target system (standard on macOS; `apt install libsqlite3-dev` on Debian/Ubuntu)
+
+### Run directly (no compile step)
+
+```bash
+cd deno
+deno task start
+```
+
+### Compile to a single binary
+
+```bash
+cd deno
+
+# Current platform
+deno task compile          # → ../dist/jsproxy-deno
+
+# Cross-compile
+deno task compile-linux-x86   # → ../dist/jsproxy-deno-linux-x86
+deno task compile-linux-arm   # → ../dist/jsproxy-deno-linux-arm
+deno task compile-macos-arm   # → ../dist/jsproxy-deno-macos-arm
+```
+
+The resulting binary bundles all JavaScript/TypeScript and npm dependencies.
+Copy it to any machine that has `libsqlite3` and run it directly.
+
+### Install into PATH
+
+```bash
+cd deno
+deno task install          # installs as ~/.deno/bin/jsproxy
+
+# then anywhere:
+jsproxy
+```
+
+### Configuration
+
+Identical to the Node.js version — same `.env` file, same environment
+variables (see [Environment Variables](#environment-variables)).
+
+### Development (hot reload)
+
+```bash
+cd deno
+deno task dev
+```
+
 ## Contributing
 
 1. Fork the repository
