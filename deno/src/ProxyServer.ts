@@ -10,6 +10,8 @@
 
 import * as http from "node:http";
 import * as https from "node:https";
+import * as net from "node:net";
+import * as tls from "node:tls";
 import * as crypto from "node:crypto";
 import { URL } from "node:url";
 import { Buffer } from "node:buffer";
@@ -36,7 +38,7 @@ export default class ProxyServer {
 
   proxy: any;
   httpServer: http.Server | null;
-  httpsServer: https.Server | null;
+  httpsServer: net.Server | null;
 
   constructor(logger: Logger) {
     this.logger = logger;
@@ -131,22 +133,57 @@ export default class ProxyServer {
 
     if (enableHttps) {
       try {
-        const defaultCert = await this.certManager.getDefaultCertificate();
-        const sniCallback = await this.certManager.getSNICallback();
+        // Deno uses rustls (not OpenSSL), which requires the certificate to be
+        // selected before the TLS handshake — there is no mid-handshake callback.
+        // node:https SNICallback is silently ignored. Fix: use a raw TCP server,
+        // peek at the TLS ClientHello to extract the SNI hostname, then wrap the
+        // socket with the correct cert via node:tls.TLSSocket.
 
-        this.httpsServer = https.createServer(
-          { ...defaultCert, SNICallback: sniCallback },
-          (req, res) => this.handleRequest(req, res, true),
-        );
-        this.httpsServer.on("upgrade", (req, socket, head) => {
+        // Inner HTTP server handles already-decrypted HTTPS traffic.
+        const innerHttpsServer = http.createServer((req, res) => {
+          this.handleRequest(req, res, true);
+        });
+        innerHttpsServer.on("upgrade", (req, socket, head) => {
           this.handleWebSocket(req, socket, head, true);
         });
-        this.httpsServer.on("tlsClientError", (err: Error) => {
-          this.logger.error("TLS client error:", err);
+
+        const rawServer = net.createServer((socket) => {
+          socket.once("data", (chunk: Buffer) => {
+            const sni = extractSNI(chunk);
+            socket.unshift(chunk); // push bytes back so TLS reads the full ClientHello
+
+            (async () => {
+              try {
+                const isDomainValidated = sni
+                  ? (await this.db.getMapping(sni, "/")) !== null
+                  : false;
+                const certificate = await this.certManager.ensureCertificate(
+                  sni ?? "default",
+                  isDomainValidated,
+                );
+                const secureContext = tls.createSecureContext({
+                  cert: certificate.cert,
+                  key: certificate.key,
+                });
+                const tlsSocket = new tls.TLSSocket(socket, {
+                  isServer: true,
+                  secureContext,
+                });
+                tlsSocket.on("error", () => {});
+                innerHttpsServer.emit("connection", tlsSocket);
+              } catch (err) {
+                this.logger.error(`HTTPS setup error for ${sni ?? "unknown"}:`, err);
+                socket.destroy();
+              }
+            })();
+          });
+          socket.on("error", () => {});
         });
 
+        this.httpsServer = rawServer;
+
         await new Promise<void>((resolve) => {
-          this.httpsServer!.listen(httpsPort, httpHost, () => {
+          rawServer.listen(httpsPort, httpHost, () => {
             this.logger.info(`HTTPS server listening on ${httpHost}:${httpsPort}`);
             resolve();
           });
@@ -677,5 +714,66 @@ export default class ProxyServer {
       await new Promise<void>((resolve) => this.httpsServer!.close(() => resolve()));
     }
     await this.db.close();
+  }
+}
+
+/**
+ * Parse a TLS ClientHello record and extract the SNI hostname.
+ * Returns null if the buffer is too short, malformed, or contains no SNI.
+ */
+function extractSNI(buf: Buffer): string | null {
+  try {
+    // TLS record header: content-type (1) + version (2) + length (2) = 5 bytes
+    if (buf.length < 5 || buf[0] !== 0x16 /* handshake */) return null;
+    let pos = 5;
+
+    // Handshake header: type (1) + length (3)
+    if (buf[pos] !== 0x01 /* ClientHello */) return null;
+    pos += 4;
+
+    // ClientVersion (2)
+    pos += 2;
+    // Random (32)
+    pos += 32;
+
+    // Session ID
+    if (pos >= buf.length) return null;
+    const sessionIdLen = buf[pos]; pos += 1 + sessionIdLen;
+
+    // Cipher Suites
+    if (pos + 2 > buf.length) return null;
+    const cipherSuitesLen = buf.readUInt16BE(pos); pos += 2 + cipherSuitesLen;
+
+    // Compression Methods
+    if (pos >= buf.length) return null;
+    const compressionLen = buf[pos]; pos += 1 + compressionLen;
+
+    // Extensions
+    if (pos + 2 > buf.length) return null;
+    const extensionsLen = buf.readUInt16BE(pos); pos += 2;
+    const extensionsEnd = pos + extensionsLen;
+
+    while (pos + 4 <= extensionsEnd && pos + 4 <= buf.length) {
+      const extType = buf.readUInt16BE(pos);
+      const extLen = buf.readUInt16BE(pos + 2);
+      pos += 4;
+
+      if (extType === 0x0000 /* server_name */) {
+        // SNI extension: list length (2) + entry type (1) + name length (2) + name
+        if (pos + 5 > buf.length) return null;
+        const nameType = buf[pos + 2];
+        if (nameType === 0 /* host_name */) {
+          const nameLen = buf.readUInt16BE(pos + 3);
+          if (pos + 5 + nameLen > buf.length) return null;
+          return buf.slice(pos + 5, pos + 5 + nameLen).toString("utf8");
+        }
+        return null;
+      }
+
+      pos += extLen;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
