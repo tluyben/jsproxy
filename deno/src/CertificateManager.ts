@@ -266,6 +266,7 @@ export default class CertificateManager {
     // entire async execution to be silently dropped. Fire an IIFE instead and
     // call the Node-style callback when it resolves.
     return (domain: string, callback: (err: Error | null, ctx?: any) => void) => {
+      this.logger.info(`SNI callback invoked for ${domain}`);
       (async () => {
         const domainMapping = await this.db.getMapping(domain, "/");
         const isDomainValidated = domainMapping !== null;
