@@ -10,6 +10,7 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 - **Zero Downtime**: Hot database replacement without service interruption
 - **Flexible Routing**: Domain and URI-based traffic routing
 - **IP Allowlisting**: Per-mapping IP restrictions with CIDR range support, works transparently behind nginx
+- **Webhook Interceptor**: Optional pre-proxy webhook call to authorize, redirect, or block requests
 - **External Backend Support**: Proxy to remote servers, not just localhost
 - **SQLite Backend**: WAL mode for concurrent reads during updates
 - **Docker Ready**: Complete containerization with docker-compose
@@ -75,6 +76,9 @@ ENABLE_HTTPS=true|false            # Enable HTTPS (default: false dev, true prod
 DB_PATH=./data/current.db         # Path to SQLite database file
 CACHE_HEADERS=true|false           # Inject Cache-Control headers on GET responses (default: false)
 CACHE_EXPIRY=60                    # Cache expiry in minutes; omit or -1 for aggressive infinite cache
+WEBHOOK_URL=https://…/hook         # Pre-proxy webhook endpoint (optional, see Webhook Interceptor)
+WEBHOOK_TIMEOUT=5000               # Webhook response timeout in ms (default: 5000)
+WEBHOOK_SECRET=<secret>            # HMAC-SHA256 signing secret for X-Webhook-Signature header
 ```
 
 ## Configuration
@@ -216,6 +220,94 @@ UPDATE mappings SET allowed_ips = NULL WHERE domain = 'admin.example.com';
 
 WebSocket connections respect the same allowlist — blocked connections receive `403 Forbidden` before the upgrade is completed.
 
+## Webhook Interceptor
+
+When `WEBHOOK_URL` is set, the proxy fires a `POST` request to that URL for every inbound request whose domain is found in the database. The webhook call happens **in parallel with any certificate work**, so it adds no extra latency on the hot path. The proxy waits for the webhook response before forwarding the request.
+
+### Behaviour by response code
+
+| Webhook status | Proxy action |
+|----------------|--------------|
+| `200` | Continue — proxy the request as normal |
+| `3xx` (with `Location` header) | Redirect the client to the `Location` URL using that status code |
+| Any other non-200 | Serve the webhook's response (status + body) directly to the client |
+
+If the webhook times out or is unreachable the proxy **fails open** — the request is proxied as normal and an error is logged.
+
+### Configuration
+
+```bash
+# .env or environment variables
+WEBHOOK_URL=https://auth.example.com/hook  # required to enable
+WEBHOOK_TIMEOUT=5000                        # ms to wait (default: 5000)
+WEBHOOK_SECRET=your-secret                  # optional HMAC-SHA256 signing
+```
+
+### Webhook request
+
+The proxy sends a `POST` with `Content-Type: application/json`:
+
+```json
+{
+  "domain":    "api.example.com",
+  "url":       "/v1/users?page=1",
+  "method":    "GET",
+  "headers":   { "host": "api.example.com", "authorization": "Bearer …" },
+  "ports":     ["3000"],
+  "ip":        "203.0.113.42",
+  "mappingId": "550e8400-e29b-41d4-a716-446655440000",
+  "timestamp": "2024-01-15T10:30:00.000Z"
+}
+```
+
+`ports` is always an array — for HA mappings it contains all configured ports (e.g. `["3000","3001","3002"]`).
+
+### HMAC signature
+
+When `WEBHOOK_SECRET` is set, a request header is added:
+
+```
+X-Webhook-Signature: sha256=<hex-encoded HMAC-SHA256 of the raw JSON body>
+```
+
+Verify in your webhook handler:
+
+```javascript
+const crypto = require('crypto');
+function verify(secret, rawBody, header) {
+  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(header));
+}
+```
+
+### Example: auth service that blocks unauthenticated requests
+
+```javascript
+// auth-service.js (runs alongside jsproxy)
+const http = require('http');
+
+http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', c => chunks.push(c));
+  req.on('end', () => {
+    const { headers } = JSON.parse(Buffer.concat(chunks).toString());
+    const token = (headers['authorization'] || '').replace('Bearer ', '');
+
+    if (!isValidToken(token)) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Unauthorized');
+    } else {
+      res.writeHead(200);
+      res.end();
+    }
+  });
+}).listen(9000);
+```
+
+```bash
+WEBHOOK_URL=http://localhost:9000 node index.js
+```
+
 ## High Availability / Load Balancing
 
 When a mapping has `back_ports` set (comma-separated list), the proxy load-balances across those ports instead of using `back_port`.
@@ -328,9 +420,12 @@ Master Process
 2. **Domain Resolution**: Extract domain from Host header
 3. **Database Query**: Find matching mapping by domain + URI
 4. **IP Check**: If `allowed_ips` is set, verify client IP — return `403` if not allowed
-5. **SSL Handling**: Ensure certificate exists for HTTPS requests
-6. **Proxy Forward**: Forward request to backend service
-7. **Response Return**: Stream response back to client
+5. **Parallel work** (runs concurrently):
+   - **SSL Handling**: Ensure certificate exists for HTTPS requests
+   - **Webhook** (if `WEBHOOK_URL` set): POST request metadata, await decision
+6. **Webhook gate**: Redirect or block based on webhook response; continue on `200`
+7. **Proxy Forward**: Forward request to backend service
+8. **Response Return**: Stream response back to client
 
 ### Error Handling
 

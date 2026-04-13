@@ -1,5 +1,6 @@
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const httpProxy = require('http-proxy');
 const DatabaseManager = require('./DatabaseManager');
 const CertificateManager = require('./CertificateManager');
@@ -224,11 +225,31 @@ class ProxyServer {
         return;
       }
 
-      // Only generate certificates for domains in our database
-      if (isHttps) {
-        // If mapping is for a wildcard domain, ensure wildcard certificate
-        const certDomain = mapping.domain.startsWith('*.') ? mapping.domain : domain;
-        await this.certManager.ensureCertificate(certDomain, true); // true = domain is validated
+      // Run certificate fetch (if HTTPS) and webhook check in parallel
+      const certPromise = isHttps
+        ? this.certManager.ensureCertificate(
+            mapping.domain && mapping.domain.startsWith('*.') ? mapping.domain : domain,
+            true
+          )
+        : Promise.resolve();
+      const webhookPromise = this.callWebhook(mapping, req);
+
+      const [, webhookDecision] = await Promise.all([certPromise, webhookPromise]);
+
+      if (webhookDecision) {
+        // 3xx: relay the redirect to the client
+        if (webhookDecision.statusCode >= 300 && webhookDecision.statusCode < 400 && webhookDecision.location) {
+          res.writeHead(webhookDecision.statusCode, { 'Location': webhookDecision.location });
+          res.end();
+          return;
+        }
+        // Non-200: serve the webhook response directly
+        if (webhookDecision.statusCode !== 200) {
+          const headers = Object.assign({ 'Content-Type': 'text/plain' }, webhookDecision.headers || {});
+          res.writeHead(webhookDecision.statusCode, headers);
+          res.end(webhookDecision.body || '');
+          return;
+        }
       }
 
       // HA round-robin across multiple ports
@@ -530,6 +551,113 @@ class ProxyServer {
 
   _ipToInt(ip) {
     return ip.split('.').reduce((acc, octet) => (acc * 256) + parseInt(octet, 10), 0) >>> 0;
+  }
+
+  // ── Webhook interceptor ───────────────────────────────────────────────────
+
+  /**
+   * Fire the configured WEBHOOK_URL (if any) and return a decision object.
+   *
+   * Returns null when no webhook is configured or on any network/timeout error
+   * (fail-open: the request is proxied as normal).
+   *
+   * Decision object shape:
+   *   { statusCode: 200 }                                   → continue
+   *   { statusCode: 3xx, location: '...' }                  → redirect client
+   *   { statusCode: 4xx|5xx, headers: {…}, body: '…' }      → serve directly
+   */
+  async callWebhook(mapping, req) {
+    const webhookUrl = process.env.WEBHOOK_URL;
+    if (!webhookUrl) return null;
+
+    const timeoutMs = parseInt(process.env.WEBHOOK_TIMEOUT || '5000', 10);
+
+    const ports = String(mapping.back_port)
+      .split(',')
+      .map(p => p.trim())
+      .filter(Boolean);
+
+    const payload = JSON.stringify({
+      domain: mapping.domain,
+      url: req.url,
+      method: req.method,
+      headers: req.headers,
+      ports,
+      ip: this.getClientIp(req),
+      mappingId: mapping.id,
+      timestamp: new Date().toISOString(),
+    });
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+      'User-Agent': 'jsproxy-webhook/1.0',
+    };
+
+    const secret = process.env.WEBHOOK_SECRET;
+    if (secret) {
+      const sig = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+      headers['X-Webhook-Signature'] = `sha256=${sig}`;
+    }
+
+    try {
+      const parsed = new URL(webhookUrl);
+      const lib = parsed.protocol === 'https:' ? https : http;
+
+      const result = await new Promise((resolve, reject) => {
+        const reqOptions = {
+          hostname: parsed.hostname,
+          port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+          path: parsed.pathname + parsed.search,
+          method: 'POST',
+          headers,
+          timeout: timeoutMs,
+        };
+
+        const whReq = lib.request(reqOptions, (whRes) => {
+          const chunks = [];
+          whRes.on('data', chunk => chunks.push(chunk));
+          whRes.on('end', () => resolve({
+            statusCode: whRes.statusCode,
+            headers: whRes.headers,
+            body: Buffer.concat(chunks).toString(),
+          }));
+          whRes.on('error', reject);
+        });
+
+        whReq.on('timeout', () => {
+          whReq.destroy();
+          reject(new Error('Webhook timeout'));
+        });
+        whReq.on('error', reject);
+        whReq.write(payload);
+        whReq.end();
+      });
+
+      const { statusCode, headers: resHeaders, body } = result;
+      this.logger.info(`Webhook response: ${statusCode} for ${req.method} ${req.url}`);
+
+      if (statusCode >= 300 && statusCode < 400) {
+        const location = resHeaders['location'] || resHeaders['Location'];
+        return { statusCode, location };
+      }
+
+      if (statusCode !== 200) {
+        // Pass through the response content-type if the webhook sets one,
+        // but strip hop-by-hop headers.
+        const hop = new Set(['transfer-encoding', 'connection', 'keep-alive']);
+        const passHeaders = {};
+        for (const [k, v] of Object.entries(resHeaders)) {
+          if (!hop.has(k.toLowerCase())) passHeaders[k] = v;
+        }
+        return { statusCode, headers: passHeaders, body };
+      }
+
+      return { statusCode: 200 };
+    } catch (err) {
+      this.logger.error('Webhook call failed (proceeding with proxy):', err.message);
+      return null; // fail-open
+    }
   }
 
   async stop() {
