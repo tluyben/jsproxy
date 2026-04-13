@@ -147,43 +147,68 @@ export default class ProxyServer {
           this.handleWebSocket(req, socket, head, true);
         });
 
-        const rawServer = net.createServer((socket) => {
-          socket.once("data", (chunk: Buffer) => {
+        // Registry of per-cert internal TLS servers on localhost.
+        // Key = domain name; each server uses the cert for that domain.
+        // Avoids creating a new server per connection while still supporting
+        // multiple certs (one per unique domain).
+        const domainServers = new Map<string, { server: tls.Server; port: number }>();
+        let nextInternalPort = 18_000;
+
+        const getOrCreateInternalServer = async (
+          domain: string,
+          certificate: { cert: string; key: string },
+        ): Promise<number> => {
+          const existing = domainServers.get(domain);
+          if (existing) return existing.port;
+
+          const port = nextInternalPort++;
+          const tlsServer = tls.createServer(
+            { cert: certificate.cert, key: certificate.key },
+            (tlsSock: tls.TLSSocket) => {
+              tlsSock.on("error", () => {});
+              innerHttpsServer.emit("connection", tlsSock);
+            },
+          );
+          await new Promise<void>((resolve) => tlsServer.listen(port, "127.0.0.1", resolve));
+          domainServers.set(domain, { server: tlsServer, port });
+          this.logger.info(`HTTPS internal TLS server for ${domain} on :${port}`);
+          return port;
+        };
+
+        const rawServer = net.createServer((clientSocket) => {
+          clientSocket.once("data", (chunk: Buffer) => {
             const sni = extractSNI(chunk);
-            this.logger.info(`[tls-debug] data chunk ${chunk.length}b, SNI=${sni}`);
-            socket.unshift(chunk); // push bytes back so TLS reads the full ClientHello
 
             (async () => {
               try {
+                const domain = sni ?? "default";
                 const isDomainValidated = sni
                   ? (await this.db.getMapping(sni, "/")) !== null
                   : false;
-                this.logger.info(`[tls-debug] ensureCertificate for ${sni ?? "default"}`);
                 const certificate = await this.certManager.ensureCertificate(
-                  sni ?? "default",
+                  domain,
                   isDomainValidated,
                 );
-                this.logger.info(`[tls-debug] got cert, creating secureContext`);
-                const secureContext = tls.createSecureContext({
-                  cert: certificate.cert,
-                  key: certificate.key,
+                const internalPort = await getOrCreateInternalServer(domain, certificate);
+
+                // Proxy the raw TCP connection to the internal TLS server.
+                // We forward the already-read ClientHello chunk first, then
+                // pipe the rest of the stream bidirectionally.
+                const proxyConn = net.connect(internalPort, "127.0.0.1");
+                proxyConn.once("connect", () => {
+                  proxyConn.write(chunk); // replay the ClientHello
+                  clientSocket.pipe(proxyConn);
+                  proxyConn.pipe(clientSocket);
                 });
-                this.logger.info(`[tls-debug] creating TLSSocket`);
-                const tlsSocket = new tls.TLSSocket(socket, {
-                  isServer: true,
-                  secureContext,
-                });
-                tlsSocket.on("error", (e) => this.logger.error(`[tls-debug] TLSSocket error:`, e));
-                tlsSocket.on("secure", () => this.logger.info(`[tls-debug] TLS handshake complete for ${sni}`));
-                this.logger.info(`[tls-debug] emitting connection to innerHttpsServer`);
-                innerHttpsServer.emit("connection", tlsSocket);
+                proxyConn.on("error", () => clientSocket.destroy());
+                clientSocket.on("error", () => proxyConn.destroy());
               } catch (err) {
                 this.logger.error(`HTTPS setup error for ${sni ?? "unknown"}:`, err);
-                socket.destroy();
+                clientSocket.destroy();
               }
             })();
           });
-          socket.on("error", () => {});
+          clientSocket.on("error", () => {});
         });
 
         this.httpsServer = rawServer;
