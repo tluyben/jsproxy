@@ -261,8 +261,12 @@ export default class CertificateManager {
   }
 
   async getSNICallback() {
-    return async (domain: string, callback: (err: Error | null, ctx?: any) => void) => {
-      try {
+    // The SNI callback must be a plain (non-async) function — Deno's node:tls
+    // does not await the return value, so an async outer function causes the
+    // entire async execution to be silently dropped. Fire an IIFE instead and
+    // call the Node-style callback when it resolves.
+    return (domain: string, callback: (err: Error | null, ctx?: any) => void) => {
+      (async () => {
         const domainMapping = await this.db.getMapping(domain, "/");
         const isDomainValidated = domainMapping !== null;
         let certDomain = domain;
@@ -272,10 +276,10 @@ export default class CertificateManager {
         const certificate = await this.ensureCertificate(certDomain, isDomainValidated);
         const context = tls.createSecureContext({ cert: certificate.cert, key: certificate.key });
         callback(null, context);
-      } catch (error: any) {
+      })().catch((error: any) => {
         this.logger.error(`SNI callback error for ${domain}:`, error);
         callback(error);
-      }
+      });
     };
   }
 
