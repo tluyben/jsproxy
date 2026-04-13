@@ -150,6 +150,7 @@ export default class ProxyServer {
         const rawServer = net.createServer((socket) => {
           socket.once("data", (chunk: Buffer) => {
             const sni = extractSNI(chunk);
+            this.logger.info(`[tls-debug] data chunk ${chunk.length}b, SNI=${sni}`);
             socket.unshift(chunk); // push bytes back so TLS reads the full ClientHello
 
             (async () => {
@@ -157,19 +158,24 @@ export default class ProxyServer {
                 const isDomainValidated = sni
                   ? (await this.db.getMapping(sni, "/")) !== null
                   : false;
+                this.logger.info(`[tls-debug] ensureCertificate for ${sni ?? "default"}`);
                 const certificate = await this.certManager.ensureCertificate(
                   sni ?? "default",
                   isDomainValidated,
                 );
+                this.logger.info(`[tls-debug] got cert, creating secureContext`);
                 const secureContext = tls.createSecureContext({
                   cert: certificate.cert,
                   key: certificate.key,
                 });
+                this.logger.info(`[tls-debug] creating TLSSocket`);
                 const tlsSocket = new tls.TLSSocket(socket, {
                   isServer: true,
                   secureContext,
                 });
-                tlsSocket.on("error", () => {});
+                tlsSocket.on("error", (e) => this.logger.error(`[tls-debug] TLSSocket error:`, e));
+                tlsSocket.on("secure", () => this.logger.info(`[tls-debug] TLS handshake complete for ${sni}`));
+                this.logger.info(`[tls-debug] emitting connection to innerHttpsServer`);
                 innerHttpsServer.emit("connection", tlsSocket);
               } catch (err) {
                 this.logger.error(`HTTPS setup error for ${sni ?? "unknown"}:`, err);
