@@ -1,5 +1,6 @@
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const crypto = require('crypto');
 const httpProxy = require('http-proxy');
 const DatabaseManager = require('./DatabaseManager');
@@ -14,10 +15,10 @@ class ProxyServer {
     this.db = new DatabaseManager(logger);
     this.certManager = new CertificateManager(logger, this.db);
 
-    // HA state
-    this.deadPorts = new Map();   // `${mappingId}:${port}` -> timestamp
-    this.rrCounters = new Map();  // mappingId -> counter
-    this.DEAD_PORT_TTL = 30000;   // ms before re-trying a dead port
+    // HA state — score-based port selection
+    this.portScores = new Map();  // `${mappingId}:${port}` -> 0..100
+    this.rrCounters = new Map();  // mappingId -> rotation counter (tie-break)
+    this.bgChecks   = new Set();  // keys currently being TCP-probed
 
     this.proxy = httpProxy.createProxyServer({
       ws: true,
@@ -401,22 +402,71 @@ class ProxyServer {
 
   // ── HA helpers ────────────────────────────────────────────────────────────
 
-  isPortDead(mappingId, port) {
-    const key = `${mappingId}:${port}`;
-    const deadAt = this.deadPorts.get(key);
-    if (!deadAt) return false;
-    if (Date.now() - deadAt > this.DEAD_PORT_TTL) {
-      this.deadPorts.delete(key);
-      return false;
-    }
-    return true;
+  // ── Port scoring ─────────────────────────────────────────────────────────────
+
+  _portKey(mappingId, port) { return `${mappingId}:${port}`; }
+
+  getPortScore(mappingId, port) {
+    return this.portScores.get(this._portKey(mappingId, port)) ?? 100;
   }
 
-  markPortDead(mappingId, port) {
-    this.logger.warn(`HA: marking port ${port} dead for mapping ${mappingId}`);
-    this.deadPorts.set(`${mappingId}:${port}`, Date.now());
+  boostPort(mappingId, port) {
+    this.portScores.set(this._portKey(mappingId, port), 100);
   }
 
+  penalizePort(mappingId, port) {
+    this.portScores.set(this._portKey(mappingId, port), 0);
+  }
+
+  // Return ports sorted best-first. Tie-break with round-robin rotation.
+  rankedPorts(mappingId, ports) {
+    const i = (this.rrCounters.get(mappingId) || 0);
+    this.rrCounters.set(mappingId, i + 1);
+    const rotated = [...ports.slice(i % ports.length), ...ports.slice(0, i % ports.length)];
+    return rotated.slice().sort((a, b) =>
+      this.getPortScore(mappingId, b) - this.getPortScore(mappingId, a)
+    );
+  }
+
+  // TCP-probe a port in the background until it responds, then set score to 50
+  // so the next real request gives it a try.
+  startBackgroundCheck(mapping, port) {
+    const key = this._portKey(mapping.id, port);
+    if (this.bgChecks.has(key)) return;
+    this.bgChecks.add(key);
+
+    const backend = mapping.backend || 'http://localhost';
+    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
+    const host = backendUrl.hostname;
+
+    const probe = () => {
+      const sock = new net.Socket();
+      sock.setTimeout(3000);
+      sock.connect(port, host, () => {
+        sock.destroy();
+        this.bgChecks.delete(key);
+        this.portScores.set(key, 50);
+        this.logger.info(`HA: port ${port} back up (score→50) for mapping ${mapping.id}`);
+      });
+      const retry = () => {
+        sock.destroy();
+        if (this.bgChecks.has(key)) {
+          const t = setTimeout(probe, 5000);
+          if (t.unref) t.unref();
+        }
+      };
+      sock.on('error', retry);
+      sock.on('timeout', retry);
+    };
+
+    const t = setTimeout(probe, 2000);
+    if (t.unref) t.unref();
+    this.logger.warn(`HA: port ${port} scored 0, background probe started`);
+  }
+
+  // Kept for backward compat with any remaining call sites
+  isPortDead(mappingId, port) { return this.getPortScore(mappingId, port) === 0; }
+  markPortDead(mappingId, port) { this.penalizePort(mappingId, port); }
   nextRRIndex(mappingId, count) {
     const i = (this.rrCounters.get(mappingId) || 0) % count;
     this.rrCounters.set(mappingId, i + 1);
@@ -498,39 +548,31 @@ class ProxyServer {
     }
   }
 
-  // Multi-port HA request for the plugin path. Returns best result object.
+  // Multi-port HA request. Tries ports best-score-first; short-circuits on the
+  // first port that actually responds (any status code). Connection-level
+  // failures (no response at all) penalize the port and move to the next one.
   async _requestHA(mapping, uri, method, headers, body) {
     const ports = String(mapping.back_port)
       .split(',')
       .map(p => parseInt(p.trim(), 10))
       .filter(p => !isNaN(p));
 
-    let alive = ports.filter(p => !this.isPortDead(mapping.id, p));
-    if (alive.length === 0) alive = [...ports];
-
-    const start = this.nextRRIndex(mapping.id, alive.length);
-    const ordered = [...alive.slice(start), ...alive.slice(0, start)];
-
-    const results = [];
+    const ordered = this.rankedPorts(mapping.id, ports);
 
     for (const port of ordered) {
       try {
         const result = await this._tryPort(mapping, port, uri, method, headers, body);
-        results.push(result);
-        if (result.statusCode >= 200 && result.statusCode < 300) return result;
+        // Port responded — boost its score and return immediately
+        this.boostPort(mapping.id, port);
+        return result;
       } catch (err) {
-        if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
-          this.markPortDead(mapping.id, port);
-        }
+        // Connection-level failure: penalize and probe in background
+        this.penalizePort(mapping.id, port);
+        this.startBackgroundCheck(mapping, port);
       }
     }
 
-    if (results.length === 0) {
-      return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway: all backends unavailable') };
-    }
-
-    results.sort((a, b) => Math.floor(a.statusCode / 100) - Math.floor(b.statusCode / 100));
-    return results[0];
+    return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway: all backends unavailable') };
   }
 
   // Full request/response pipeline used when ≥1 plugin expressed interest.
@@ -615,9 +657,7 @@ class ProxyServer {
     // SSE (and other streaming) can't be buffered for failover — stream directly
     // via http-proxy using one round-robin selected port.
     if (req.headers.accept && req.headers.accept.includes('text/event-stream')) {
-      const alive = ports.filter(p => !this.isPortDead(mapping.id, p));
-      const pool = alive.length > 0 ? alive : ports;
-      const port = pool[this.nextRRIndex(mapping.id, pool.length)];
+      const port = this.rankedPorts(mapping.id, ports)[0];
       const backend = mapping.backend || 'http://localhost';
       this.proxy.web(req, res, { target: `${backend}:${port}`, secure: false, changeOrigin: true });
       return;
