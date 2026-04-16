@@ -227,6 +227,8 @@ All live in `plugins/`. Start each with `node plugins/<name>.js`.
 | `hello-world.js` | 3001 | Rewrites any `/hello` response to "Hello World!" |
 | `rewrite.js` | 3002 | Rewrites `/api/v1/*` requests to `/api/v2/*` |
 | `retry.js` | 3003 | Retries 5xx responses against the backend with exponential backoff |
+| `telemetry.js` | 3004 | Captures per-request spans; emits to console, webhook, OTEL, or Sentry |
+| `pii.js` | 3005 | Detects and scrubs PII fields in JSON bodies (mock or redact mode) |
 | `demo-backend.js` | 3000 | Test backend with routes for each demo |
 
 ---

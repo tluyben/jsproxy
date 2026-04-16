@@ -113,6 +113,70 @@ const DEMOS = {
       },
     ],
   },
+
+  telemetry: {
+    title:   'telemetry plugin',
+    desc:    'Captures per-request spans (method, route, status, latency). Plug into Sentry, OpenTelemetry, or any webhook — no app code changes.',
+    backend: { script: 'plugins/demo-backend.js', port: 3000 },
+    plugin: {
+      script: 'plugins/telemetry.js',
+      port:   3004,
+      env:    { TELEMETRY_TARGET: 'console', TELEMETRY_SERVICE_NAME: 'demo-api' },
+    },
+    proxy: { port: 8080, plugin: 'localhost:3004' },
+    curls: [
+      {
+        label: 'GET /api/users  →  200 span printed by plugin (watch plugin log)',
+        cmd:   'curl -s http://localhost:8080/api/users',
+      },
+      {
+        label: 'GET /api/slow  →  500ms latency captured in span',
+        cmd:   'curl -s http://localhost:8080/api/slow',
+      },
+      {
+        label: 'GET /api/crash  →  500 error span with error=true flag',
+        cmd:   'curl -s http://localhost:8080/api/crash',
+      },
+      {
+        label: 'GET /health  →  ignored by plugin (/valid returns false for /health)',
+        cmd:   'curl -s http://localhost:8080/health',
+      },
+      {
+        label: 'POST /api/orders  →  POST spans include method in the span name',
+        cmd:   'curl -s -X POST http://localhost:8080/api/orders -H "Content-Type: application/json" -d \'{"item":"widget","qty":3}\'',
+      },
+    ],
+  },
+
+  pii: {
+    title:   'pii plugin',
+    desc:    'Detects PII fields in JSON bodies (email, name, phone, SSN, address, card, …) and replaces them with realistic mock data before forwarding.',
+    backend: { script: 'plugins/demo-backend.js', port: 3000 },
+    plugin: {
+      script: 'plugins/pii.js',
+      port:   3005,
+      env:    { PII_MODE: 'mock', PII_DIRECTION: 'both' },
+    },
+    proxy: { port: 8080, plugin: 'localhost:3005' },
+    curls: [
+      {
+        label: 'GET /api/user/profile  →  response PII (name, email, phone, SSN, address, card) replaced with mock data',
+        cmd:   'curl -s http://localhost:8080/api/user/profile',
+      },
+      {
+        label: 'GET /api/users  →  PII in array items scrubbed (plugin walks arrays recursively)',
+        cmd:   'curl -s http://localhost:8080/api/users',
+      },
+      {
+        label: 'POST /api/register  →  request body PII scrubbed before it reaches the backend',
+        cmd:   'curl -s -X POST http://localhost:8080/api/register -H "Content-Type: application/json" -d \'{"name":"Jane Doe","email":"jane@real.com","phone":"555-1234","password":"hunter2","address":"123 Real St","zip":"97201"}\'',
+      },
+      {
+        label: 'POST /api/orders  →  nested PII (customer + shipping object) all scrubbed',
+        cmd:   'curl -s -X POST http://localhost:8080/api/orders -H "Content-Type: application/json" -d \'{"order_id":"ORD-001","customer":{"name":"John Smith","email":"john@real.com","phone":"555-9999"},"shipping":{"address":"456 Oak Ave","city":"Portland","zip":"97201","country":"US"},"total":99.99}\'',
+      },
+    ],
+  },
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────

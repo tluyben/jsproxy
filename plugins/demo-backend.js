@@ -4,12 +4,18 @@
  * demo-backend — a simple HTTP server used in plugin demos.
  *
  * Routes:
- *   GET  /            echo request info as JSON
- *   GET  /hello       returns a backend greeting (overridden by hello-world plugin)
- *   GET  /api/v1/*    v1 API (should be rewritten to v2 by rewrite plugin)
- *   GET  /api/v2/*    v2 API (the actual target after rewrite)
- *   GET  /flaky       alternates between 200 and 500 on each request (for retry demo)
- *   GET  /health      always 200
+ *   GET  /                  echo request info as JSON
+ *   GET  /hello             returns a backend greeting (overridden by hello-world plugin)
+ *   GET  /api/v1/*          v1 API (should be rewritten to v2 by rewrite plugin)
+ *   GET  /api/v2/*          v2 API (the actual target after rewrite)
+ *   GET  /flaky             alternates between 200 and 500 on each request (for retry demo)
+ *   GET  /api/users         user list with PII fields (pii demo)
+ *   GET  /api/user/profile  single user profile with PII (pii demo)
+ *   POST /api/register      echoes registration body back (pii demo — request scrubbing)
+ *   POST /api/orders        echoes order body back (pii demo — nested PII in shipping)
+ *   GET  /api/slow          artificial 500ms delay (telemetry demo — latency)
+ *   GET  /api/crash         always returns 500 (telemetry demo — error spans)
+ *   GET  /health            always 200
  *
  * Usage:
  *   node plugins/demo-backend.js
@@ -75,6 +81,97 @@ http.createServer((req, res) => {
     }, null, 2));
   }
 
+  // ── telemetry demo routes ─────────────────────────────────────────────────
+
+  // /api/slow — artificial 500ms delay (demonstrates latency capture in telemetry plugin)
+  if (req.url === '/api/slow' || req.url.startsWith('/api/slow?')) {
+    return setTimeout(() => {
+      send(res, 200, 'application/json', JSON.stringify({
+        ok: true,
+        note: 'This response was delayed 500ms — check the latency in the telemetry span.',
+        delayMs: 500,
+      }, null, 2));
+    }, 500);
+  }
+
+  // /api/crash — always 500 (demonstrates error span in telemetry plugin)
+  if (req.url === '/api/crash' || req.url.startsWith('/api/crash?')) {
+    console.log(`[backend #${id}] /api/crash → 500`);
+    return send(res, 500, 'application/json', JSON.stringify({
+      error: 'simulated crash',
+      note: 'telemetry plugin will emit this as an error span',
+    }, null, 2));
+  }
+
+  // ── pii demo routes ───────────────────────────────────────────────────────
+
+  // /api/users — user list with PII (response scrubbed by pii plugin)
+  if (req.url === '/api/users' || req.url.startsWith('/api/users?')) {
+    return send(res, 200, 'application/json', JSON.stringify({
+      users: [
+        { id: 1, name: 'Jane Doe',     email: 'jane@real-company.com',  phone: '555-867-5309', username: 'jdoe' },
+        { id: 2, name: 'John Smith',   email: 'john@real-company.com',  phone: '555-321-7654', username: 'jsmith' },
+        { id: 3, name: 'Alice Walker', email: 'alice@real-company.com', phone: '555-111-2222', username: 'awalker' },
+      ],
+    }, null, 2));
+  }
+
+  // /api/user/profile — single user profile with rich PII (response scrubbed by pii plugin)
+  if (req.url === '/api/user/profile' || req.url.startsWith('/api/user/profile?')) {
+    return send(res, 200, 'application/json', JSON.stringify({
+      id: 42,
+      name: 'Jane Doe',
+      email: 'jane.doe@real-company.com',
+      username: 'janedoe',
+      phone: '555-867-5309',
+      dob: '1990-04-15',
+      ssn: '123-45-6789',
+      address: '742 Evergreen Terrace',
+      city: 'Springfield',
+      state: 'IL',
+      zip: '62701',
+      country: 'US',
+      ip_address: '203.0.113.42',
+      avatar: 'https://cdn.real-company.com/avatars/jane.jpg',
+      payment: {
+        card_number: '4111111111111111',
+        cvv: '737',
+        billing_address: '742 Evergreen Terrace',
+      },
+    }, null, 2));
+  }
+
+  // /api/register — POST: echoes the request body back so you can see what the backend received
+  // The pii plugin scrubs the request body before it arrives here.
+  if (req.url === '/api/register' || req.url.startsWith('/api/register')) {
+    let body = '';
+    req.on('data', d => (body += d));
+    return req.on('end', () => {
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch {}
+      send(res, 200, 'application/json', JSON.stringify({
+        ok: true,
+        note: 'Backend received this body — PII should be scrubbed if the plugin is active.',
+        receivedBody: parsed || body || null,
+      }, null, 2));
+    });
+  }
+
+  // /api/orders — POST: echoes nested order body (shipping/billing PII) back
+  if (req.url === '/api/orders' || req.url.startsWith('/api/orders')) {
+    let body = '';
+    req.on('data', d => (body += d));
+    return req.on('end', () => {
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch {}
+      send(res, 200, 'application/json', JSON.stringify({
+        ok: true,
+        note: 'Backend received this order — customer/shipping PII should be scrubbed.',
+        receivedOrder: parsed || body || null,
+      }, null, 2));
+    });
+  }
+
   // Default: echo
   let body = '';
   req.on('data', d => (body += d));
@@ -88,7 +185,9 @@ http.createServer((req, res) => {
   });
 }).listen(PORT, () => {
   console.log(`demo-backend listening on port ${PORT}`);
-  console.log(`  Routes: / /hello /api/v1/* /api/v2/* /flaky /health`);
+  console.log(`  Routes: / /hello /api/v1/* /api/v2/* /flaky`);
+  console.log(`          /api/users /api/user/profile /api/register /api/orders`);
+  console.log(`          /api/slow /api/crash /health`);
 });
 
 function send(res, status, type, body) {
