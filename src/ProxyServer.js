@@ -83,7 +83,11 @@ class ProxyServer {
 
   async initialize() {
     await this.db.initialize();
-    await this.certManager.initialize();
+    const isProduction = process.env.NODE_ENV === 'production';
+    const enableHttps = process.env.ENABLE_HTTPS !== 'false' && (isProduction || process.env.ENABLE_HTTPS === 'true');
+    if (enableHttps) {
+      await this.certManager.initialize();
+    }
   }
 
   async start() {

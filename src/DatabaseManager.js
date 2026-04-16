@@ -173,16 +173,16 @@ class DatabaseManager {
 
         // No exact match, try wildcard match
         const parts = domain.split('.');
+        const wildcardSql = `
+          SELECT * FROM mappings
+          WHERE domain = ? AND (? LIKE '/' || front_uri || '%' OR front_uri = '')
+          ORDER BY LENGTH(front_uri) DESC
+          LIMIT 1
+        `;
+
         if (parts.length > 1) {
           parts.shift();
           const wildcardDomain = `*.${parts.join('.')}`;
-
-          const wildcardSql = `
-            SELECT * FROM mappings
-            WHERE domain = ? AND (? LIKE '/' || front_uri || '%' OR front_uri = '')
-            ORDER BY LENGTH(front_uri) DESC
-            LIMIT 1
-          `;
 
           this.db.get(wildcardSql, [wildcardDomain, requestUrl], (wildErr, wildcardRow) => {
             if (wildErr) {
