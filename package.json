@@ -6,6 +6,9 @@
   "bin": {"jsproxy": "index.js"},
   "scripts": {
     "start": "node index.js",
+    "demo:hello": "node scripts/run-demo.js hello",
+    "demo:rewrite": "node scripts/run-demo.js rewrite",
+    "demo:retry": "node scripts/run-demo.js retry",
     "dev": "node --watch index.js",
     "dev:80": "HTTP_PORT=80 HTTPS_PORT=443 ENABLE_HTTPS=false npm run dev",
     "dev:443": "HTTP_PORT=80 HTTPS_PORT=443 ENABLE_HTTPS=true npm run dev",

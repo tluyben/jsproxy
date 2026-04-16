@@ -11,6 +11,7 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 - **Flexible Routing**: Domain and URI-based traffic routing
 - **IP Allowlisting**: Per-mapping IP restrictions with CIDR range support, works transparently behind nginx
 - **Webhook Interceptor**: Optional pre-proxy webhook call to authorize, redirect, or block requests
+- **Plugin System**: Intercept and transform requests/responses via external HTTP services — rewrite URLs, add headers, retry failures, short-circuit with custom responses, and more
 - **External Backend Support**: Proxy to remote servers, not just localhost
 - **SQLite Backend**: WAL mode for concurrent reads during updates
 - **Docker Ready**: Complete containerization with docker-compose
@@ -79,6 +80,8 @@ CACHE_EXPIRY=60                    # Cache expiry in minutes; omit or -1 for agg
 WEBHOOK_URL=https://…/hook         # Pre-proxy webhook endpoint (optional, see Webhook Interceptor)
 WEBHOOK_TIMEOUT=5000               # Webhook response timeout in ms (default: 5000)
 WEBHOOK_SECRET=<secret>            # HMAC-SHA256 signing secret for X-Webhook-Signature header
+PLUGIN=localhost:3001,localhost:3002  # Plugin endpoints (optional, see Plugin System)
+PLUGIN_TIMEOUT=5000                # Per-plugin HTTP call timeout in ms (default: 5000)
 ```
 
 ## Configuration
@@ -308,6 +311,101 @@ http.createServer((req, res) => {
 WEBHOOK_URL=http://localhost:9000 node index.js
 ```
 
+## Plugin System
+
+Plugins let you intercept and transform requests and responses without modifying jsproxy.
+Each plugin is a plain HTTP server — any language, any framework — that exposes three endpoints.
+
+**When `PLUGIN` is not set the code path is identical to previous versions — zero overhead.**
+
+### Configuration
+
+```bash
+PLUGIN=localhost:3001                        # single plugin
+PLUGIN=localhost:3001,localhost:3002         # chain — called in order
+PLUGIN_TIMEOUT=5000                          # per-call timeout in ms (default: 5000)
+```
+
+### How it works
+
+```
+1. POST /valid  (all plugins in parallel — no payload, very cheap)
+                 → each returns { valid: true|false }
+                 → if ALL return false: skip plugins, proxy normally, no buffering
+
+2. POST /before  (interested plugins in order, request body included as base64)
+                 → first non-CONTINUE result wins
+
+3. Forward to backend  (with any rewrite applied)
+
+4. POST /after   (interested plugins in order, response body included as base64)
+                 → called even on 502 (backend down) so plugins can produce fallbacks
+                 → first non-CONTINUE result wins
+
+5. Send response to client
+```
+
+### Plugin endpoints
+
+Each plugin endpoint receives a JSON `POST` and must return JSON.
+
+**`/valid`** — lightweight opt-in, called in parallel:
+```json
+// request
+{ "requestId": "…", "domain": "example.com", "inPort": 8080, "uri": "/api/v1/users", "method": "GET" }
+// response
+{ "valid": true }
+```
+
+**`/before`** — full request available, called sequentially on interested plugins:
+```json
+// request  (payload is base64 or null)
+{ "requestId": "…", "domain": "example.com", "inPort": 8080,
+  "uri": "/api/v1/users", "method": "GET", "headers": {…}, "payload": null }
+
+// response options:
+{ "result": "CONTINUE" }
+{ "result": "IGNORE" }                                        // forward unchanged, skip /after
+{ "result": "CANCEL", "statusCode": 403 }                    // don't forward, respond immediately
+{ "result": "REWRITE_REQUEST", "uri": "…", "method": null, "headers": {…}, "payload": null }
+//   null fields keep the original value
+```
+
+**`/after`** — full response available, called sequentially on interested plugins:
+```json
+// request  (payload is base64 or null)
+{ "requestId": "…", "domain": "example.com", "inPort": 8080,
+  "statusCode": 200, "headers": {…}, "payload": "…" }
+
+// response options:
+{ "result": "CONTINUE" }
+{ "result": "CANCEL", "statusCode": 503 }
+{ "result": "REWRITE_RESPONSE", "statusCode": 200, "headers": {…}, "payload": "…" }
+//   null fields keep the original backend value
+```
+
+### Included plugins and demos
+
+Three example plugins ship in `plugins/` alongside a demo backend:
+
+| Plugin | Default port | What it does |
+|---|---|---|
+| `hello-world.js` | 3001 | Rewrites any `/hello` response to `"Hello World!"` |
+| `rewrite.js` | 3002 | Rewrites `/api/v1/*` → `/api/v2/*`, adds version headers |
+| `retry.js` | 3003 | Retries 5xx responses against the backend with exponential backoff |
+
+Run a fully self-contained demo with a single command — starts jsproxy, the backend, and the plugin; adds the mapping; and runs a series of curl examples:
+
+```bash
+npm run demo:hello
+npm run demo:rewrite
+npm run demo:retry
+```
+
+Each demo prints the curl commands so you can copy-paste and keep experimenting. Press Ctrl+C to stop everything.
+
+See [`docs/plugins.md`](docs/plugins.md) for the full API reference, plugin authoring guide, and demo walkthroughs.
+
 ## High Availability / Load Balancing
 
 When a mapping has `back_ports` set (comma-separated list), the proxy load-balances across those ports instead of using `back_port`.
@@ -402,6 +500,18 @@ npm run lint:fix
 npm run dev
 ```
 
+### Plugin demos
+
+Self-contained demos that spin up jsproxy, a backend, and a plugin — then run curl examples:
+
+```bash
+npm run demo:hello    # /hello always returns "Hello World!"
+npm run demo:rewrite  # /api/v1/* transparently rewritten to /api/v2/*
+npm run demo:retry    # 5xx responses retried with exponential backoff
+```
+
+Each demo leaves services running so you can copy-paste the curl commands and experiment. Ctrl+C shuts everything down.
+
 ## Architecture
 
 ### Process Structure
@@ -424,8 +534,11 @@ Master Process
    - **SSL Handling**: Ensure certificate exists for HTTPS requests
    - **Webhook** (if `WEBHOOK_URL` set): POST request metadata, await decision
 6. **Webhook gate**: Redirect or block based on webhook response; continue on `200`
-7. **Proxy Forward**: Forward request to backend service
-8. **Response Return**: Stream response back to client
+7. **Plugin `/valid`** (if `PLUGIN` set): fan-out to all plugins in parallel — each opts in or out; if none opt in, step 8–10 are skipped entirely
+8. **Plugin `/before`**: interested plugins called in order; can rewrite, cancel, or ignore the request
+9. **Proxy Forward**: Forward request to backend service (with any rewrites applied)
+10. **Plugin `/after`**: interested plugins called in order; can rewrite or cancel the response
+11. **Response Return**: Send response to client
 
 ### Error Handling
 
