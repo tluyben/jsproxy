@@ -4,11 +4,13 @@ const crypto = require('crypto');
 const httpProxy = require('http-proxy');
 const DatabaseManager = require('./DatabaseManager');
 const CertificateManager = require('./CertificateManager');
+const { noop } = require('./PluginManager');
 const { URL } = require('url');
 
 class ProxyServer {
-  constructor(logger) {
+  constructor(logger, pluginManager) {
     this.logger = logger;
+    this.pluginManager = pluginManager || noop;
     this.db = new DatabaseManager(logger);
     this.certManager = new CertificateManager(logger, this.db);
 
@@ -252,6 +254,28 @@ class ProxyServer {
         }
       }
 
+      // ── Plugin hooks ─────────────────────────────────────────────────────
+      // Completely skipped when no plugins are configured (hasPlugins = false).
+      if (this.pluginManager.hasPlugins) {
+        try {
+          const inPort = isHttps
+            ? parseInt(process.env.HTTPS_PORT || (process.env.NODE_ENV === 'production' ? '443' : '8443'), 10)
+            : parseInt(process.env.HTTP_PORT || (process.env.NODE_ENV === 'production' ? '80' : '8080'), 10);
+          const requestId = crypto.randomUUID();
+          const interested = await this.pluginManager.runValid(requestId, domain, inPort, req.url, req.method);
+          if (interested.length > 0) {
+            this.pluginManager.register(requestId, interested);
+            res.once('close', () => this.pluginManager.cleanup(requestId));
+            await this._handleWithPlugins(requestId, domain, inPort, mapping, req, res);
+            return;
+          }
+        } catch (err) {
+          this.logger.error('Plugin system error (fail-open):', err);
+          // Fall through to normal proxy path
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
       // HA round-robin across multiple ports
       if (String(mapping.back_port).includes(',')) {
         await this.haRequest(mapping, req, res);
@@ -404,29 +428,34 @@ class ProxyServer {
     });
   }
 
+  // Thin wrapper kept for backward compat with haRequest's original call sites.
   tryPort(mapping, port, req, body) {
+    return this._tryPort(mapping, port, req.url, req.method, req.headers, body);
+  }
+
+  // Core single-backend request. Used by both the HA path and the plugin path.
+  _tryPort(mapping, port, uri, method, reqHeaders, body) {
     return new Promise((resolve, reject) => {
       const backend = mapping.backend || 'http://localhost';
       const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
-      const isHttps = backendUrl.protocol === 'https:';
-      const lib = isHttps ? https : http;
+      const isHttpsBackend = backendUrl.protocol === 'https:';
+      const lib = isHttpsBackend ? https : http;
 
       const targetPath = (!mapping.front_uri && !mapping.back_uri)
-        ? req.url
-        : this.buildTargetPath(mapping, req.url);
+        ? uri
+        : this.buildTargetPath(mapping, uri);
 
-      const headers = Object.assign({}, req.headers);
+      const headers = Object.assign({}, reqHeaders);
       headers['host'] = `${backendUrl.hostname}:${port}`;
-      headers['x-forwarded-host'] = req.headers.host || '';
-      headers['x-forwarded-proto'] = req.connection.encrypted ? 'https' : 'http';
-      if (body.length > 0) headers['content-length'] = body.length;
+      if (!headers['x-forwarded-host']) headers['x-forwarded-host'] = headers['host'];
+      if (body && body.length > 0) headers['content-length'] = body.length;
       else delete headers['content-length'];
 
       const proxyReq = lib.request({
         hostname: backendUrl.hostname,
         port,
         path: targetPath,
-        method: req.method,
+        method,
         headers,
         timeout: 10000,
       }, (proxyRes) => {
@@ -449,9 +478,118 @@ class ProxyServer {
       });
       proxyReq.on('error', reject);
 
-      if (body.length > 0) proxyReq.write(body);
+      if (body && body.length > 0) proxyReq.write(body);
       proxyReq.end();
     });
+  }
+
+  // Single-port backend request for the plugin path. Returns a result object or
+  // a synthetic 502 on error.
+  async _requestSingle(mapping, uri, method, headers, body) {
+    try {
+      return await this._tryPort(mapping, parseInt(mapping.back_port, 10), uri, method, headers, body);
+    } catch (err) {
+      this.logger.error('_requestSingle failed:', err);
+      return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway') };
+    }
+  }
+
+  // Multi-port HA request for the plugin path. Returns best result object.
+  async _requestHA(mapping, uri, method, headers, body) {
+    const ports = String(mapping.back_port)
+      .split(',')
+      .map(p => parseInt(p.trim(), 10))
+      .filter(p => !isNaN(p));
+
+    let alive = ports.filter(p => !this.isPortDead(mapping.id, p));
+    if (alive.length === 0) alive = [...ports];
+
+    const start = this.nextRRIndex(mapping.id, alive.length);
+    const ordered = [...alive.slice(start), ...alive.slice(0, start)];
+
+    const results = [];
+
+    for (const port of ordered) {
+      try {
+        const result = await this._tryPort(mapping, port, uri, method, headers, body);
+        results.push(result);
+        if (result.statusCode >= 200 && result.statusCode < 300) return result;
+      } catch (err) {
+        if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+          this.markPortDead(mapping.id, port);
+        }
+      }
+    }
+
+    if (results.length === 0) {
+      return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway: all backends unavailable') };
+    }
+
+    results.sort((a, b) => Math.floor(a.statusCode / 100) - Math.floor(b.statusCode / 100));
+    return results[0];
+  }
+
+  // Full request/response pipeline used when ≥1 plugin expressed interest.
+  async _handleWithPlugins(requestId, domain, inPort, mapping, req, res) {
+    // Buffer request body (needed for before() payload and for re-sending to backend)
+    const requestBody = await this.bufferBody(req);
+
+    // ── before() ────────────────────────────────────────────────────────────
+    const beforeResult = await this.pluginManager.runBefore(
+      requestId, domain, inPort, req.url, req.method, req.headers, requestBody
+    );
+
+    if (beforeResult.type === 'CANCEL') {
+      res.writeHead(beforeResult.statusCode, { 'content-type': 'text/plain' });
+      return res.end();
+    }
+
+    // Apply REWRITE_REQUEST (null fields keep the original value)
+    let uri     = req.url;
+    let method  = req.method;
+    let headers = req.headers;
+    let body    = requestBody;
+    const skipAfter = beforeResult.type === 'IGNORE';
+
+    if (beforeResult.type === 'REWRITE_REQUEST') {
+      if (beforeResult.uri     != null) uri     = beforeResult.uri;
+      if (beforeResult.method  != null) method  = beforeResult.method;
+      if (beforeResult.headers != null) headers = beforeResult.headers;
+      if (beforeResult.payload != null) body    = Buffer.from(beforeResult.payload, 'base64');
+    }
+
+    // ── backend request ──────────────────────────────────────────────────────
+    const backendResult = String(mapping.back_port).includes(',')
+      ? await this._requestHA(mapping, uri, method, headers, body)
+      : await this._requestSingle(mapping, uri, method, headers, body);
+
+    // ── after() ──────────────────────────────────────────────────────────────
+    // Skipped when before() returned IGNORE (cleanup already done)
+    if (skipAfter) {
+      return this.sendHAResponse(res, backendResult);
+    }
+
+    const afterResult = await this.pluginManager.runAfter(
+      requestId, domain, inPort, backendResult.statusCode, backendResult.headers, backendResult.body
+    );
+
+    if (afterResult.type === 'CANCEL') {
+      res.writeHead(afterResult.statusCode, { 'content-type': 'text/plain' });
+      return res.end();
+    }
+
+    if (afterResult.type === 'REWRITE_RESPONSE') {
+      const status  = afterResult.statusCode ?? backendResult.statusCode;
+      const hdrs    = afterResult.headers    ?? backendResult.headers;
+      const resBody = afterResult.payload != null
+        ? Buffer.from(afterResult.payload, 'base64')
+        : backendResult.body;
+      res.writeHead(status, hdrs);
+      return res.end(resBody);
+    }
+
+    // CONTINUE — send the backend response as-is
+    this.sendHAResponse(res, backendResult);
   }
 
   sendHAResponse(res, result) {
@@ -482,41 +620,8 @@ class ProxyServer {
     }
 
     const body = await this.bufferBody(req);
-
-    // Build ordered port list starting from round-robin position, skipping dead ones
-    let alive = ports.filter(p => !this.isPortDead(mapping.id, p));
-    if (alive.length === 0) alive = [...ports]; // all dead → try anyway
-
-    const start = this.nextRRIndex(mapping.id, alive.length);
-    const ordered = [...alive.slice(start), ...alive.slice(0, start)];
-
-    const results = [];
-
-    for (const port of ordered) {
-      try {
-        const result = await this.tryPort(mapping, port, req, body);
-        results.push(result);
-        if (result.statusCode >= 200 && result.statusCode < 300) {
-          this.sendHAResponse(res, result);
-          return;
-        }
-      } catch (err) {
-        if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
-          this.markPortDead(mapping.id, port);
-        }
-        // other errors (ETIMEOUT etc.) don't permanently kill the port
-      }
-    }
-
-    if (results.length === 0) {
-      res.writeHead(502, { 'Content-Type': 'text/plain' });
-      res.end('Bad Gateway: all backends unavailable');
-      return;
-    }
-
-    // Pick best by status class: 2xx < 3xx < 4xx < 5xx
-    results.sort((a, b) => Math.floor(a.statusCode / 100) - Math.floor(b.statusCode / 100));
-    this.sendHAResponse(res, results[0]);
+    const result = await this._requestHA(mapping, req.url, req.method, req.headers, body);
+    this.sendHAResponse(res, result);
   }
 
   // ── IP allowlist helpers ───────────────────────────────────────────────────

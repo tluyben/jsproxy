@@ -58,14 +58,16 @@ if (cluster.isMaster) {
 
 } else {
   const ProxyServer = require('./src/ProxyServer');
-  
+  const { PluginManager } = require('./src/PluginManager');
+
   async function startWorker() {
     try {
       // Get worker ID
       const workerId = parseInt(process.env.WORKER_ID || '0');
       logger.info(`Worker ${process.pid} starting with ID: ${workerId}`);
-      
-      const server = new ProxyServer(logger);
+
+      const pluginManager = new PluginManager(logger, process.env.PLUGIN);
+      const server = new ProxyServer(logger, pluginManager);
       await server.initialize();
       await server.start();
       
