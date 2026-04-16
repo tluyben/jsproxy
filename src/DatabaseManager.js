@@ -190,10 +190,19 @@ class DatabaseManager {
               reject(wildErr);
               return;
             }
-            resolve(wildcardRow || null);
+            if (wildcardRow) { resolve(wildcardRow); return; }
+            // Final fallback: global '*' catch-all
+            this.db.get(wildcardSql, ['*', requestUrl], (catchErr, catchRow) => {
+              if (catchErr) { this.logger.error('Error getting catch-all mapping:', catchErr); reject(catchErr); return; }
+              resolve(catchRow || null);
+            });
           });
         } else {
-          resolve(null);
+          // Domain has no dots (e.g. "netcup-7") — try global '*' catch-all directly
+          this.db.get(wildcardSql, ['*', requestUrl], (catchErr, catchRow) => {
+            if (catchErr) { this.logger.error('Error getting catch-all mapping:', catchErr); reject(catchErr); return; }
+            resolve(catchRow || null);
+          });
         }
       });
     });
