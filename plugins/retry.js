@@ -212,32 +212,46 @@ async function processQueue() {
   for (const row of rows) {
     const bodyBuf = row.payload ? Buffer.from(row.payload, 'base64') : Buffer.alloc(0);
     const headers = JSON.parse(row.headers);
-    const backend = backends[row.attempts % backends.length];
 
-    console.log(`[retry] attempt ${row.attempts + 1} for ${row.method} ${row.uri} → ${backend.url}`);
+    // Try every backend in order — only back off if ALL fail
+    let delivered = false;
+    let lastStatus = 0;
+    let lastReason = '';
 
-    try {
-      const result = await doRequest(backend, row.uri, row.method, headers, bodyBuf);
-      const bodyText = result.body.toString('utf8').slice(0, REASON_MAX);
+    for (let i = 0; i < backends.length; i++) {
+      const backend = backends[(row.attempts + i) % backends.length];
+      console.log(`[retry] attempt ${row.attempts + 1} for ${row.method} ${row.uri} → ${backend.url}`);
 
-      if (result.statusCode < 500) {
-        console.log(`[retry] success (${result.statusCode}) for ${row.uri} — removing from queue`);
-        await dbRun(`DELETE FROM retry_queue WHERE id = ?`, [row.id]);
-        continue;
+      try {
+        const result = await doRequest(backend, row.uri, row.method, headers, bodyBuf);
+        const bodyText = result.body.toString('utf8').slice(0, REASON_MAX);
+
+        if (result.statusCode < 500) {
+          console.log(`[retry] success (${result.statusCode}) for ${row.uri} — removing from queue`);
+          await dbRun(`DELETE FROM retry_queue WHERE id = ?`, [row.id]);
+          delivered = true;
+          break;
+        }
+
+        // 500: check if it's a permanent external failure or our own crash
+        if (result.statusCode === 500 && isPermanentFailure(bodyText)) {
+          console.log(`[retry] permanent failure (500) for ${row.uri} — DLQ immediately`);
+          await moveToDlq(row, 500, bodyText);
+          delivered = true; // don't reschedule
+          break;
+        }
+
+        lastStatus = result.statusCode;
+        lastReason = bodyText;
+      } catch (err) {
+        lastStatus = 0;
+        lastReason = err.message;
       }
+    }
 
-      // 500: check if it's a permanent external failure or our own crash
-      if (result.statusCode === 500 && isPermanentFailure(bodyText)) {
-        console.log(`[retry] permanent failure (500) for ${row.uri} — DLQ immediately`);
-        await moveToDlq(row, 500, bodyText);
-        continue;
-      }
-
-      // 500 (our crash) or 502/503/504 → reschedule or DLQ by age
-      await rescheduleOrDlq(row, result.statusCode, bodyText);
-    } catch (err) {
-      // Network error / timeout — definitely our infrastructure, reschedule
-      await rescheduleOrDlq(row, 0, err.message);
+    if (!delivered) {
+      // All backends failed — back off
+      await rescheduleOrDlq(row, lastStatus, lastReason);
     }
   }
 }
