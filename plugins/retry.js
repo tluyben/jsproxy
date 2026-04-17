@@ -1,66 +1,156 @@
 'use strict';
 
 /**
- * retry plugin
+ * retry plugin — async, SQLite-backed, with Dead Letter Queue
  *
- * When the backend returns a 5xx (or is unreachable → 502), retries the request
- * directly against the configured backend with exponential backoff.
+ * Retry policy:
+ *   502/503/504 → always queue for retry (backend unreachable / infrastructure error)
+ *   500         → inspect response body:
+ *                   if body matches PERMANENT_FAIL_PATTERNS → immediate DLQ (external rejection,
+ *                   e.g. MailChannels blocked address — hammering it again won't help)
+ *                   otherwise → queue for retry (our own crash: disk full, DB error, etc.)
+ *   4xx / 2xx   → pass through untouched
+ *
+ * After DLQ_AFTER_MS total age a retrying item is moved to retry_dlq.
+ * Use dlq-resurrect.js to move DLQ items back to the live queue.
+ *
+ * Every queued/DLQ'd item stores fail_status + fail_reason (truncated body)
+ * so you can inspect exactly why something failed.
  *
  * Environment variables:
- *   PORT          Plugin listen port         (default: 3003)
- *   BACKEND_URL   Backend to retry against   (default: http://localhost:3000)
- *   MAX_RETRIES   Max retry attempts         (default: 3)
- *   BASE_DELAY_MS First retry delay ms       (default: 200)
- *                 Subsequent delays: BASE_DELAY_MS * 2^attempt
- *
- * Usage:
- *   BACKEND_URL=http://localhost:3000 node plugins/retry.js
- *   PLUGIN=localhost:3003 node index.js
- *
- * How it works:
- *   /valid  → true for all requests (monitors everything)
- *   /before → saves request info (uri, method, headers, payload) keyed by requestId
- *   /after  → if statusCode ≥ 500, retries against BACKEND_URL with backoff;
- *             on success returns REWRITE_RESPONSE with the good response;
- *             on exhausted retries returns CONTINUE (passes through the error)
+ *   PORT                    Plugin listen port                         (default: 3003)
+ *   BACKEND_URLS            Comma-separated backends, round-robin      (default: http://localhost:3000)
+ *   BACKEND_URL             Single-backend fallback
+ *   PLUGIN_ROUTES           URI prefixes to intercept                  (default: /send,/api/send)
+ *   BASE_DELAY_MS           First retry delay ms                       (default: 1000)
+ *   MAX_BACKOFF_MS          Backoff ceiling ms                         (default: 3600000 = 1h)
+ *   DLQ_AFTER_MS            Age before promoting to DLQ                (default: 3600000 = 1h)
+ *   RETRY_DB_PATH           SQLite queue file                          (default: /app/jsproxy/data/retry_queue.db)
+ *   POLL_INTERVAL_MS        Worker poll interval ms                    (default: 5000)
+ *   PERMANENT_FAIL_PATTERNS Comma-separated case-insensitive substrings in a 500 body
+ *                           that mean "do not retry, DLQ immediately"
+ *                           (default: mailchannels,delivery rejected,no such user,user unknown,550 ,551 ,552 ,553 ,554 )
  */
 
-const http = require('http');
+const http  = require('http');
 const https = require('https');
+const { randomUUID } = require('crypto');
 
-const PORT = parseInt(process.env.PORT || '3003', 10);
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
-const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
-const BASE_DELAY_MS = parseInt(process.env.BASE_DELAY_MS || '200', 10);
+const PORT             = parseInt(process.env.PORT             || '3003',        10);
+const BASE_DELAY_MS    = parseInt(process.env.BASE_DELAY_MS    || '1000',        10);
+const MAX_BACKOFF_MS   = parseInt(process.env.MAX_BACKOFF_MS   || String(60 * 60 * 1000), 10);
+const DLQ_AFTER_MS     = parseInt(process.env.DLQ_AFTER_MS     || String(60 * 60 * 1000), 10);
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '5000',        10);
+const RETRY_DB_PATH    = process.env.RETRY_DB_PATH || '/app/jsproxy/data/retry_queue.db';
+const REASON_MAX       = 500; // chars to store from response body
 
-const backendParsed = new URL(BACKEND_URL);
-const backendLib = backendParsed.protocol === 'https:' ? https : http;
-const backendPort = parseInt(backendParsed.port || (backendParsed.protocol === 'https:' ? '443' : '80'), 10);
+const PLUGIN_ROUTES = (process.env.PLUGIN_ROUTES || '/send,/api/send')
+  .split(',').map(r => r.trim()).filter(Boolean);
 
-// Stores request info between /before and /after calls.
-// Each entry: { uri, method, headers, payload, ts }
-// ts is used by the cleanup interval to evict stale entries (safety net).
-const pending = new Map();
+const BACKEND_URLS = (process.env.BACKEND_URLS || process.env.BACKEND_URL || 'http://localhost:3000')
+  .split(',').map(u => u.trim()).filter(Boolean);
 
-// Safety net: evict entries older than 2 minutes (covers dropped connections etc.)
-const GC_INTERVAL = setInterval(() => {
-  const cutoff = Date.now() - 120_000;
-  for (const [id, info] of pending) {
-    if (info.ts < cutoff) {
-      pending.delete(id);
-    }
+const PERMANENT_FAIL_PATTERNS = (
+  process.env.PERMANENT_FAIL_PATTERNS ||
+  'mailchannels,delivery rejected,no such user,user unknown,550 ,551 ,552 ,553 ,554 '
+).split(',').map(p => p.trim().toLowerCase()).filter(Boolean);
+
+/** Returns true if a 500 response body indicates a permanent external failure */
+function isPermanentFailure(bodyText) {
+  const lower = bodyText.toLowerCase();
+  return PERMANENT_FAIL_PATTERNS.some(p => lower.includes(p));
+}
+
+// ── SQLite queue ──────────────────────────────────────────────────────────────
+
+const sqlite3 = require('sqlite3');
+const db = new sqlite3.Database(RETRY_DB_PATH, (err) => {
+  if (err) {
+    console.error(`[retry] FATAL: could not open SQLite queue at ${RETRY_DB_PATH}: ${err.message}`);
+    process.exit(1);
   }
-}, 60_000);
-GC_INTERVAL.unref(); // don't keep the process alive just for this
+  console.log(`[retry] queue DB: ${RETRY_DB_PATH}`);
+});
+
+db.serialize(() => {
+  db.run('PRAGMA journal_mode = WAL');
+  db.run(`
+    CREATE TABLE IF NOT EXISTS retry_queue (
+      id           TEXT    PRIMARY KEY,
+      uri          TEXT    NOT NULL,
+      method       TEXT    NOT NULL,
+      headers      TEXT    NOT NULL,
+      payload      TEXT,
+      attempts     INTEGER NOT NULL DEFAULT 0,
+      next_retry   INTEGER NOT NULL DEFAULT 0,
+      fail_status  INTEGER,
+      fail_reason  TEXT,
+      created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS retry_dlq (
+      id           TEXT    PRIMARY KEY,
+      uri          TEXT    NOT NULL,
+      method       TEXT    NOT NULL,
+      headers      TEXT    NOT NULL,
+      payload      TEXT,
+      attempts     INTEGER NOT NULL DEFAULT 0,
+      fail_status  INTEGER,
+      fail_reason  TEXT,
+      created_at   INTEGER NOT NULL,
+      dlq_at       INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+    )
+  `);
+  // Migrations: add columns if they don't exist yet (ALTER TABLE errors are silently ignored)
+  db.run(`ALTER TABLE retry_queue ADD COLUMN fail_status INTEGER`, () => {});
+  db.run(`ALTER TABLE retry_queue ADD COLUMN fail_reason TEXT`,   () => {});
+  db.run(`ALTER TABLE retry_dlq   ADD COLUMN fail_status INTEGER`, () => {});
+  db.run(`ALTER TABLE retry_dlq   ADD COLUMN fail_reason TEXT`,   () => {});
+});
+
+function dbRun(sql, params) {
+  return new Promise((resolve, reject) =>
+    db.run(sql, params, function (err) { err ? reject(err) : resolve(this); })
+  );
+}
+function dbAll(sql, params) {
+  return new Promise((resolve, reject) =>
+    db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows))
+  );
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+function isInterested(uri) {
+  const path = uri.split('?')[0];
+  return PLUGIN_ROUTES.some(r => path === r || path.startsWith(r + '/') || path.startsWith(r + '?'));
+}
+
+function parseBackend(url) {
+  const parsed = new URL(url);
+  return {
+    url,
+    lib:      parsed.protocol === 'https:' ? https : http,
+    hostname: parsed.hostname,
+    port:     parseInt(parsed.port || (parsed.protocol === 'https:' ? '443' : '80'), 10),
+  };
+}
+
+const backends = BACKEND_URLS.map(parseBackend);
+
+function backoff(attempts) {
+  return Math.min(BASE_DELAY_MS * Math.pow(2, attempts), MAX_BACKOFF_MS);
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function doRequest(uri, method, headers, bodyBuf) {
+function doRequest(backend, uri, method, headers, bodyBuf) {
   return new Promise((resolve, reject) => {
     const reqHeaders = Object.assign({}, headers, {
-      host: `${backendParsed.hostname}:${backendPort}`,
+      host: `${backend.hostname}:${backend.port}`,
     });
     if (bodyBuf && bodyBuf.length > 0) {
       reqHeaders['content-length'] = bodyBuf.length;
@@ -68,66 +158,126 @@ function doRequest(uri, method, headers, bodyBuf) {
       delete reqHeaders['content-length'];
     }
 
-    const req = backendLib.request(
-      {
-        hostname: backendParsed.hostname,
-        port: backendPort,
-        path: uri,
-        method,
-        headers: reqHeaders,
-        timeout: 10_000,
-      },
+    const req = backend.lib.request(
+      { hostname: backend.hostname, port: backend.port, path: uri, method, headers: reqHeaders, timeout: 10_000 },
       (res) => {
         const chunks = [];
         res.on('data', c => chunks.push(c));
-        res.on('end', () =>
-          resolve({
-            statusCode: res.statusCode,
-            headers: res.headers,
-            body: Buffer.concat(chunks),
-          })
-        );
+        res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
         res.on('error', reject);
       }
     );
-    req.on('timeout', () => {
-      req.destroy();
-      const err = new Error('backend request timeout');
-      err.code = 'ETIMEOUT';
-      reject(err);
-    });
+    req.on('timeout', () => { req.destroy(); const e = new Error('timeout'); e.code = 'ETIMEOUT'; reject(e); });
     req.on('error', reject);
     if (bodyBuf && bodyBuf.length > 0) req.write(bodyBuf);
     req.end();
   });
 }
 
+// ── background worker ─────────────────────────────────────────────────────────
+
+async function moveToDlq(row, failStatus, failReason) {
+  const age = Math.round((Date.now() - row.created_at) / 60000);
+  console.log(`[retry] DLQ: ${row.method} ${row.uri} — status=${failStatus} reason="${failReason}" (age ${age}min, ${row.attempts} attempts)`);
+  await dbRun(
+    `INSERT INTO retry_dlq (id, uri, method, headers, payload, attempts, fail_status, fail_reason, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [row.id, row.uri, row.method, row.headers, row.payload,
+     row.attempts, failStatus, failReason, row.created_at]
+  );
+  await dbRun(`DELETE FROM retry_queue WHERE id = ?`, [row.id]);
+}
+
+async function rescheduleOrDlq(row, failStatus, failReason) {
+  const age = Date.now() - row.created_at;
+  if (age >= DLQ_AFTER_MS) {
+    await moveToDlq(row, failStatus, failReason);
+  } else {
+    const delay = backoff(row.attempts + 1);
+    console.log(`[retry] rescheduling ${row.uri} in ${Math.round(delay / 1000)}s — status=${failStatus} reason="${failReason}"`);
+    await dbRun(
+      `UPDATE retry_queue SET attempts = ?, next_retry = ?, fail_status = ?, fail_reason = ? WHERE id = ?`,
+      [row.attempts + 1, Date.now() + delay, failStatus, failReason, row.id]
+    );
+  }
+}
+
+async function processQueue() {
+  const now  = Date.now();
+  const rows = await dbAll(`SELECT * FROM retry_queue WHERE next_retry <= ? ORDER BY next_retry ASC LIMIT 10`, [now]);
+  if (rows.length === 0) return;
+
+  console.log(`[retry] worker: ${rows.length} item(s) due`);
+
+  for (const row of rows) {
+    const bodyBuf = row.payload ? Buffer.from(row.payload, 'base64') : Buffer.alloc(0);
+    const headers = JSON.parse(row.headers);
+    const backend = backends[row.attempts % backends.length];
+
+    console.log(`[retry] attempt ${row.attempts + 1} for ${row.method} ${row.uri} → ${backend.url}`);
+
+    try {
+      const result = await doRequest(backend, row.uri, row.method, headers, bodyBuf);
+      const bodyText = result.body.toString('utf8').slice(0, REASON_MAX);
+
+      if (result.statusCode < 500) {
+        console.log(`[retry] success (${result.statusCode}) for ${row.uri} — removing from queue`);
+        await dbRun(`DELETE FROM retry_queue WHERE id = ?`, [row.id]);
+        continue;
+      }
+
+      // 500: check if it's a permanent external failure or our own crash
+      if (result.statusCode === 500 && isPermanentFailure(bodyText)) {
+        console.log(`[retry] permanent failure (500) for ${row.uri} — DLQ immediately`);
+        await moveToDlq(row, 500, bodyText);
+        continue;
+      }
+
+      // 500 (our crash) or 502/503/504 → reschedule or DLQ by age
+      await rescheduleOrDlq(row, result.statusCode, bodyText);
+    } catch (err) {
+      // Network error / timeout — definitely our infrastructure, reschedule
+      await rescheduleOrDlq(row, 0, err.message);
+    }
+  }
+}
+
+const worker = setInterval(async () => {
+  try { await processQueue(); } catch (err) { console.error('[retry] worker error:', err); }
+}, POLL_INTERVAL_MS);
+worker.unref();
+
+// ── plugin HTTP server ────────────────────────────────────────────────────────
+
+const pending = new Map();
+
+const GC = setInterval(() => {
+  const cutoff = Date.now() - 120_000;
+  for (const [id, info] of pending) {
+    if (info.ts < cutoff) pending.delete(id);
+  }
+}, 60_000);
+GC.unref();
+
 http.createServer((req, res) => {
   let raw = '';
   req.on('data', d => (raw += d));
   req.on('end', async () => {
     let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      res.writeHead(400);
-      return res.end('bad json');
-    }
+    try { data = JSON.parse(raw); } catch { res.writeHead(400); return res.end('bad json'); }
 
     try {
       if (req.url === '/valid') {
-        // Monitor all requests
-        return json(res, { valid: true });
+        return json(res, { valid: isInterested(data.uri) });
       }
 
       if (req.url === '/before') {
-        // Save request info for potential retry in /after
         pending.set(data.requestId, {
-          uri: data.uri,
-          method: data.method,
+          uri:     data.uri,
+          method:  data.method,
           headers: data.headers,
-          payload: data.payload, // base64 or null
-          ts: Date.now(),
+          payload: data.payload,
+          ts:      Date.now(),
         });
         return json(res, { result: 'CONTINUE' });
       }
@@ -136,55 +286,64 @@ http.createServer((req, res) => {
         const info = pending.get(data.requestId);
         pending.delete(data.requestId);
 
-        // Only retry on 5xx
+        // 4xx and below — pass through
         if (data.statusCode < 500 || !info) {
           return json(res, { result: 'CONTINUE' });
         }
 
-        const bodyBuf = info.payload ? Buffer.from(info.payload, 'base64') : Buffer.alloc(0);
+        // Decode response body for inspection
+        const bodyText = data.payload
+          ? Buffer.from(data.payload, 'base64').toString('utf8').slice(0, REASON_MAX)
+          : '';
 
-        console.log(`[retry] ${info.method} ${info.uri} got ${data.statusCode} — retrying (max ${MAX_RETRIES})`);
-
-        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-          const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
-          console.log(`[retry] attempt ${attempt}/${MAX_RETRIES} after ${delay}ms`);
-          await sleep(delay);
-
-          try {
-            const result = await doRequest(info.uri, info.method, info.headers, bodyBuf);
-            console.log(`[retry] attempt ${attempt} → ${result.statusCode}`);
-
-            if (result.statusCode < 500) {
-              console.log(`[retry] success on attempt ${attempt}`);
-              return json(res, {
-                result: 'REWRITE_RESPONSE',
-                statusCode: result.statusCode,
-                headers: result.headers,
-                payload: result.body.length > 0 ? result.body.toString('base64') : null,
-              });
-            }
-            // 5xx again — keep trying
-          } catch (err) {
-            console.log(`[retry] attempt ${attempt} failed: ${err.message}`);
-            // backend still down — keep trying
-          }
+        // 500: check if permanent external failure → pass through to client, DLQ for record
+        if (data.statusCode === 500 && isPermanentFailure(bodyText)) {
+          // Store in DLQ for visibility but don't retry — pass the real error back to client
+          const id = randomUUID();
+          const now = Date.now();
+          await dbRun(
+            `INSERT INTO retry_dlq (id, uri, method, headers, payload, attempts, fail_status, fail_reason, created_at)
+             VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+            [id, info.uri, info.method, JSON.stringify(info.headers), info.payload || null,
+             500, bodyText, now]
+          );
+          console.log(`[retry] permanent 500 for ${info.uri} — DLQ'd (id=${id}), passing error to client`);
+          return json(res, { result: 'CONTINUE' }); // client sees the real 500
         }
 
-        console.log(`[retry] all ${MAX_RETRIES} retries exhausted — passing through error`);
-        return json(res, { result: 'CONTINUE' });
+        // 500 (our crash) or 502/503/504 → queue for retry, return 202 to client
+        const id = randomUUID();
+        await dbRun(
+          `INSERT INTO retry_queue (id, uri, method, headers, payload, next_retry, fail_status, fail_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [id, info.uri, info.method, JSON.stringify(info.headers), info.payload || null,
+           Date.now(), data.statusCode, bodyText]
+        );
+
+        console.log(`[retry] queued ${info.method} ${info.uri} (${data.statusCode}) id=${id} — "${bodyText.slice(0, 80)}"`);
+
+        const body = JSON.stringify({ queued: true, id, message: 'Request accepted and queued for delivery' });
+        return json(res, {
+          result:     'REWRITE_RESPONSE',
+          statusCode: 202,
+          headers:    { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)) },
+          payload:    Buffer.from(body).toString('base64'),
+        });
       }
 
-      res.writeHead(404);
-      res.end();
+      res.writeHead(404); res.end();
     } catch (err) {
       console.error('[retry] plugin error:', err);
-      json(res, { result: 'CONTINUE' }); // fail-open
+      json(res, { result: 'CONTINUE' });
     }
   });
 }).listen(PORT, () => {
-  console.log(`retry plugin listening on port ${PORT}`);
-  console.log(`  Backend: ${BACKEND_URL}`);
-  console.log(`  Max retries: ${MAX_RETRIES}, base delay: ${BASE_DELAY_MS}ms (exponential)`);
+  console.log(`[retry] plugin listening on :${PORT}`);
+  console.log(`[retry]   routes:            ${PLUGIN_ROUTES.join(', ')}`);
+  console.log(`[retry]   backends:          ${BACKEND_URLS.join(', ')} (round-robin)`);
+  console.log(`[retry]   backoff:           ${BASE_DELAY_MS}ms base, ${MAX_BACKOFF_MS / 1000}s cap, DLQ after ${DLQ_AFTER_MS / 1000}s`);
+  console.log(`[retry]   permanent-fail:    ${PERMANENT_FAIL_PATTERNS.join(' | ')}`);
+  console.log(`[retry]   queue:             ${RETRY_DB_PATH}`);
 });
 
 function json(res, obj) {
