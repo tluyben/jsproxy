@@ -10,6 +10,7 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 - **Zero Downtime**: Hot database replacement without service interruption
 - **Flexible Routing**: Domain and URI-based traffic routing
 - **IP Allowlisting**: Per-mapping IP restrictions with CIDR range support, works transparently behind nginx
+- **Auth Protection**: Per-mapping HTTP Basic Auth, Bearer token, or password-only auth with optional expiry and use-count limits
 - **Webhook Interceptor**: Optional pre-proxy webhook call to authorize, redirect, or block requests
 - **Plugin System**: Intercept and transform requests/responses via external HTTP services — rewrite URLs, add headers, retry failures, short-circuit with custom responses, and more
 - **External Backend Support**: Proxy to remote servers, not just localhost
@@ -98,7 +99,9 @@ CREATE TABLE mappings (
   back_port TEXT NOT NULL,       -- Backend port (e.g., 3000); comma-separated for HA (e.g., "3000,3001,3002")
   back_uri TEXT NOT NULL,        -- Backend URI path (e.g., "api/v1/users")
   backend TEXT DEFAULT NULL,     -- Backend server URL (e.g., "https://api.example.com", defaults to "http://localhost")
-  allowed_ips TEXT DEFAULT NULL, -- IP allowlist: comma-separated IPs/CIDRs; NULL or empty = allow all
+  allowed_ips TEXT DEFAULT NULL,       -- IP allowlist: comma-separated IPs/CIDRs; NULL or empty = allow all
+  auth_type TEXT DEFAULT NULL,         -- Auth mode: 'basic', 'bearer', 'password', or NULL (no auth)
+  auth_credentials TEXT DEFAULT NULL,  -- JSON array of credential objects (see Auth Protection section)
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -222,6 +225,96 @@ UPDATE mappings SET allowed_ips = NULL WHERE domain = 'admin.example.com';
 ```
 
 WebSocket connections respect the same allowlist — blocked connections receive `403 Forbidden` before the upgrade is completed.
+
+## Auth Protection
+
+Each mapping can optionally require authentication via one of three modes. Only **one mode** is active per mapping at a time. Multiple credentials of the same type can coexist — any one match grants access. Auth is checked after IP allowlisting.
+
+| Mode | `auth_type` | Header expected by clients |
+|------|-------------|---------------------------|
+| HTTP Basic Auth | `basic` | `Authorization: Basic base64(user:pass)` |
+| Bearer token | `bearer` | `Authorization: Bearer <token>` |
+| Password only | `password` | `Authorization: Bearer <password>` or `Authorization: Basic base64(:password)` |
+
+- **NULL auth_type** — open access (default, fully backward compatible)
+- **Auth set** — unauthenticated requests receive `401 Unauthorized` with a `WWW-Authenticate` header
+- WebSocket upgrades are auth-checked the same way
+
+### Managing auth with the CLI
+
+```bash
+# ── Set auth type (clears credentials if type changes) ──────────────────────
+node scripts/manage-auth.js api.example.com --type bearer
+node scripts/manage-auth.js api.example.com --type basic
+node scripts/manage-auth.js api.example.com --type password
+
+# ── Add credentials ──────────────────────────────────────────────────────────
+# Bearer token
+node scripts/manage-auth.js api.example.com --add-bearer mysecrettoken
+
+# Basic auth
+node scripts/manage-auth.js api.example.com --add-basic alice:s3cr3t
+node scripts/manage-auth.js api.example.com --add-basic bob:p@ssw0rd
+
+# Password only
+node scripts/manage-auth.js api.example.com --add-password mysharedpassword
+
+# ── Optional: expiry and/or max successful uses before credential is removed ─
+node scripts/manage-auth.js api.example.com --add-bearer temptoken --expires 2025-12-31
+node scripts/manage-auth.js api.example.com --add-bearer temptoken --max-uses 50
+node scripts/manage-auth.js api.example.com --add-basic alice:pass --expires 2025-06-01 --max-uses 100
+
+# ── List current auth config ─────────────────────────────────────────────────
+node scripts/manage-auth.js api.example.com --list
+
+# ── Remove a specific credential ─────────────────────────────────────────────
+node scripts/manage-auth.js api.example.com --remove alice           # basic: remove by username
+node scripts/manage-auth.js api.example.com --remove mysecrettoken   # bearer: remove by token
+node scripts/manage-auth.js api.example.com --remove mysharedpassword # password: remove by value
+
+# ── Remove all auth (open access again) ──────────────────────────────────────
+node scripts/manage-auth.js api.example.com --clear
+```
+
+### Managing auth via SQLite directly
+
+```sql
+-- Enable bearer auth with two tokens
+UPDATE mappings
+  SET auth_type = 'bearer',
+      auth_credentials = '[{"token":"abc123"},{"token":"xyz789","expires_at":"2025-12-31T00:00:00.000Z","max_uses":10}]'
+  WHERE domain = 'api.example.com';
+
+-- Enable basic auth
+UPDATE mappings
+  SET auth_type = 'basic',
+      auth_credentials = '[{"user":"alice","pass":"s3cr3t"},{"user":"bob","pass":"other"}]'
+  WHERE domain = 'api.example.com';
+
+-- Enable password-only auth
+UPDATE mappings
+  SET auth_type = 'password',
+      auth_credentials = '[{"pass":"mysharedpassword"}]'
+  WHERE domain = 'api.example.com';
+
+-- Remove auth entirely (open access)
+UPDATE mappings SET auth_type = NULL, auth_credentials = NULL WHERE domain = 'api.example.com';
+```
+
+### Credential JSON format
+
+Each entry in the `auth_credentials` JSON array supports these fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `user` | basic only | Username |
+| `pass` | basic / password | Password |
+| `token` | bearer only | Bearer token string |
+| `expires_at` | optional | ISO 8601 datetime; credential rejected after this time |
+| `max_uses` | optional | Remove credential automatically after N successful uses |
+| `uses` | managed automatically | Running use count (do not set manually) |
+
+Changes are active immediately — no proxy restart needed.
 
 ## Webhook Interceptor
 

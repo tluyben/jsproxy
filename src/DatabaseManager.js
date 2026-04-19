@@ -17,6 +17,7 @@ class DatabaseManager {
     await this.createMappingsTable();
     await this.addBackendColumnIfMissing();
     await this.addAllowedIpsColumnIfMissing();
+    await this.addAuthColumnsIfMissing();
   }
 
   async ensureDataDirectory() {
@@ -146,6 +147,46 @@ class DatabaseManager {
           if (err2) { this.logger.error('Error adding allowed_ips column:', err2); reject(err2); }
           else { this.logger.info('Added allowed_ips column to mappings table'); resolve(); }
         });
+      });
+    });
+  }
+
+  async addAuthColumnsIfMissing() {
+    return new Promise((resolve, reject) => {
+      this.db.all('PRAGMA table_info(mappings)', (err, columns) => {
+        if (err) { reject(err); return; }
+        const names = new Set(columns.map(c => c.name));
+        const toAdd = [];
+        if (!names.has('auth_type')) toAdd.push('ALTER TABLE mappings ADD COLUMN auth_type TEXT DEFAULT NULL');
+        if (!names.has('auth_credentials')) toAdd.push('ALTER TABLE mappings ADD COLUMN auth_credentials TEXT DEFAULT NULL');
+        if (toAdd.length === 0) { resolve(); return; }
+        let i = 0;
+        const next = () => {
+          if (i >= toAdd.length) { this.logger.info('Added auth columns to mappings table'); resolve(); return; }
+          this.db.run(toAdd[i++], (err2) => { if (err2) reject(err2); else next(); });
+        };
+        next();
+      });
+    });
+  }
+
+  async recordAuthUse(mappingId, credentialIndex) {
+    return new Promise((resolve) => {
+      this.db.get('SELECT auth_credentials FROM mappings WHERE id = ?', [mappingId], (err, row) => {
+        if (err || !row || !row.auth_credentials) { resolve(); return; }
+        let creds;
+        try { creds = JSON.parse(row.auth_credentials); } catch { resolve(); return; }
+        if (credentialIndex >= creds.length) { resolve(); return; }
+        const cred = creds[credentialIndex];
+        if (!cred.max_uses) { resolve(); return; }
+        cred.uses = (cred.uses || 0) + 1;
+        if (cred.uses >= cred.max_uses) creds.splice(credentialIndex, 1);
+        const json = creds.length > 0 ? JSON.stringify(creds) : null;
+        this.db.run(
+          'UPDATE mappings SET auth_credentials = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [json, mappingId],
+          (err2) => { if (err2) this.logger.error('Error recording auth use:', err2); resolve(); }
+        );
       });
     });
   }

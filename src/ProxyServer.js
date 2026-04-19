@@ -232,6 +232,15 @@ class ProxyServer {
         return;
       }
 
+      const authResult = this.checkAuth(req, mapping);
+      if (!authResult.allowed) {
+        this._sendUnauthorized(res, authResult);
+        return;
+      }
+      if (authResult.credentialIndex !== undefined) {
+        this.db.recordAuthUse(mapping.id, authResult.credentialIndex).catch(() => {});
+      }
+
       // Run certificate fetch (if HTTPS) and webhook check in parallel
       const certPromise = isHttps
         ? this.certManager.ensureCertificate(
@@ -335,6 +344,17 @@ class ProxyServer {
         socket.write('HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nForbidden');
         socket.destroy();
         return;
+      }
+
+      const wsAuthResult = this.checkAuth(req, mapping);
+      if (!wsAuthResult.allowed) {
+        const scheme = wsAuthResult.type === 'bearer' ? 'Bearer' : 'Basic';
+        socket.write(`HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: ${scheme} realm="Proxy"\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nUnauthorized`);
+        socket.destroy();
+        return;
+      }
+      if (wsAuthResult.credentialIndex !== undefined) {
+        this.db.recordAuthUse(mapping.id, wsAuthResult.credentialIndex).catch(() => {});
       }
 
       // Only generate certificates for domains in our database
@@ -666,6 +686,78 @@ class ProxyServer {
     const body = await this.bufferBody(req);
     const result = await this._requestHA(mapping, req.url, req.method, req.headers, body);
     this.sendHAResponse(res, result);
+  }
+
+  // ── Auth helpers ──────────────────────────────────────────────────────────
+
+  checkAuth(req, mapping) {
+    if (!mapping.auth_type) return { allowed: true };
+
+    let credentials = [];
+    try { credentials = mapping.auth_credentials ? JSON.parse(mapping.auth_credentials) : []; }
+    catch { return { allowed: false, type: 'basic' }; }
+
+    if (credentials.length === 0) return { allowed: false, type: mapping.auth_type === 'bearer' ? 'bearer' : 'basic' };
+
+    const authHeader = req.headers.authorization || '';
+    const now = new Date();
+    const expired = (c) => c.expires_at && new Date(c.expires_at) < now;
+
+    if (mapping.auth_type === 'bearer') {
+      if (!authHeader.startsWith('Bearer ')) return { allowed: false, type: 'bearer' };
+      const token = authHeader.slice(7).trim();
+      for (let i = 0; i < credentials.length; i++) {
+        const c = credentials[i];
+        if (c.token === token && !expired(c)) return { allowed: true, credentialIndex: i };
+      }
+      return { allowed: false, type: 'bearer' };
+    }
+
+    if (mapping.auth_type === 'basic') {
+      if (!authHeader.startsWith('Basic ')) return { allowed: false, type: 'basic' };
+      let user, pass;
+      try {
+        const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf8');
+        const idx = decoded.indexOf(':');
+        user = idx >= 0 ? decoded.slice(0, idx) : decoded;
+        pass = idx >= 0 ? decoded.slice(idx + 1) : '';
+      } catch { return { allowed: false, type: 'basic' }; }
+      for (let i = 0; i < credentials.length; i++) {
+        const c = credentials[i];
+        if (c.user === user && c.pass === pass && !expired(c)) return { allowed: true, credentialIndex: i };
+      }
+      return { allowed: false, type: 'basic' };
+    }
+
+    if (mapping.auth_type === 'password') {
+      let pass = null;
+      if (authHeader.startsWith('Bearer ')) {
+        pass = authHeader.slice(7).trim();
+      } else if (authHeader.startsWith('Basic ')) {
+        try {
+          const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf8');
+          const idx = decoded.lastIndexOf(':');
+          pass = idx >= 0 ? decoded.slice(idx + 1) : decoded;
+        } catch { /* ignore */ }
+      }
+      if (!pass) return { allowed: false, type: 'basic' };
+      for (let i = 0; i < credentials.length; i++) {
+        const c = credentials[i];
+        if (c.pass === pass && !expired(c)) return { allowed: true, credentialIndex: i };
+      }
+      return { allowed: false, type: 'basic' };
+    }
+
+    return { allowed: false, type: 'basic' };
+  }
+
+  _sendUnauthorized(res, authResult) {
+    const scheme = authResult.type === 'bearer' ? 'Bearer' : 'Basic';
+    res.writeHead(401, {
+      'Content-Type': 'text/plain',
+      'WWW-Authenticate': `${scheme} realm="Proxy"`,
+    });
+    res.end('Unauthorized');
   }
 
   // ── IP allowlist helpers ───────────────────────────────────────────────────
