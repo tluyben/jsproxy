@@ -144,19 +144,21 @@ impl ProxyServer {
         });
     }
 
-    /// Start the proxy server
+    /// Start the proxy server (binds its own listener — used in single-worker mode).
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let http_addr: SocketAddr = format!("{}:{}", self.config.http_host, self.config.http_port).parse()?;
         info!("Proxy server starting on HTTP:{}", self.config.http_port);
         if self.config.enable_https {
             info!("HTTPS will be enabled on port {}", self.config.https_port);
         }
-        self.run_http_server(http_addr).await
+        let listener = TcpListener::bind(http_addr).await?;
+        self.run_with_listener(listener).await
     }
 
-    async fn run_http_server(self: Arc<Self>, addr: SocketAddr) -> Result<()> {
-        let listener = TcpListener::bind(addr).await?;
-        info!("HTTP server listening on {}", addr);
+    /// Accept loop on a pre-bound listener.
+    /// Called by each worker thread when running in multi-worker mode.
+    pub async fn run_with_listener(self: Arc<Self>, listener: TcpListener) -> Result<()> {
+        info!("HTTP worker listening on {}", listener.local_addr()?);
 
         loop {
             let (stream, remote_addr) = listener.accept().await?;

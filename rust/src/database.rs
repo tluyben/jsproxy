@@ -115,7 +115,8 @@ impl DatabaseManager {
     pub fn find_mapping(&self, domain: &str, path: &str) -> Result<Option<Mapping>> {
         let conn = self.conn.lock();
 
-        let sql = "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports,
+        // CAST back_port so TEXT-affinity values (JS-created DBs) work too
+        let sql = "SELECT id, domain, front_uri, CAST(back_port AS INTEGER), back_uri, backend, back_ports,
                           allowed_ips, auth_type, auth_credentials, created_at, updated_at
                    FROM mappings
                    WHERE domain = ?1
@@ -333,11 +334,11 @@ impl DatabaseManager {
     pub fn list_mappings(&self, domain: Option<&str>) -> Result<Vec<Mapping>> {
         let conn = self.conn.lock();
         let sql = if domain.is_some() {
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports,
+            "SELECT id, domain, front_uri, CAST(back_port AS INTEGER), back_uri, backend, back_ports,
                     allowed_ips, auth_type, auth_credentials, created_at, updated_at
              FROM mappings WHERE domain = ?1 ORDER BY domain, front_uri"
         } else {
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports,
+            "SELECT id, domain, front_uri, CAST(back_port AS INTEGER), back_uri, backend, back_ports,
                     allowed_ips, auth_type, auth_credentials, created_at, updated_at
              FROM mappings ORDER BY domain, front_uri"
         };
@@ -372,7 +373,7 @@ impl DatabaseManager {
     pub fn get_mapping_by_id(&self, id: &str) -> Result<Option<Mapping>> {
         let conn = self.conn.lock();
         let mapping = conn.query_row(
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports,
+            "SELECT id, domain, front_uri, CAST(back_port AS INTEGER), back_uri, backend, back_ports,
                     allowed_ips, auth_type, auth_credentials, created_at, updated_at
              FROM mappings WHERE id = ?1",
             params![id],
@@ -398,7 +399,7 @@ impl DatabaseManager {
         let conn = self.conn.lock();
         let front_uri = front_uri.trim_start_matches('/').trim_end_matches('/');
         let mapping = conn.query_row(
-            "SELECT id, domain, front_uri, back_port, back_uri, backend, back_ports,
+            "SELECT id, domain, front_uri, CAST(back_port AS INTEGER), back_uri, backend, back_ports,
                     allowed_ips, auth_type, auth_credentials, created_at, updated_at
              FROM mappings WHERE domain = ?1 AND front_uri = ?2",
             params![domain, front_uri],

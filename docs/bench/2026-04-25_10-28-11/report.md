@@ -1,0 +1,180 @@
+# jsproxy Benchmark Report
+
+**Date:** 2026-04-25_10-28-11  
+**Host:** v2202410233941289239 (Linux x86_64)  
+**CPU:** AMD EPYC 9634 84-Core Processor  
+**Logical CPUs:** 8  
+**wrk:** duration=20s, connections=100, threads=4  
+**JS runtime:** v24.13.0  
+**Rust build:** release (LTO enabled)  
+
+## Summary
+
+| Scenario | JS req/s | Rust req/s | Rust/JS |
+|----------|----------|------------|---------|
+| Health check (no backend) | 191776 | 145962 | 0.76x ⚠️ |
+| Passthrough proxy (catch-all) | 4023 | 9340 | 2.32x 🚀 |
+| Path rewrite /api → /v1 | 6119 | 12465 | 2.04x 🚀 |
+
+> Ratio > 1.0x = Rust faster. Expected: Rust should win on proxy scenarios.
+
+## Detailed Results
+
+Columns: `req/s | avg latency | p50 | p90 | p99 | errors`
+
+### Health check (no backend)
+
+| Impl | req/s | avg lat | p50 | p90 | p99 | errors |
+|------|-------|---------|-----|-----|-----|--------|
+| **JS**   | 191776 | 655.78us | 460.00us | 848.00us | 5.55ms | 0 |
+| **Rust** | 145962 | 700.45us | 510.00us | 1.44ms | 2.16ms | 0 |
+
+<details><summary>JS raw wrk output</summary>
+
+```
+Running 20s test @ http://127.0.0.1:22000/health
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   655.78us    1.07ms  38.12ms   95.81%
+    Req/Sec    48.31k     8.68k   66.14k    69.25%
+  Latency Distribution
+     50%  460.00us
+     75%  526.00us
+     90%  848.00us
+     99%    5.55ms
+  3846034 requests in 20.05s, 619.87MB read
+Requests/sec: 191776.43
+Transfer/sec:     30.91MB
+```
+
+</details>
+
+<details><summary>Rust raw wrk output</summary>
+
+```
+Running 20s test @ http://127.0.0.1:23000/health
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   700.45us  597.90us  15.53ms   81.12%
+    Req/Sec    36.73k     3.46k   49.07k    70.00%
+  Latency Distribution
+     50%  510.00us
+     75%    0.97ms
+     90%    1.44ms
+     99%    2.16ms
+  2924505 requests in 20.04s, 287.27MB read
+Requests/sec: 145961.93
+Transfer/sec:     14.34MB
+```
+
+</details>
+
+### Passthrough proxy (catch-all)
+
+| Impl | req/s | avg lat | p50 | p90 | p99 | errors |
+|------|-------|---------|-----|-----|-----|--------|
+| **JS**   | 4023 | 24.74ms | 23.94ms | 28.99ms | 39.40ms | 0 |
+| **Rust** | 9340 | 10.73ms | 10.56ms | 13.91ms | 17.43ms | 0 |
+
+<details><summary>JS raw wrk output</summary>
+
+```
+Running 20s test @ http://127.0.0.1:22000/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    24.74ms    4.07ms  75.38ms   83.02%
+    Req/Sec     1.01k   100.08     1.21k    82.50%
+  Latency Distribution
+     50%   23.94ms
+     75%   26.07ms
+     90%   28.99ms
+     99%   39.40ms
+  80636 requests in 20.05s, 9.38MB read
+Requests/sec:   4022.67
+Transfer/sec:    479.26KB
+```
+
+</details>
+
+<details><summary>Rust raw wrk output</summary>
+
+```
+Running 20s test @ http://127.0.0.1:23001/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    10.73ms    2.98ms  68.93ms   77.24%
+    Req/Sec     2.35k   128.33     2.59k    90.25%
+  Latency Distribution
+     50%   10.56ms
+     75%   12.25ms
+     90%   13.91ms
+     99%   17.43ms
+  187155 requests in 20.04s, 26.77MB read
+Requests/sec:   9339.92
+Transfer/sec:      1.34MB
+```
+
+</details>
+
+### Path rewrite /api → /v1
+
+| Impl | req/s | avg lat | p50 | p90 | p99 | errors |
+|------|-------|---------|-----|-----|-----|--------|
+| **JS**   | 6119 | 16.23ms | 15.46ms | 20.41ms | 28.22ms | 0 |
+| **Rust** | 12465 | 8.02ms | 7.98ms | 9.39ms | 12.44ms | 0 |
+
+<details><summary>JS raw wrk output</summary>
+
+```
+Running 20s test @ http://127.0.0.1:22001/api/data
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    16.23ms    3.54ms  59.12ms   80.42%
+    Req/Sec     1.54k   191.72     1.90k    72.12%
+  Latency Distribution
+     50%   15.46ms
+     75%   17.56ms
+     90%   20.41ms
+     99%   28.22ms
+  122589 requests in 20.03s, 14.26MB read
+Requests/sec:   6118.75
+Transfer/sec:    728.99KB
+```
+
+</details>
+
+<details><summary>Rust raw wrk output</summary>
+
+```
+Running 20s test @ http://127.0.0.1:23000/api/data
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     8.02ms    1.48ms  37.21ms   80.79%
+    Req/Sec     3.14k   171.49     3.48k    75.62%
+  Latency Distribution
+     50%    7.98ms
+     75%    8.58ms
+     90%    9.39ms
+     99%   12.44ms
+  249726 requests in 20.03s, 35.72MB read
+Requests/sec:  12464.55
+Transfer/sec:      1.78MB
+```
+
+</details>
+
+## Architecture Notes
+
+| | JS | Rust |
+|-|----|------|
+| Runtime | Node.js cluster (workers) | Tokio async (single process) |
+| HTTP lib | http-proxy | Hyper 1.1 |
+| DB | sqlite3 (npm) | rusqlite (bundled) |
+| TLS | acme-client / node:tls | rustls |
+| Auth | ✅ | ✅ (ported) |
+| IP allowlist | ✅ | ✅ (ported) |
+| Plugin system | ✅ | ❌ |
+| Catch-all routing | ✅ | ✅ (ported) |
+
+---
+_Generated by `scripts/bench.py`_

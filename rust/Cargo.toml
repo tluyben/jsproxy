@@ -63,6 +63,7 @@ parking_lot = "0.12"
 once_cell = "1.19"
 dashmap = "5.5"
 async-trait = "0.1"
+socket2 = { version = "0.5", features = ["all"] }
 pin-project-lite = "0.2"
 
 # For HTTP client (proxying)
