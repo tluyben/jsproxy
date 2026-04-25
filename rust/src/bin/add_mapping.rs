@@ -127,7 +127,7 @@ fn main() -> Result<()> {
             let front_uri = both.as_ref().or(frontend.as_ref()).map(|s| s.as_str()).unwrap_or("");
             let back_uri = both.as_ref().or(backend.as_ref()).map(|s| s.as_str()).unwrap_or("");
 
-            let mapping = db.add_mapping(&domain, front_uri, port, back_uri, server.as_deref(), ports.as_deref())?;
+            let mapping = db.add_mapping(&domain, front_uri, port, back_uri, server.as_deref(), ports.as_deref(), None, None, None)?;
 
             println!("Added mapping:");
             print_mapping(&mapping);
@@ -197,6 +197,8 @@ fn main() -> Result<()> {
                             "back_uri": m.back_uri,
                             "backend": m.backend,
                             "back_ports": m.back_ports,
+                            "allowed_ips": m.allowed_ips,
+                            "auth_type": m.auth_type,
                             "created_at": m.created_at,
                             "updated_at": m.updated_at,
                         })
@@ -239,6 +241,12 @@ fn print_mapping(mapping: &rustproxy::Mapping) {
     println!("  Back URI:   /{}", mapping.back_uri);
     if let Some(ref backend) = mapping.backend {
         println!("  Backend:    {}", backend);
+    }
+    if let Some(ref ips) = mapping.allowed_ips {
+        println!("  Allowed IPs: {}", ips);
+    }
+    if let Some(ref auth) = mapping.auth_type {
+        println!("  Auth Type:  {}", auth);
     }
     println!("  Created:    {}", mapping.created_at);
 }
