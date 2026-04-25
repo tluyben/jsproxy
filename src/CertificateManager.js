@@ -19,7 +19,8 @@ class CertificateManager {
     this.lastCertRequest = new Map(); // Track last cert request time per domain
     this.certRequestCount = new Map(); // Track request count per domain
     this.wildcardCerts = new Map(); // Track wildcard certificates
-    this.acmeCapable = new Map(); // Cache HTTP-01 reachability test results per domain
+    this.acmeCapable = new Map(); // domain -> { capable: bool, probedAt: number }
+    this.reprobingDomains = new Set(); // domains with an in-progress background re-probe
     this.testChallenges = new Map(); // In-flight test challenge tokens
   }
 
@@ -665,10 +666,42 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   async testAcmeCapability(domain) {
+    const FAILURE_TTL = 15 * 60 * 1000;
+
     if (this.acmeCapable.has(domain)) {
-      return this.acmeCapable.get(domain);
+      const { capable, probedAt } = this.acmeCapable.get(domain);
+      if (capable) return true;
+      if (Date.now() - probedAt < FAILURE_TTL) return false;
+      // TTL expired on a failed probe — re-probe in background, serve self-signed for now
+      this._reprobeAcmeCapabilityBackground(domain);
+      return false;
     }
 
+    return await this._runProbe(domain);
+  }
+
+  _reprobeAcmeCapabilityBackground(domain) {
+    if (this.reprobingDomains.has(domain)) return;
+    this.reprobingDomains.add(domain);
+    this._runProbe(domain)
+      .then(async (capable) => {
+        if (!capable) return;
+        // Port 80 is now reachable — evict any self-signed cert so the next
+        // SNI handshake falls through to ACME instead of returning the stale one.
+        if (this.certificates.has(domain)) {
+          const cached = this.certificates.get(domain);
+          const isReal = await this.isRealCertificate(cached.cert);
+          if (!isReal) {
+            this.certificates.delete(domain);
+            this.logger.info(`ACME capability restored for ${domain} — cleared self-signed cache`);
+          }
+        }
+      })
+      .catch(err => this.logger.warn(`Background ACME re-probe error for ${domain}:`, err))
+      .finally(() => this.reprobingDomains.delete(domain));
+  }
+
+  async _runProbe(domain) {
     const token = crypto.randomBytes(16).toString('hex');
     const value = crypto.randomBytes(16).toString('hex');
     this.testChallenges.set(token, value);
@@ -700,10 +733,10 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     if (capable) {
       this.logger.info(`ACME HTTP-01 reachability confirmed for ${domain}`);
     } else {
-      this.logger.warn(`ACME HTTP-01 not reachable for ${domain} — will use self-signed certificate permanently`);
+      this.logger.warn(`ACME HTTP-01 not reachable for ${domain}`);
     }
 
-    this.acmeCapable.set(domain, capable);
+    this.acmeCapable.set(domain, { capable, probedAt: Date.now() });
     return capable;
   }
 
