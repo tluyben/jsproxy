@@ -13,4 +13,4 @@ pub mod proxy;
 
 pub use certificate::CertificateManager;
 pub use database::{DatabaseManager, Mapping};
-pub use proxy::{ProxyConfig, ProxyServer};
+pub use proxy::{FallbackHandler, NotFoundFallback, ProxyBuilder, ProxyConfig, ProxyServer};

@@ -23,6 +23,37 @@ use tracing::{debug, error, info, warn};
 use base64::{Engine as _, engine::general_purpose};
 use url::Url;
 
+/// Trait for handling requests that have no proxy mapping.
+///
+/// Implement this in your application and pass it to [`ProxyBuilder::fallback`] so that
+/// unmatched requests fall through to your own routes instead of returning 404.
+#[async_trait::async_trait]
+pub trait FallbackHandler: Send + Sync + 'static {
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        remote_addr: SocketAddr,
+    ) -> Result<Response<Full<Bytes>>>;
+}
+
+/// Default fallback: returns `404 No mapping found`.
+pub struct NotFoundFallback;
+
+#[async_trait::async_trait]
+impl FallbackHandler for NotFoundFallback {
+    async fn handle(
+        &self,
+        _req: Request<Incoming>,
+        _remote_addr: SocketAddr,
+    ) -> Result<Response<Full<Bytes>>> {
+        Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "text/plain")
+            .body(Full::new(Bytes::from("No mapping found")))
+            .unwrap())
+    }
+}
+
 /// Proxy server configuration
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -63,6 +94,8 @@ pub struct ProxyServer {
     rr_counters: DashMap<String, usize>,
     /// HA: set of port keys currently being background-probed.
     bg_checks: DashMap<String, ()>,
+    /// Called when no DB mapping matches the request.
+    fallback: Arc<dyn FallbackHandler>,
 }
 
 impl ProxyServer {
@@ -78,6 +111,7 @@ impl ProxyServer {
             port_scores: DashMap::new(),
             rr_counters: DashMap::new(),
             bg_checks: DashMap::new(),
+            fallback: Arc::new(NotFoundFallback),
         }
     }
 
@@ -259,7 +293,10 @@ impl ProxyServer {
         // Find mapping
         let mapping = match self.db_manager.find_mapping(&host, &path)? {
             Some(m) => m,
-            None => return Ok(Self::error_response(StatusCode::NOT_FOUND, "No mapping found")),
+            None => {
+                let fb = self.fallback.handle(req, remote_addr).await?;
+                return Ok(fb.map(|b| b.map_err(|never| match never {}).boxed()));
+            }
         };
 
         // IP allowlist check
@@ -851,6 +888,65 @@ impl ProxyServer {
 
     fn empty_body() -> BoxBody<Bytes, hyper::Error> {
         Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+    }
+}
+
+// ── ProxyBuilder ──────────────────────────────────────────────────────────────
+
+/// Ergonomic builder for creating a [`ProxyServer`], optionally with a custom
+/// [`FallbackHandler`] for embedding rustproxy inside another application.
+pub struct ProxyBuilder {
+    config: ProxyConfig,
+    db_path: std::path::PathBuf,
+    certs_dir: std::path::PathBuf,
+    acme_directory_url: Option<String>,
+    fallback: Option<Arc<dyn FallbackHandler>>,
+}
+
+impl Default for ProxyBuilder {
+    fn default() -> Self { Self::new() }
+}
+
+impl ProxyBuilder {
+    pub fn new() -> Self {
+        Self {
+            config: ProxyConfig::default(),
+            db_path: "./data/current.db".into(),
+            certs_dir: "./certs".into(),
+            acme_directory_url: None,
+            fallback: None,
+        }
+    }
+
+    pub fn db_path(mut self, p: impl Into<std::path::PathBuf>) -> Self { self.db_path = p.into(); self }
+    pub fn certs_dir(mut self, p: impl Into<std::path::PathBuf>) -> Self { self.certs_dir = p.into(); self }
+    pub fn http_port(mut self, port: u16) -> Self { self.config.http_port = port; self }
+    pub fn https_port(mut self, port: u16) -> Self { self.config.https_port = port; self }
+    pub fn enable_https(mut self, v: bool) -> Self { self.config.enable_https = v; self }
+    pub fn force_https(mut self, v: bool) -> Self { self.config.force_https = v; self }
+    pub fn http_host(mut self, h: impl Into<String>) -> Self { self.config.http_host = h.into(); self }
+    pub fn acme_directory_url(mut self, url: impl Into<String>) -> Self { self.acme_directory_url = Some(url.into()); self }
+
+    /// Set a custom fallback handler for requests with no proxy mapping.
+    pub fn fallback(mut self, h: impl FallbackHandler) -> Self {
+        self.fallback = Some(Arc::new(h));
+        self
+    }
+
+    pub fn build(self) -> Result<ProxyServer> {
+        let db_manager = Arc::new(crate::database::DatabaseManager::new(&self.db_path)?);
+        let cert_manager = Arc::new(crate::certificate::CertificateManager::new(
+            &self.certs_dir, self.acme_directory_url,
+        )?);
+        Ok(ProxyServer {
+            config: self.config,
+            db_manager,
+            cert_manager,
+            port_scores: DashMap::new(),
+            rr_counters: DashMap::new(),
+            bg_checks: DashMap::new(),
+            fallback: self.fallback.unwrap_or_else(|| Arc::new(NotFoundFallback)),
+        })
     }
 }
 

@@ -75,6 +75,14 @@ tempfile = "3.9"
 tokio-test = "0.4"
 wiremock = "0.5"
 rand = "0.8"
+# For embedded-mode examples
+axum = "0.7"
+tower = { version = "0.4", features = ["util"] }
+async-trait = "0.1"
+
+[[example]]
+name = "axum_embed"
+path = "examples/axum_embed.rs"
 
 [profile.release]
 lto = true

@@ -17,7 +17,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use rustproxy::{CertificateManager, DatabaseManager, ProxyConfig, ProxyServer};
+use rustproxy::{CertificateManager, DatabaseManager, FallbackHandler, ProxyBuilder, ProxyConfig, ProxyServer};
+use anyhow::Result;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -637,4 +638,120 @@ async fn test_ha_failover_dead_port() {
         assert!(resp.status().is_success());
         assert!(resp.text().await.unwrap().contains("ALIVE"));
     }
+}
+
+// ── Fallback / embedded-library tests ────────────────────────────────────────
+
+/// A custom fallback that always returns 200 with a known body.
+struct HelloFallback;
+
+#[async_trait::async_trait]
+impl FallbackHandler for HelloFallback {
+    async fn handle(
+        &self,
+        _req: hyper::Request<hyper::body::Incoming>,
+        _remote_addr: std::net::SocketAddr,
+    ) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>> {
+        Ok(hyper::Response::builder()
+            .status(200)
+            .body(http_body_util::Full::new(bytes::Bytes::from("hello from fallback")))
+            .unwrap())
+    }
+}
+
+/// A fallback that always returns 500 — used to verify /health bypasses it.
+struct PanicFallback;
+
+#[async_trait::async_trait]
+impl FallbackHandler for PanicFallback {
+    async fn handle(
+        &self,
+        _req: hyper::Request<hyper::body::Incoming>,
+        _remote_addr: std::net::SocketAddr,
+    ) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>> {
+        Ok(hyper::Response::builder()
+            .status(500)
+            .body(http_body_util::Full::new(bytes::Bytes::from("fallback error")))
+            .unwrap())
+    }
+}
+
+#[tokio::test]
+async fn test_fallback_called_when_no_mapping() {
+    let dir = tempdir().unwrap();
+    let proxy_port = get_unique_port();
+
+    let server = Arc::new(ProxyBuilder::new()
+        .db_path(dir.path().join("test.db"))
+        .certs_dir(dir.path().join("certs"))
+        .http_port(proxy_port)
+        .fallback(HelloFallback)
+        .build()
+        .unwrap());
+
+    tokio::spawn(async move { let _ = server.run().await; });
+    sleep(Duration::from_millis(150)).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/anything", proxy_port))
+        .header("Host", "myapp.example.com")
+        .send().await.unwrap();
+
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello from fallback");
+}
+
+#[tokio::test]
+async fn test_proxy_wins_over_fallback() {
+    let dir = tempdir().unwrap();
+    let proxy_port = get_unique_port();
+    let backend_port = get_unique_port();
+
+    let db = DatabaseManager::new(dir.path().join("test.db")).unwrap();
+    add(&db, "localhost", "", backend_port, "");
+    drop(db);
+
+    let _backend = run_backend_server(backend_port, "PROXIED").await;
+
+    let server = Arc::new(ProxyBuilder::new()
+        .db_path(dir.path().join("test.db"))
+        .certs_dir(dir.path().join("certs"))
+        .http_port(proxy_port)
+        .fallback(HelloFallback) // would return "hello from fallback" if called
+        .build()
+        .unwrap());
+
+    tokio::spawn(async move { let _ = server.run().await; });
+    sleep(Duration::from_millis(150)).await;
+
+    let body = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/test", proxy_port))
+        .header("Host", "localhost")
+        .send().await.unwrap().text().await.unwrap();
+
+    assert!(body.contains("PROXIED"), "expected proxy response, got: {}", body);
+}
+
+#[tokio::test]
+async fn test_health_check_bypasses_fallback() {
+    let dir = tempdir().unwrap();
+    let proxy_port = get_unique_port();
+
+    let server = Arc::new(ProxyBuilder::new()
+        .db_path(dir.path().join("test.db"))
+        .certs_dir(dir.path().join("certs"))
+        .http_port(proxy_port)
+        .fallback(PanicFallback) // returns 500 if called
+        .build()
+        .unwrap());
+
+    tokio::spawn(async move { let _ = server.run().await; });
+    sleep(Duration::from_millis(150)).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/health", proxy_port))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.text().await.unwrap(), "OK");
 }

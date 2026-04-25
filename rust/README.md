@@ -191,6 +191,122 @@ Connection-refused failures are **instant**, so a fully-down cluster fails in mi
 
 > Note: WebSocket connections always use the single `back_port` — HA is HTTP only.
 
+## Embedding in Your Own Project
+
+rustproxy ships as both a standalone binary **and** a library crate. You can embed it
+into your own Rust application so that a single binary handles ACME certificates, proxy
+routing, URL rewriting, and authentication — while unmatched requests fall through to
+your own routes.
+
+### How it works
+
+```
+Client → rustproxy (ProxyLayer)
+         ├── /health            → rustproxy built-in  (always 200 OK)
+         ├── /.well-known/...   → rustproxy built-in  (ACME challenge)
+         ├── mapped domain/path → proxied to backend  (DB mapping wins)
+         └── everything else    → your FallbackHandler (your app)
+```
+
+### Cargo.toml
+
+```toml
+[dependencies]
+rustproxy    = { path = "../rustproxy" }   # or from crates.io once published
+axum         = "0.7"
+tower        = { version = "0.4", features = ["util"] }
+tokio        = { version = "1", features = ["full"] }
+anyhow       = "1"
+async-trait  = "0.1"
+bytes        = "1"
+http-body-util = "0.1"
+hyper        = { version = "1", features = ["full"] }
+```
+
+### Implement `FallbackHandler` for your router
+
+```rust
+use async_trait::async_trait;
+use axum::{Router, routing::get};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, Response, body::Incoming};
+use rustproxy::FallbackHandler;
+use std::net::SocketAddr;
+use tower::ServiceExt;
+
+struct AxumFallback { router: Router }
+
+#[async_trait]
+impl FallbackHandler for AxumFallback {
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        _remote_addr: SocketAddr,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        // Convert incoming body to axum body
+        let (parts, body) = req.into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let axum_req = Request::from_parts(parts, axum::body::Body::from(bytes));
+
+        // Run through your Axum router
+        let resp = self.router.clone().oneshot(axum_req).await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Collect the response body
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+            .to_bytes();
+
+        Ok(Response::from_parts(parts, Full::new(bytes)))
+    }
+}
+```
+
+### Wire it up with `ProxyBuilder`
+
+```rust
+use rustproxy::ProxyBuilder;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/hello", get(|| async { "Hello!" }));
+
+    let server = Arc::new(
+        ProxyBuilder::new()
+            .db_path("./data/current.db")
+            .certs_dir("./certs")
+            .http_port(8080)
+            .fallback(AxumFallback { router: app })
+            .build()?
+    );
+
+    server.run().await
+}
+```
+
+A fully working example is in [`examples/axum_embed.rs`](examples/axum_embed.rs):
+
+```bash
+cargo run --example axum_embed
+```
+
+### Adding proxy mappings at runtime
+
+Use `DatabaseManager` directly from Rust code, or use the CLI:
+
+```bash
+cargo run --bin rustproxy-mapping -- add api.example.com 3000 --frontend api --backend v1
+```
+
+Any domain/path registered in the database is proxied; everything else goes to your
+`FallbackHandler`.
+
+---
+
 ## Compatibility with jsproxy
 
 RustProxy is designed to be 100% compatible with jsproxy:
