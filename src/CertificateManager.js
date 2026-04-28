@@ -330,11 +330,11 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return await this.ensureWildcardCertificate(mainDomain, isDomainValidated);
     }
 
-    // Check memory cache first
+    // Check memory cache first — only trust it if it's a real (CA-signed) cert
     if (this.certificates.has(domain)) {
       const cached = this.certificates.get(domain);
       try {
-        if (await this.isCertificateValid(cached.cert)) {
+        if (await this.isCertificateValid(cached.cert) && await this.isRealCertificate(cached.cert)) {
           return cached;
         }
       } catch (error) {
