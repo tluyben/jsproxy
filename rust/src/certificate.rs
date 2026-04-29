@@ -6,14 +6,21 @@ use dashmap::DashMap;
 use rcgen::generate_simple_self_signed;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::info;
+use tracing::{info, warn};
 
 /// ACME challenge token storage
 pub struct AcmeChallenge {
     pub token: String,
     pub key_authorization: String,
+}
+
+/// Cached result of an ACME HTTP-01 reachability probe for a domain
+struct AcmeCapableEntry {
+    capable: bool,
+    probed_at: Instant,
 }
 
 /// Rate limiting state for certificate requests
@@ -30,6 +37,10 @@ pub struct CertificateManager {
     /// In-flight ACME HTTP-01 reachability test challenges: token -> value
     test_challenges: DashMap<String, String>,
     rate_limits: DashMap<String, RateLimitState>,
+    /// ACME HTTP-01 capability cache: domain -> { capable, probed_at }
+    acme_capable: DashMap<String, AcmeCapableEntry>,
+    /// Domains with an in-progress background re-probe (deduplicate concurrent spawns)
+    reprobing_domains: DashMap<String, ()>,
     #[allow(dead_code)]
     acme_directory_url: String,
     #[allow(dead_code)]
@@ -51,6 +62,8 @@ impl CertificateManager {
             acme_challenges: DashMap::new(),
             test_challenges: DashMap::new(),
             rate_limits: DashMap::new(),
+            acme_capable: DashMap::new(),
+            reprobing_domains: DashMap::new(),
             acme_directory_url: acme_directory_url.unwrap_or_else(|| {
                 "https://acme-v02.api.letsencrypt.org/directory".to_string()
             }),
@@ -182,6 +195,85 @@ impl CertificateManager {
     #[allow(dead_code)]
     pub fn certs_dir(&self) -> &Path {
         &self.certs_dir
+    }
+
+    /// Test whether `domain` is reachable on port 80 via HTTP-01 challenge.
+    ///
+    /// - Returns `true` immediately if a successful probe is cached.
+    /// - Returns `false` immediately if a failed probe is still within its 15-minute TTL,
+    ///   but kicks off a background re-probe so recovery is eventually detected.
+    /// - Runs a synchronous probe on the first call for this domain.
+    pub async fn test_acme_capability(self: &Arc<Self>, domain: &str) -> bool {
+        const FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
+
+        if let Some(entry) = self.acme_capable.get(domain) {
+            if entry.capable {
+                return true;
+            }
+            if entry.probed_at.elapsed() < FAILURE_TTL {
+                return false;
+            }
+            drop(entry);
+            // TTL expired — re-probe in background, serve self-signed for now
+            Self::reprobe_acme_capability_background(Arc::clone(self), domain.to_string());
+            return false;
+        }
+
+        self.run_probe(domain).await
+    }
+
+    fn reprobe_acme_capability_background(this: Arc<Self>, domain: String) {
+        if this.reprobing_domains.contains_key(&domain) {
+            return;
+        }
+        this.reprobing_domains.insert(domain.clone(), ());
+        tokio::spawn(async move {
+            let capable = this.run_probe(&domain).await;
+            if capable {
+                info!("ACME capability restored for {} — cleared self-signed block", domain);
+                // No in-memory cert cache exists in the Rust version; disk is authoritative.
+            }
+            this.reprobing_domains.remove(&domain);
+        });
+    }
+
+    async fn run_probe(&self, domain: &str) -> bool {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let value = uuid::Uuid::new_v4().simple().to_string();
+        self.store_test_challenge(&token, &value);
+
+        let capable = self.do_probe(domain, &token, &value).await;
+        self.remove_test_challenge(&token);
+
+        if capable {
+            info!("ACME HTTP-01 reachability confirmed for {}", domain);
+        } else {
+            warn!("ACME HTTP-01 not reachable for {}", domain);
+        }
+
+        self.acme_capable.insert(domain.to_string(), AcmeCapableEntry {
+            capable,
+            probed_at: Instant::now(),
+        });
+
+        capable
+    }
+
+    async fn do_probe(&self, domain: &str, token: &str, value: &str) -> bool {
+        let url = format!("http://{}/.well-known/test-challenge/{}", domain, token);
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                resp.text().await.map(|b| b.trim() == value).unwrap_or(false)
+            }
+            _ => false,
+        }
     }
 }
 
