@@ -5,23 +5,27 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
 
+const TRUSTED_UPGRADE_INTERVAL_MS = 60_000;
+
 class CertificateManager {
   constructor(logger, dbManager) {
     this.logger = logger;
-    this.db = dbManager; // Need access to check main domains
+    this.db = dbManager;
+    // entries: { cert, key, type: 'trusted' | 'selfsigned' }
     this.certificates = new Map();
-    this.challenges = new Map(); // Store ACME challenges in memory
+    this.challenges = new Map();
     this.certsDir = './certs';
     this.acmeClient = null;
     this.accountKey = null;
-    this.processingDomains = new Set(); // used by wildcard path
-    this.pendingCerts = new Map(); // domain -> Promise<{cert,key}> for in-flight ACME requests
-    this.lastCertRequest = new Map(); // Track last cert request time per domain
-    this.certRequestCount = new Map(); // Track request count per domain
-    this.wildcardCerts = new Map(); // Track wildcard certificates
+    this.processingDomains = new Set();
+    this.pendingCerts = new Map();
+    this.lastCertRequest = new Map();
+    this.certRequestCount = new Map();
+    this.wildcardCerts = new Map();
     this.acmeCapable = new Map(); // domain -> { capable: bool, probedAt: number }
-    this.reprobingDomains = new Set(); // domains with an in-progress background re-probe
-    this.testChallenges = new Map(); // In-flight test challenge tokens
+    this.reprobingDomains = new Set();
+    this.upgradingDomains = new Set(); // domains with a pending trusted-cert upgrade check
+    this.testChallenges = new Map();
   }
 
   async initialize() {
@@ -39,12 +43,10 @@ class CertificateManager {
     }
   }
 
-
   async initializeAcmeClient() {
     try {
       const accountKeyPath = path.join(this.certsDir, 'account-key.pem');
-      
-      // Read or create account key (this part was working)
+
       try {
         const accountKeyPem = await fs.readFile(accountKeyPath);
         this.accountKey = accountKeyPem;
@@ -54,7 +56,6 @@ class CertificateManager {
         await fs.writeFile(accountKeyPath, this.accountKey);
       }
 
-      // ALWAYS use production certificates - staging certs are useless
       const directoryUrl = acme.directory.letsencrypt.production;
 
       this.acmeClient = new acme.Client({
@@ -62,8 +63,6 @@ class CertificateManager {
         accountKey: this.accountKey
       });
 
-      // createAccount is idempotent — returns existing account if already registered,
-      // and crucially sets the account URL on this client instance (required for createOrder)
       await this.acmeClient.createAccount({
         termsOfServiceAgreed: true,
         contact: []
@@ -78,25 +77,75 @@ class CertificateManager {
   async loadExistingCertificates() {
     try {
       const files = await fs.readdir(this.certsDir);
-      const certFiles = files.filter(file => file.endsWith('.crt'));
 
-      for (const certFile of certFiles) {
-        const domain = certFile.replace('.crt', '');
+      // Load trusted certs (.trusted.crt), migrating bare .crt files on the fly
+      const trustedFiles = files.filter(f => f.endsWith('.trusted.crt') && !f.startsWith('wildcard.'));
+      const legacyCrtFiles = files.filter(f =>
+        f.endsWith('.crt') &&
+        !f.endsWith('.trusted.crt') &&
+        !f.endsWith('.selfsigned.crt') &&
+        !f.startsWith('wildcard.') &&
+        f !== 'default.crt'
+      );
+
+      for (const certFile of [...trustedFiles, ...legacyCrtFiles]) {
+        const isTrustedExt = certFile.endsWith('.trusted.crt');
+        const domain = certFile.replace('.trusted.crt', '').replace('.crt', '');
+        if (this.certificates.has(domain)) continue; // already loaded via .trusted.crt
         const certPath = path.join(this.certsDir, certFile);
-        const keyPath = path.join(this.certsDir, `${domain}.key`);
-
+        const keyPath  = path.join(this.certsDir, isTrustedExt ? `${domain}.trusted.key` : `${domain}.key`);
         try {
           const cert = await fs.readFile(certPath);
-          const key = await fs.readFile(keyPath);
-
-          if (await this.isCertificateValid(cert)) {
-            this.certificates.set(domain, { cert, key });
-            this.logger.info(`Loaded certificate for domain: ${domain}`);
-          } else {
+          const key  = await fs.readFile(keyPath);
+          if (!await this.isCertificateValid(cert)) {
             this.logger.warn(`Certificate for ${domain} is expired or invalid`);
+            continue;
+          }
+          const isReal = await this.isRealCertificate(cert);
+          if (isReal) {
+            if (!isTrustedExt) {
+              // Migrate bare .crt/.key → .trusted.crt/.trusted.key
+              const tCertPath = path.join(this.certsDir, `${domain}.trusted.crt`);
+              const tKeyPath  = path.join(this.certsDir, `${domain}.trusted.key`);
+              await fs.rename(certPath, tCertPath).catch(() => {});
+              await fs.rename(keyPath,  tKeyPath).catch(() => {});
+              this.logger.info(`Migrated trusted certificate for: ${domain}`);
+            } else {
+              this.logger.info(`Loaded trusted certificate for: ${domain}`);
+            }
+            this.certificates.set(domain, { cert, key, type: 'trusted' });
+          } else {
+            // Old self-signed .crt — migrate to .selfsigned.*
+            const ssCertPath = path.join(this.certsDir, `${domain}.selfsigned.crt`);
+            const ssKeyPath  = path.join(this.certsDir, `${domain}.selfsigned.key`);
+            await fs.rename(certPath, ssCertPath).catch(() => {});
+            await fs.rename(keyPath,  ssKeyPath).catch(() => {});
+            this.certificates.set(domain, { cert, key, type: 'selfsigned' });
+            this.logger.info(`Migrated self-signed certificate for: ${domain}`);
           }
         } catch (error) {
           this.logger.warn(`Failed to load certificate for ${domain}:`, error.message);
+        }
+      }
+
+      // Load self-signed certs (.selfsigned.crt), skip domains already loaded as trusted
+      const ssFiles = files.filter(f => f.endsWith('.selfsigned.crt'));
+      for (const certFile of ssFiles) {
+        const domain = certFile.replace('.selfsigned.crt', '');
+        if (this.certificates.has(domain)) continue;
+        const certPath = path.join(this.certsDir, certFile);
+        const keyPath = path.join(this.certsDir, `${domain}.selfsigned.key`);
+        try {
+          const cert = await fs.readFile(certPath);
+          const key = await fs.readFile(keyPath);
+          if (!await this.isCertificateValid(cert)) {
+            this.logger.warn(`Self-signed certificate for ${domain} is expired or invalid`);
+            continue;
+          }
+          this.certificates.set(domain, { cert, key, type: 'selfsigned' });
+          this.logger.info(`Loaded self-signed certificate for: ${domain}`);
+        } catch (error) {
+          this.logger.warn(`Failed to load self-signed certificate for ${domain}:`, error.message);
         }
       }
     } catch (error) {
@@ -106,7 +155,6 @@ class CertificateManager {
 
   async isCertificateValid(certPem) {
     try {
-      // Parse certificate to check expiry
       const certString = certPem.toString();
       const cert = forge.pki.certificateFromPem(certString);
 
@@ -114,17 +162,15 @@ class CertificateManager {
       const notAfter = new Date(cert.validity.notAfter);
       const notBefore = new Date(cert.validity.notBefore);
 
-      // Check if certificate is currently valid
       if (now < notBefore || now > notAfter) {
         this.logger.warn(`Certificate expired or not yet valid. Valid from ${notBefore} to ${notAfter}`);
         return false;
       }
 
-      // Check if certificate expires in next 30 days (renew early)
       const thirtyDaysFromNow = new Date(now.getTime() + (30 * 24 * 60 * 60 * 1000));
       if (notAfter < thirtyDaysFromNow) {
         this.logger.info(`Certificate expiring soon (${notAfter}), will renew`);
-        return false; // Trigger renewal
+        return false;
       }
 
       return true;
@@ -136,35 +182,24 @@ class CertificateManager {
 
   async isRealCertificate(certPem) {
     try {
-      // Parse certificate to check if it's CA-signed (not self-signed)
       const certString = certPem.toString();
       const cert = forge.pki.certificateFromPem(certString);
 
-      // Self-signed certificates have subject === issuer
       const subject = cert.subject.attributes;
       const issuer = cert.issuer.attributes;
 
-      // Check if subject and issuer are different (CA-signed)
-      // For self-signed certs, they will be identical
       const subjectStr = subject.map(attr => `${attr.name}=${attr.value}`).sort().join(',');
       const issuerStr = issuer.map(attr => `${attr.name}=${attr.value}`).sort().join(',');
 
-      if (subjectStr === issuerStr) {
-        // Self-signed certificate
-        return false;
-      }
+      if (subjectStr === issuerStr) return false;
 
-      // Additionally check for our test self-signed markers
       const orgName = subject.find(attr => attr.name === 'organizationName');
-      if (orgName && orgName.value === 'Test') {
-        return false; // Our self-signed cert
-      }
+      if (orgName && orgName.value === 'Test') return false;
 
-      // This is a CA-signed certificate (like Let's Encrypt)
       return true;
     } catch (error) {
       this.logger.error('Error checking if certificate is real:', error);
-      return false; // Assume self-signed on error
+      return false;
     }
   }
 
@@ -179,27 +214,23 @@ class CertificateManager {
     } catch (error) {
       this.logger.info('Generating self-signed default certificate');
       const { cert, key } = await this.generateSelfSignedCertificate('localhost');
-      
       await fs.writeFile(defaultCertPath, cert);
       await fs.writeFile(defaultKeyPath, key);
-      
       return { cert, key };
     }
   }
 
   async generateSelfSignedCertificate(commonName) {
     try {
-      // Generate a key pair
       const keys = forge.pki.rsa.generateKeyPair(2048);
-      
-      // Create a certificate
+
       const cert = forge.pki.createCertificate();
       cert.publicKey = keys.publicKey;
       cert.serialNumber = '01';
       cert.validity.notBefore = new Date();
       cert.validity.notAfter = new Date();
       cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 1);
-      
+
       const attrs = [{
         name: 'commonName',
         value: commonName || 'localhost'
@@ -219,7 +250,7 @@ class CertificateManager {
         shortName: 'OU',
         value: 'Test'
       }];
-      
+
       cert.setSubject(attrs);
       cert.setIssuer(attrs);
       cert.setExtensions([{
@@ -257,64 +288,100 @@ class CertificateManager {
       }, {
         name: 'subjectKeyIdentifier'
       }]);
-      
-      // Sign the certificate with its own key (self-signed)
+
       cert.sign(keys.privateKey, forge.md.sha256.create());
-      
-      // Convert to PEM format
+
       const certPem = forge.pki.certificateToPem(cert);
       const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
-      
-      return { 
-        cert: Buffer.from(certPem), 
-        key: Buffer.from(keyPem) 
+
+      return {
+        cert: Buffer.from(certPem),
+        key: Buffer.from(keyPem)
       };
     } catch (error) {
       this.logger.error('Failed to generate self-signed certificate:', error);
-      
-      // Ultimate fallback - create minimal working cert using acme.forge
+
       const key = await acme.forge.createPrivateKey();
       const cert = `-----BEGIN CERTIFICATE-----
 MIICljCCAX4CCQCKvJPJ9VJd8TANBgkqhkiG9w0BAQsFADA1MQswCQYDVQQGEwJV
 UzELMAkGA1UECAwCQ0ExEzARBgNVBAcMCkxvcyBBbmdlbGVzMQswCQYDVQQKDAJJ
 VDEQMBAGA1UEAwwJbG9jYWxob3N0MB4XDTE4MTEwNTE5MDUwNFoXDTI4MTEwMjE5
 MDUwNFowNTELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkNBMRMwEQYDVQQHDApMb3Mg
-QW5nZWxlczELMAkGA1UECgwCSVQxEDAOBgNVBAMMB2xvY2FsaG9zdDBcMA0GCSqG
+QW5nZWxlczELMAkDA1UECgwCSVQxEDAOBgNVBAMMB2xvY2FsaG9zdDBcMA0GCSqG
 SIb3DQEBAQUAA0sAMEgCQQC7VJTUt9Us8cKjMzEfYyjiWA4R4npB9c20HlsIuM5W
 QWVT47ubqyP6L0NmuXtBDTyY1j8N6yibDcalB3Nc8wKdAgMBAAEwDQYJKoZIhvcN
 AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
 3cIIj+oQ/q9VoRkQ2i0XJE8R1Kw9v4JJhQ==
 -----END CERTIFICATE-----`;
-      
-      return { 
-        cert: Buffer.from(cert), 
-        key: Buffer.from(key) 
+
+      return {
+        cert: Buffer.from(cert),
+        key: Buffer.from(key)
       };
     }
+  }
+
+  // Write a self-signed cert pair to disk under the .selfsigned.* filenames
+  async _writeSelfSigned(domain, cert, key) {
+    const certPath = path.join(this.certsDir, `${domain}.selfsigned.crt`);
+    const keyPath = path.join(this.certsDir, `${domain}.selfsigned.key`);
+    await fs.writeFile(certPath, cert);
+    await fs.writeFile(keyPath, key);
+  }
+
+  // Generate, persist, and cache a self-signed cert; schedule upgrade check for public domains
+  async _generateAndCacheSelfSigned(domain) {
+    const { cert, key } = await this.generateSelfSignedCertificate(domain);
+    await this._writeSelfSigned(domain, cert, key).catch(err =>
+      this.logger.warn(`Failed to persist self-signed cert for ${domain}:`, err)
+    );
+    const entry = { cert, key, type: 'selfsigned' };
+    this.certificates.set(domain, entry);
+    if (this.isPublicDomain(domain)) this._checkForTrustedUpgrade(domain);
+    return entry;
+  }
+
+  // Schedule a one-shot disk check 60s from now; re-arms itself until trusted cert appears
+  _checkForTrustedUpgrade(domain) {
+    if (this.upgradingDomains.has(domain)) return;
+    this.upgradingDomains.add(domain);
+    setTimeout(async () => {
+      this.upgradingDomains.delete(domain);
+      try {
+        const certPath = path.join(this.certsDir, `${domain}.trusted.crt`);
+        const keyPath = path.join(this.certsDir, `${domain}.trusted.key`);
+        const cert = await fs.readFile(certPath);
+        const key = await fs.readFile(keyPath);
+        if (await this.isCertificateValid(cert)) {
+          this.certificates.set(domain, { cert, key, type: 'trusted' });
+          this.logger.info(`Upgraded ${domain} from self-signed to trusted cert`);
+        }
+        // If not valid yet, next request with selfsigned in cache will re-arm the check
+      } catch (_) {
+        // No trusted cert on disk yet — next request re-arms
+      }
+    }, TRUSTED_UPGRADE_INTERVAL_MS);
   }
 
   async getSNICallback() {
     return async (domain, callback) => {
       try {
-        // Check if domain is in database
         const domainMapping = await this.db.getMapping(domain, '/');
         const isDomainValidated = domainMapping !== null;
 
-        // If mapping is for a wildcard domain, use the wildcard certificate
         let certDomain = domain;
         if (domainMapping && domainMapping.domain.startsWith('*.') && !domain.startsWith('*')) {
           certDomain = domainMapping.domain;
         }
 
         const certificate = await this.ensureCertificate(certDomain, isDomainValidated);
-        
-        // SNI callback needs a SecureContext, not just cert/key
+
         const tls = require('tls');
         const context = tls.createSecureContext({
           cert: certificate.cert,
           key: certificate.key
         });
-        
+
         callback(null, context);
       } catch (error) {
         this.logger.error(`SNI callback error for ${domain}:`, error);
@@ -324,143 +391,124 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   async ensureCertificate(domain, isDomainValidated = false) {
-    // If domain is a wildcard pattern (e.g., *.example.com), handle directly
     if (domain.startsWith('*.')) {
-      const mainDomain = domain.replace('*.', '');
-      return await this.ensureWildcardCertificate(mainDomain, isDomainValidated);
+      return await this.ensureWildcardCertificate(domain.replace('*.', ''), isDomainValidated);
     }
 
-    // Check memory cache first — only trust it if it's a real (CA-signed) cert
+    // Memory cache
     if (this.certificates.has(domain)) {
       const cached = this.certificates.get(domain);
-      try {
-        if (await this.isCertificateValid(cached.cert) && await this.isRealCertificate(cached.cert)) {
-          return cached;
-        }
-      } catch (error) {
-        this.logger.warn(`Invalid cached certificate for ${domain}, removing from cache`);
+      if (await this.isCertificateValid(cached.cert)) {
+        if (cached.type === 'trusted') return cached;
+        // selfsigned: serve immediately, re-arm upgrade check in background
+        this._checkForTrustedUpgrade(domain);
+        return cached;
       }
       this.certificates.delete(domain);
     }
 
-    // If this is a subdomain, check if we have a wildcard cert for the main domain
+    // Wildcard fallback
     const mainDomain = this.getMainDomain(domain);
-    const isSubdomain = domain !== mainDomain;
-
-    if (isSubdomain) {
+    if (domain !== mainDomain) {
       const wildcardCert = await this.getWildcardCertificate(mainDomain);
       if (wildcardCert) {
         this.logger.info(`Using wildcard certificate for ${domain} from *.${mainDomain}`);
-        this.certificates.set(domain, wildcardCert);
+        // Tag as trusted so it stays cached without upgrade checks (wildcard has its own path)
+        this.certificates.set(domain, { ...wildcardCert, type: 'trusted' });
         return wildcardCert;
       }
     }
 
-    // Check disk for exact domain cert
-    const certPath = path.join(this.certsDir, `${domain}.crt`);
-    const keyPath = path.join(this.certsDir, `${domain}.key`);
-
+    // Disk: trusted first (.trusted.crt / .trusted.key)
+    const certPath = path.join(this.certsDir, `${domain}.trusted.crt`);
+    const keyPath = path.join(this.certsDir, `${domain}.trusted.key`);
     try {
       const cert = await fs.readFile(certPath);
       const key = await fs.readFile(keyPath);
-
       if (await this.isCertificateValid(cert)) {
-        const isRealCert = await this.isRealCertificate(cert);
-
-        if (isRealCert) {
-          this.certificates.set(domain, { cert, key });
-          return { cert, key };
-        }
-
-        if (this.certificates.has(domain)) {
-          const cached = this.certificates.get(domain);
-          const cachedIsReal = await this.isRealCertificate(cached.cert);
-          if (cachedIsReal) {
-            return cached;
-          }
-        }
-
-        this.certificates.set(domain, { cert, key });
-        return { cert, key };
+        const entry = { cert, key, type: 'trusted' };
+        this.certificates.set(domain, entry);
+        return entry;
       }
-    } catch (error) {
-      if (this.certificates.has(domain)) {
-        const cached = this.certificates.get(domain);
-        if (await this.isCertificateValid(cached.cert)) {
-          return cached;
-        }
-        this.certificates.delete(domain);
-      }
-    }
+    } catch (_) {}
 
-    // Only generate certificates for validated domains
+    // Disk: self-signed (.selfsigned.crt / .selfsigned.key)
+    const ssCertPath = path.join(this.certsDir, `${domain}.selfsigned.crt`);
+    const ssKeyPath = path.join(this.certsDir, `${domain}.selfsigned.key`);
+    try {
+      const cert = await fs.readFile(ssCertPath);
+      const key = await fs.readFile(ssKeyPath);
+      if (await this.isCertificateValid(cert)) {
+        const entry = { cert, key, type: 'selfsigned' };
+        this.certificates.set(domain, entry);
+        if (this.isPublicDomain(domain)) this._checkForTrustedUpgrade(domain);
+        return entry;
+      }
+    } catch (_) {}
+
+    // Domain not in DB — generate self-signed, no upgrade check
     if (!isDomainValidated) {
       this.logger.warn(`Domain ${domain} not validated - using self-signed certificate`);
-      const cert = await this.generateSelfSignedCertificate(domain);
-      this.certificates.set(domain, cert);
-      return cert;
+      const { cert, key } = await this.generateSelfSignedCertificate(domain);
+      await this._writeSelfSigned(domain, cert, key).catch(() => {});
+      const entry = { cert, key, type: 'selfsigned' };
+      this.certificates.set(domain, entry);
+      return entry;
     }
 
-    // Skip ACME for non-public domains (no dot, private TLDs, IPs)
+    // Non-public domain — self-signed forever, no upgrade check needed
     if (!this.isPublicDomain(domain)) {
       this.logger.info(`Domain ${domain} is not a public FQDN — using self-signed certificate`);
-      const cert = await this.generateSelfSignedCertificate(domain);
-      this.certificates.set(domain, cert);
-      return cert;
+      const { cert, key } = await this.generateSelfSignedCertificate(domain);
+      await this._writeSelfSigned(domain, cert, key).catch(() => {});
+      const entry = { cert, key, type: 'selfsigned' };
+      this.certificates.set(domain, entry);
+      return entry;
     }
 
-    // Test HTTP-01 reachability before attempting ACME
+    // HTTP-01 reachability check
     const capable = await this.testAcmeCapability(domain);
     if (!capable) {
-      const cert = await this.generateSelfSignedCertificate(domain);
-      this.certificates.set(domain, cert);
-      return cert;
+      return await this._generateAndCacheSelfSigned(domain);
     }
 
-    // If ACME is already in-flight, join it — wait up to 30s then give up
+    // Join in-flight ACME request
     if (this.pendingCerts.has(domain)) {
       this.logger.info(`Joining in-flight certificate request for ${domain}`);
       const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(null), 30000));
       const cert = await Promise.race([this.pendingCerts.get(domain), timeoutPromise]);
       if (cert) return cert;
-      // ACME is stuck — stop joining it so future requests don't wait again
       this.logger.warn(`ACME stuck for ${domain} after 30s, giving up on this attempt`);
       this.pendingCerts.delete(domain);
-      return await this.generateSelfSignedCertificate(domain);
+      return await this._generateAndCacheSelfSigned(domain);
     }
 
-    // Rate limiting — only blocks starting a *new* ACME request
+    // Rate limiting
     const now = Date.now();
     const lastRequest = this.lastCertRequest.get(domain) || 0;
-    const timeSinceLastRequest = now - lastRequest;
-
-    if (timeSinceLastRequest < 5 * 60 * 1000) {
-      this.logger.warn(`Rate limit: Too soon to request certificate for ${domain} (${Math.round(timeSinceLastRequest/1000)}s since last request)`);
-      const cert = await this.generateSelfSignedCertificate(domain);
-      this.certificates.set(domain, cert);
-      return cert;
+    if (now - lastRequest < 5 * 60 * 1000) {
+      this.logger.warn(`Rate limit: Too soon to request certificate for ${domain} (${Math.round((now - lastRequest)/1000)}s since last request)`);
+      return await this._generateAndCacheSelfSigned(domain);
     }
-
     const requestCount = this.certRequestCount.get(domain) || 0;
     if (requestCount >= 5) {
       this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
-      const cert = await this.generateSelfSignedCertificate(domain);
-      this.certificates.set(domain, cert);
-      return cert;
+      return await this._generateAndCacheSelfSigned(domain);
     }
 
-    // Start ACME and store the Promise — concurrent requests will join it above
+    // Start ACME
     this.lastCertRequest.set(domain, now);
     this.certRequestCount.set(domain, requestCount + 1);
 
     const certPromise = this.obtainCertificate(domain)
       .then(certificate => {
-        this.certificates.set(domain, certificate);
-        return certificate;
+        const entry = { ...certificate, type: 'trusted' };
+        this.certificates.set(domain, entry);
+        return entry;
       })
       .catch(async (err) => {
         this.logger.error(`ACME failed for ${domain}, falling back to self-signed:`, err);
-        return await this.generateSelfSignedCertificate(domain);
+        return await this._generateAndCacheSelfSigned(domain);
       })
       .finally(() => {
         this.pendingCerts.delete(domain);
@@ -473,7 +521,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   async ensureWildcardCertificate(mainDomain, isDomainValidated = false) {
     const wildcardDomain = `*.${mainDomain}`;
 
-    // Check memory cache first
     if (this.wildcardCerts.has(mainDomain)) {
       const cached = this.wildcardCerts.get(mainDomain);
       if (await this.isCertificateValid(cached.cert)) {
@@ -482,7 +529,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       this.wildcardCerts.delete(mainDomain);
     }
 
-    // Check disk for existing valid cert
     try {
       const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
       const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
@@ -517,7 +563,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return await this.generateSelfSignedCertificate(wildcardDomain);
     }
 
-    // Load or create pending DNS-01 order
     const pendingFile = path.join(this.certsDir, `wildcard.${mainDomain}.pending.json`);
     let pending = null;
 
@@ -530,7 +575,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         await fs.unlink(pendingFile).catch(() => {});
       }
     } catch (e) {
-      // No pending file yet
     }
 
     if (!pending) {
@@ -550,7 +594,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       }
     }
 
-    // Check if the DNS TXT record has been set
     const isReady = await this.checkDnsTxtRecord(pending.txtRecordName, pending.txtRecordValue);
 
     if (!isReady) {
@@ -561,7 +604,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return await this.generateSelfSignedCertificate(wildcardDomain);
     }
 
-    // DNS record is in place — complete the order
     if (this.processingDomains.has(wildcardDomain)) {
       await this.waitForCertificateProcessing(wildcardDomain);
       return this.wildcardCerts.get(mainDomain) || await this.generateSelfSignedCertificate(wildcardDomain);
@@ -575,7 +617,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return certificate;
     } catch (e) {
       this.logger.error(`Failed to complete wildcard order for ${wildcardDomain}:`, e);
-      // Remove pending so a fresh order is created next time
       await fs.unlink(pendingFile).catch(() => {});
       return await this.generateSelfSignedCertificate(wildcardDomain);
     } finally {
@@ -584,20 +625,14 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   getMainDomain(domain) {
-    // Extract main domain from subdomain
-    // e.g., "sub.example.com" -> "example.com"
-    // e.g., "example.com" -> "example.com"
     const parts = domain.split('.');
-    if (parts.length <= 2) {
-      return domain; // Already a main domain
-    }
-    
-    // Handle common TLDs including compound ones like .co.uk
+    if (parts.length <= 2) return domain;
+
     const tldPatterns = [
-      /\.(co|ac|gov|org|net|edu|mil)\.\w+$/,  // compound TLDs
-      /\.\w+$/  // simple TLDs
+      /\.(co|ac|gov|org|net|edu|mil)\.\w+$/,
+      /\.\w+$/
     ];
-    
+
     for (const pattern of tldPatterns) {
       const match = domain.match(pattern);
       if (match) {
@@ -607,8 +642,7 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         return domainParts[domainParts.length - 1] + tld;
       }
     }
-    
-    // Fallback: assume last two parts
+
     return parts.slice(-2).join('.');
   }
 
@@ -618,13 +652,9 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   isPublicDomain(domain) {
-    // Single-label hostnames (no dot) are never valid for ACME
     if (!domain.includes('.')) return false;
-
-    // Plain IPv4 addresses
     if (/^\d{1,3}(\.\d{1,3}){3}$/.test(domain)) return false;
 
-    // Private / special-use TLDs that Let's Encrypt will never issue for
     const privateSuffixes = [
       '.local', '.localhost', '.internal', '.lan', '.test',
       '.example', '.invalid', '.home', '.corp', '.localdomain',
@@ -637,12 +667,10 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   async getWildcardCertificate(mainDomain) {
-    // Check memory cache
     if (this.wildcardCerts.has(mainDomain)) {
       return this.wildcardCerts.get(mainDomain);
     }
 
-    // Check disk for wildcard cert
     try {
       const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
       const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
@@ -672,7 +700,6 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       const { capable, probedAt } = this.acmeCapable.get(domain);
       if (capable) return true;
       if (Date.now() - probedAt < FAILURE_TTL) return false;
-      // TTL expired on a failed probe — re-probe in background, serve self-signed for now
       this._reprobeAcmeCapabilityBackground(domain);
       return false;
     }
@@ -686,12 +713,10 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     this._runProbe(domain)
       .then(async (capable) => {
         if (!capable) return;
-        // Port 80 is now reachable — evict any self-signed cert so the next
-        // SNI handshake falls through to ACME instead of returning the stale one.
+        // ACME now reachable — evict selfsigned from memory so next handshake goes to ACME
         if (this.certificates.has(domain)) {
           const cached = this.certificates.get(domain);
-          const isReal = await this.isRealCertificate(cached.cert);
-          if (!isReal) {
+          if (cached.type === 'selfsigned') {
             this.certificates.delete(domain);
             this.logger.info(`ACME capability restored for ${domain} — cleared self-signed cache`);
           }
@@ -751,19 +776,16 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     this.logger.info(`Obtaining certificate for domain: ${domain}`);
 
     if (!this.acmeClient) {
-      this.logger.warn(`ACME client not available, generating self-signed certificate for ${domain}`);
-      return await this.generateSelfSignedCertificate(domain);
+      // Let the caller's .catch handle fallback to self-signed
+      throw new Error(`ACME client not available for ${domain}`);
     }
 
     try {
-      const requestDomains = [domain];
-      const certFilename = domain;
-
       const privateKey = await acme.forge.createPrivateKey();
 
       const [key, csr] = await acme.forge.createCsr({
-        commonName: requestDomains[0],
-        altNames: requestDomains
+        commonName: domain,
+        altNames: [domain]
       }, privateKey);
 
       const cert = await this.acmeClient.auto({
@@ -774,20 +796,17 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         challengeRemoveFn: this.challengeRemoveFn.bind(this)
       });
 
-      const certPath = path.join(this.certsDir, `${certFilename}.crt`);
-      const keyPath = path.join(this.certsDir, `${certFilename}.key`);
+      const certPath = path.join(this.certsDir, `${domain}.trusted.crt`);
+      const keyPath = path.join(this.certsDir, `${domain}.trusted.key`);
 
       await fs.writeFile(certPath, cert);
       await fs.writeFile(keyPath, key);
 
-      this.logger.info(`Certificate obtained and saved: ${certFilename} for domains: ${requestDomains.join(', ')}`);
+      this.logger.info(`Certificate obtained and saved for: ${domain}`);
 
-      const certificate = { cert: Buffer.from(cert), key: Buffer.from(key) };
-
-      return certificate;
+      return { cert: Buffer.from(cert), key: Buffer.from(key) };
     } catch (error) {
       this.logger.error(`Failed to obtain certificate for ${domain}:`, error);
-
       throw error;
     }
   }
@@ -855,12 +874,10 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   async getChallenge(token) {
-    // First check in-memory challenges
     if (this.challenges.has(token)) {
       return this.challenges.get(token);
     }
-    
-    // Also check file system for challenges created by other workers
+
     const challengeFile = path.join(this.certsDir, '.well-known', 'acme-challenge', token);
     try {
       const challenge = await fs.readFile(challengeFile, 'utf8');
@@ -874,16 +891,14 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     this.logger.info(`Creating challenge for ${authz.identifier.value}: ${challenge.type}`);
 
     if (challenge.type === 'http-01') {
-      // Store in memory for this worker
       this.challenges.set(challenge.token, keyAuthorization);
-      
-      // Also write to file system for other workers
+
       const challengePath = path.join(this.certsDir, '.well-known', 'acme-challenge');
       await fs.mkdir(challengePath, { recursive: true });
-      
+
       const challengeFile = path.join(challengePath, challenge.token);
       await fs.writeFile(challengeFile, keyAuthorization);
-      
+
       this.logger.info(`HTTP challenge created: token=${challenge.token}`);
     }
   }
@@ -892,10 +907,8 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     this.logger.info(`Removing challenge for ${authz.identifier.value}: ${challenge.type}`);
 
     if (challenge.type === 'http-01') {
-      // Remove from memory
       this.challenges.delete(challenge.token);
-      
-      // Remove from file system
+
       const challengeFile = path.join(this.certsDir, '.well-known', 'acme-challenge', challenge.token);
       try {
         await fs.unlink(challengeFile);
@@ -914,7 +927,7 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         if (await this.shouldRenewCertificate(certificate.cert)) {
           this.logger.info(`Renewing certificate for ${domain}`);
           const newCertificate = await this.obtainCertificate(domain);
-          this.certificates.set(domain, newCertificate);
+          this.certificates.set(domain, { ...newCertificate, type: 'trusted' });
         }
       } catch (error) {
         this.logger.error(`Failed to renew certificate for ${domain}:`, error);
