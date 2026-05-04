@@ -363,20 +363,65 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }, TRUSTED_UPGRADE_INTERVAL_MS);
   }
 
+  // Run ACME for a validated public domain without blocking the caller.
+  // All existing guards (in-flight dedup, rate-limit, request cap) apply.
+  _startAcmeBackground(domain) {
+    if (this.pendingCerts.has(domain)) return;
+    if (!this.acmeClient) return;
+
+    const now = Date.now();
+    const lastRequest = this.lastCertRequest.get(domain) || 0;
+    if (now - lastRequest < 5 * 60 * 1000) return;
+    const requestCount = this.certRequestCount.get(domain) || 0;
+    if (requestCount >= 5) {
+      this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
+      return;
+    }
+
+    this.lastCertRequest.set(domain, now);
+    this.certRequestCount.set(domain, requestCount + 1);
+
+    const certPromise = this.testAcmeCapability(domain)
+      .then(async capable => {
+        if (!capable) return null;
+        const certificate = await this.obtainCertificate(domain);
+        const entry = { ...certificate, type: 'trusted' };
+        this.certificates.set(domain, entry);
+        return entry;
+      })
+      .catch(err => {
+        this.logger.error(`Background ACME failed for ${domain}:`, err);
+        return null;
+      })
+      .finally(() => {
+        this.pendingCerts.delete(domain);
+      });
+
+    this.pendingCerts.set(domain, certPromise);
+    // intentionally not awaited — caller keeps running with the selfsigned
+  }
+
   async getSNICallback() {
     return async (domain, callback) => {
       try {
+        const tls = require('tls');
         const domainMapping = await this.db.getMapping(domain, '/');
-        const isDomainValidated = domainMapping !== null;
 
+        if (!domainMapping) {
+          // Not in DB — serve the shared default cert, generate nothing
+          const defaultCert = await this.getDefaultCertificate();
+          callback(null, tls.createSecureContext({ cert: defaultCert.cert, key: defaultCert.key }));
+          return;
+        }
+
+        const isDomainValidated = true;
         let certDomain = domain;
-        if (domainMapping && domainMapping.domain.startsWith('*.') && !domain.startsWith('*')) {
+        if (domainMapping.domain.startsWith('*.') && !domain.startsWith('*')) {
           certDomain = domainMapping.domain;
         }
 
         const certificate = await this.ensureCertificate(certDomain, isDomainValidated);
 
-        const tls = require('tls');
         const context = tls.createSecureContext({
           cert: certificate.cert,
           key: certificate.key
@@ -442,6 +487,9 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         const entry = { cert, key, type: 'selfsigned' };
         this.certificates.set(domain, entry);
         if (this.isPublicDomain(domain)) this._checkForTrustedUpgrade(domain);
+        // Validated public domains also get a live ACME attempt in the background;
+        // _checkForTrustedUpgrade picks up the result from disk when it lands.
+        if (isDomainValidated && this.isPublicDomain(domain)) this._startAcmeBackground(domain);
         return entry;
       }
     } catch (_) {}
