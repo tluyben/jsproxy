@@ -520,8 +520,8 @@ class ProxyServer {
         : this.buildTargetPath(mapping, uri);
 
       const headers = Object.assign({}, reqHeaders);
-      headers['host'] = `${backendUrl.hostname}:${port}`;
       if (!headers['x-forwarded-host']) headers['x-forwarded-host'] = headers['host'];
+      headers['host'] = `${backendUrl.hostname}:${port}`;
       if (body && body.length > 0) headers['content-length'] = body.length;
       else delete headers['content-length'];
 

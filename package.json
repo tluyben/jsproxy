@@ -1,6 +1,6 @@
 {
   "name": "jsproxy",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "A resilient HTTP/HTTPS proxy server with WebSocket support and automatic SSL certificate generation",
   "main": "index.js",
   "bin": {"jsproxy": "index.js"},
