@@ -447,6 +447,7 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         if (cached.type === 'trusted') return cached;
         // selfsigned: serve immediately, re-arm upgrade check in background
         this._checkForTrustedUpgrade(domain);
+        if (isDomainValidated && this.isPublicDomain(domain)) this._startAcmeBackground(domain);
         return cached;
       }
       this.certificates.delete(domain);
