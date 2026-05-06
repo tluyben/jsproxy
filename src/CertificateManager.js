@@ -7,8 +7,20 @@ const { execSync } = require('child_process');
 
 const TRUSTED_UPGRADE_INTERVAL_MS = 60_000;
 
+const DEFAULT_ACME_CONFIG = {
+  maxAttempts: 5,
+  backoffMs: [
+    5  * 60 * 1000,  // attempt 1 → retry in 5 min
+    30 * 60 * 1000,  // attempt 2 → 30 min
+    2  * 60 * 60 * 1000,  // attempt 3 → 2 hr
+    12 * 60 * 60 * 1000,  // attempt 4 → 12 hr
+    24 * 60 * 60 * 1000,  // attempt 5 → 24 hr
+  ],
+  lockTtlMs: 5 * 60 * 1000,
+};
+
 class CertificateManager {
-  constructor(logger, dbManager) {
+  constructor(logger, dbManager, options = {}) {
     this.logger = logger;
     this.db = dbManager;
     // entries: { cert, key, type: 'trusted' | 'selfsigned' }
@@ -19,13 +31,24 @@ class CertificateManager {
     this.accountKey = null;
     this.processingDomains = new Set();
     this.pendingCerts = new Map();
-    this.lastCertRequest = new Map();
-    this.certRequestCount = new Map();
     this.wildcardCerts = new Map();
     this.acmeCapable = new Map(); // domain -> { capable: bool, probedAt: number }
     this.reprobingDomains = new Set();
     this.upgradingDomains = new Set(); // domains with a pending trusted-cert upgrade check
     this.testChallenges = new Map();
+    this.workerId = process.pid;
+
+    const acmeCfg = options.acme || {};
+    this.acmeConfig = {
+      maxAttempts: acmeCfg.maxAttempts
+        ?? (process.env.ACME_MAX_ATTEMPTS ? parseInt(process.env.ACME_MAX_ATTEMPTS) : DEFAULT_ACME_CONFIG.maxAttempts),
+      backoffMs: acmeCfg.backoffMs
+        ?? (process.env.ACME_BACKOFF_SCHEDULE
+          ? process.env.ACME_BACKOFF_SCHEDULE.split(',').map(s => parseInt(s.trim()) * 1000)
+          : DEFAULT_ACME_CONFIG.backoffMs),
+      lockTtlMs: acmeCfg.lockTtlMs
+        ?? (process.env.ACME_LOCK_TTL_MS ? parseInt(process.env.ACME_LOCK_TTL_MS) : DEFAULT_ACME_CONFIG.lockTtlMs),
+    };
   }
 
   async initialize() {
@@ -363,39 +386,135 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }, TRUSTED_UPGRADE_INTERVAL_MS);
   }
 
-  // Run ACME for a validated public domain without blocking the caller.
-  // All existing guards (in-flight dedup, rate-limit, request cap) apply.
-  _startAcmeBackground(domain) {
-    if (this.pendingCerts.has(domain)) return;
-    if (!this.acmeClient) return;
+  // --- Persistent ACME state helpers ---
+
+  _acmeStatePath(domain) {
+    return path.join(this.certsDir, `${domain}.acme-state.json`);
+  }
+
+  _acmeLockPath(domain) {
+    return path.join(this.certsDir, `${domain}.acme-lock.json`);
+  }
+
+  async _loadAcmeState(domain) {
+    try {
+      const data = await fs.readFile(this._acmeStatePath(domain), 'utf8');
+      return JSON.parse(data);
+    } catch {
+      return { attempts: 0, lastAttemptAt: 0, nextRetryAt: 0, gaveUp: false, lastError: null };
+    }
+  }
+
+  async _saveAcmeState(domain, state) {
+    const p = this._acmeStatePath(domain);
+    const tmp = p + '.tmp';
+    await fs.writeFile(tmp, JSON.stringify(state, null, 2));
+    await fs.rename(tmp, p);
+  }
+
+  async _clearAcmeState(domain) {
+    await fs.unlink(this._acmeStatePath(domain)).catch(() => {});
+  }
+
+  // Returns true if this worker acquired the lock, false if another holds it.
+  async _acquireLock(domain) {
+    const lockPath = this._acmeLockPath(domain);
+    const now = Date.now();
+    try {
+      const data = await fs.readFile(lockPath, 'utf8');
+      const lock = JSON.parse(data);
+      if (lock.workerId !== this.workerId && now - lock.acquiredAt < this.acmeConfig.lockTtlMs) {
+        return false;
+      }
+    } catch {
+      // No lock file — proceed to write
+    }
+    await fs.writeFile(lockPath, JSON.stringify({ workerId: this.workerId, acquiredAt: now }));
+    // Read back to detect a simultaneous write from another worker
+    try {
+      const data = await fs.readFile(lockPath, 'utf8');
+      return JSON.parse(data).workerId === this.workerId;
+    } catch {
+      return false;
+    }
+  }
+
+  async _releaseLock(domain) {
+    const lockPath = this._acmeLockPath(domain);
+    try {
+      const data = await fs.readFile(lockPath, 'utf8');
+      if (JSON.parse(data).workerId === this.workerId) await fs.unlink(lockPath);
+    } catch {
+      // Already gone
+    }
+  }
+
+  // Core ACME attempt with persistent state + cross-worker locking.
+  // Returns a trusted cert entry on success, null otherwise.
+  async _attemptAcme(domain) {
+    if (!this.acmeClient) return null;
+
+    const state = await this._loadAcmeState(domain);
+    if (state.gaveUp) return null;
 
     const now = Date.now();
-    const lastRequest = this.lastCertRequest.get(domain) || 0;
-    if (now - lastRequest < 5 * 60 * 1000) return;
-    const requestCount = this.certRequestCount.get(domain) || 0;
-    if (requestCount >= 5) {
-      this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
-      return;
+    if (now < state.nextRetryAt) return null;
+
+    const locked = await this._acquireLock(domain);
+    if (!locked) return null;
+
+    // Re-read after acquiring — another worker may have just finished
+    const fresh = await this._loadAcmeState(domain);
+    if (fresh.gaveUp || now < fresh.nextRetryAt) {
+      await this._releaseLock(domain);
+      return null;
     }
 
-    this.lastCertRequest.set(domain, now);
-    this.certRequestCount.set(domain, requestCount + 1);
+    try {
+      const capable = await this.testAcmeCapability(domain);
+      if (!capable) return null; // Probe failed — don't count as an attempt
 
-    const certPromise = this.testAcmeCapability(domain)
-      .then(async capable => {
-        if (!capable) return null;
-        const certificate = await this.obtainCertificate(domain);
-        const entry = { ...certificate, type: 'trusted' };
-        this.certificates.set(domain, entry);
-        return entry;
-      })
+      const certificate = await this.obtainCertificate(domain);
+      await this._clearAcmeState(domain);
+      const entry = { ...certificate, type: 'trusted' };
+      this.certificates.set(domain, entry);
+      return entry;
+    } catch (err) {
+      const { maxAttempts, backoffMs } = this.acmeConfig;
+      const attempts = fresh.attempts + 1;
+      const gaveUp = attempts >= maxAttempts;
+      const backoffIndex = Math.min(attempts - 1, backoffMs.length - 1);
+      const backoff = backoffMs[backoffIndex];
+
+      await this._saveAcmeState(domain, {
+        attempts,
+        lastAttemptAt: now,
+        nextRetryAt: gaveUp ? Number.MAX_SAFE_INTEGER : now + backoff,
+        gaveUp,
+        lastError: err.message || String(err),
+      });
+
+      if (gaveUp) {
+        this.logger.error(`Giving up on ACME for ${domain} after ${attempts} failed attempts — serving self-signed permanently`, { domain });
+      } else {
+        this.logger.warn(`ACME attempt ${attempts}/${maxAttempts} failed for ${domain}, next retry in ${Math.round(backoff / 60000)}min: ${err.message}`);
+      }
+      return null;
+    } finally {
+      await this._releaseLock(domain);
+    }
+  }
+
+  // Fire-and-forget ACME for domains that already have a selfsigned cert.
+  _startAcmeBackground(domain) {
+    if (this.pendingCerts.has(domain)) return;
+
+    const certPromise = this._attemptAcme(domain)
       .catch(err => {
-        this.logger.error(`Background ACME failed for ${domain}:`, err);
+        this.logger.error(`Background ACME error for ${domain}:`, err);
         return null;
       })
-      .finally(() => {
-        this.pendingCerts.delete(domain);
-      });
+      .finally(() => this.pendingCerts.delete(domain));
 
     this.pendingCerts.set(domain, certPromise);
     // intentionally not awaited — caller keeps running with the selfsigned
@@ -515,56 +634,23 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return entry;
     }
 
-    // HTTP-01 reachability check
-    const capable = await this.testAcmeCapability(domain);
-    if (!capable) {
-      return await this._generateAndCacheSelfSigned(domain);
-    }
-
-    // Join in-flight ACME request
+    // Join in-flight ACME request if one is already running (e.g. from background worker)
     if (this.pendingCerts.has(domain)) {
       this.logger.info(`Joining in-flight certificate request for ${domain}`);
       const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(null), 30000));
       const cert = await Promise.race([this.pendingCerts.get(domain), timeoutPromise]);
       if (cert) return cert;
-      this.logger.warn(`ACME stuck for ${domain} after 30s, giving up on this attempt`);
+      this.logger.warn(`ACME stuck for ${domain} after 30s, falling back to self-signed`);
       this.pendingCerts.delete(domain);
       return await this._generateAndCacheSelfSigned(domain);
     }
 
-    // Rate limiting
-    const now = Date.now();
-    const lastRequest = this.lastCertRequest.get(domain) || 0;
-    if (now - lastRequest < 5 * 60 * 1000) {
-      this.logger.warn(`Rate limit: Too soon to request certificate for ${domain} (${Math.round((now - lastRequest)/1000)}s since last request)`);
-      return await this._generateAndCacheSelfSigned(domain);
-    }
-    const requestCount = this.certRequestCount.get(domain) || 0;
-    if (requestCount >= 5) {
-      this.logger.error(`Rate limit: Too many certificate requests for ${domain} this week`);
-      return await this._generateAndCacheSelfSigned(domain);
-    }
-
-    // Start ACME
-    this.lastCertRequest.set(domain, now);
-    this.certRequestCount.set(domain, requestCount + 1);
-
-    const certPromise = this.obtainCertificate(domain)
-      .then(certificate => {
-        const entry = { ...certificate, type: 'trusted' };
-        this.certificates.set(domain, entry);
-        return entry;
-      })
-      .catch(async (err) => {
-        this.logger.error(`ACME failed for ${domain}, falling back to self-signed:`, err);
-        return await this._generateAndCacheSelfSigned(domain);
-      })
-      .finally(() => {
-        this.pendingCerts.delete(domain);
-      });
-
+    // Attempt ACME synchronously (state + locking handled inside)
+    const certPromise = this._attemptAcme(domain).finally(() => this.pendingCerts.delete(domain));
     this.pendingCerts.set(domain, certPromise);
-    return await certPromise;
+    const trusted = await certPromise;
+    if (trusted) return trusted;
+    return await this._generateAndCacheSelfSigned(domain);
   }
 
   async ensureWildcardCertificate(mainDomain, isDomainValidated = false) {
