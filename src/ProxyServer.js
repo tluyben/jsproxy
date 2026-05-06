@@ -17,9 +17,10 @@ class ProxyServer {
     this.certManager = new CertificateManager(logger, this.db);
 
     // HA state — score-based port selection
-    this.portScores = new Map();  // `${mappingId}:${port}` -> 0..100
-    this.rrCounters = new Map();  // mappingId -> rotation counter (tie-break)
-    this.bgChecks   = new Set();  // keys currently being TCP-probed
+    this.portScores   = new Map();  // `${mappingId}:${port}` -> 0..100
+    this.portLastSeen = new Map();  // `${mappingId}:${port}` -> Date.now() when last successful
+    this.rrCounters   = new Map();  // mappingId -> rotation counter (tie-break)
+    this.bgChecks     = new Set();  // keys currently being TCP-probed
 
     this.proxy = httpProxy.createProxyServer({
       ws: true,
@@ -104,7 +105,8 @@ class ProxyServer {
         if (err.port)    span.setAttribute('proxy.backend_port',    String(err.port));
         if (err.code)    span.setAttribute('error.code',            err.code);
       }
-      this.logger.error('proxy error', {
+      const logProxyError = req?._proxyIsHA ? this.logger.warn.bind(this.logger) : this.logger.error.bind(this.logger);
+      logProxyError('proxy error', {
         domain,
         method:     req?.method,
         url:        req?.url,
@@ -124,7 +126,8 @@ class ProxyServer {
 
     this.proxy.on('proxyReqError', (err, req, res) => {
       const domain = req?._proxyDomain || req?.headers?.host?.split(':')[0] || 'unknown';
-      this.logger.error('proxy request error', {
+      const logProxyReqError = req?._proxyIsHA ? this.logger.warn.bind(this.logger) : this.logger.error.bind(this.logger);
+      logProxyReqError('proxy request error', {
         domain,
         method:     req?.method,
         url:        req?.url,
@@ -339,6 +342,7 @@ class ProxyServer {
 
       // Store mapping context for error handlers.
       req._proxyMappingId = mapping.id;
+      req._proxyIsHA = String(mapping.back_port).includes(',');
       if (req._span) {
         req._span.setAttribute('proxy.mapping_id',   String(mapping.id));
         req._span.setAttribute('proxy.backend_port', String(mapping.back_port));
@@ -470,6 +474,8 @@ class ProxyServer {
         return;
       }
 
+      req._proxyIsHA = String(mapping.back_port).includes(',');
+
       if (!this.isIpAllowed(this.getClientIp(req), mapping.allowed_ips)) {
         socket.write('HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nForbidden');
         socket.destroy();
@@ -566,7 +572,9 @@ class ProxyServer {
   }
 
   boostPort(mappingId, port) {
-    this.portScores.set(this._portKey(mappingId, port), 100);
+    const key = this._portKey(mappingId, port);
+    this.portScores.set(key, 100);
+    this.portLastSeen.set(key, Date.now());
   }
 
   penalizePort(mappingId, port) {
@@ -601,6 +609,7 @@ class ProxyServer {
         sock.destroy();
         this.bgChecks.delete(key);
         this.portScores.set(key, 50);
+        this.portLastSeen.set(key, Date.now());
         this.logger.info(`HA: port ${port} back up (score→50) for mapping ${mapping.id}`);
       });
       const retry = () => {
@@ -714,7 +723,7 @@ class ProxyServer {
   // Multi-port HA request. Tries ports best-score-first; short-circuits on the
   // first port that actually responds (any status code). Connection-level
   // failures (no response at all) penalize the port and move to the next one.
-  async _requestHA(mapping, uri, method, headers, body) {
+  async _requestHA(mapping, uri, method, headers, body, span = null) {
     const ports = String(mapping.back_port)
       .split(',')
       .map(p => parseInt(p.trim(), 10))
@@ -741,11 +750,28 @@ class ProxyServer {
       }
     }
 
-    this.logger.error('all backends unavailable', {
-      domain:     mapping.domain,
-      ports:      String(mapping.back_port),
-      mapping_id: mapping.id,
+    const portDetails = ordered.map(port => {
+      const lastSeen = this.portLastSeen.get(this._portKey(mapping.id, port));
+      return {
+        port,
+        score:     this.getPortScore(mapping.id, port),
+        last_seen: lastSeen ? new Date(lastSeen).toISOString() : 'never',
+        last_seen_ms_ago: lastSeen ? Date.now() - lastSeen : null,
+      };
     });
+    this.logger.error('all backends unavailable', {
+      domain:       mapping.domain,
+      mapping_id:   mapping.id,
+      port_details: portDetails,
+    });
+    if (span) {
+      span.setAttribute('ha.all_backends_down', true);
+      span.setAttribute('ha.failed_ports', ordered.join(','));
+      for (const d of portDetails) {
+        span.setAttribute(`ha.port.${d.port}.last_seen`,        d.last_seen);
+        span.setAttribute(`ha.port.${d.port}.last_seen_ms_ago`, d.last_seen_ms_ago ?? -1);
+      }
+    }
     return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway: all backends unavailable') };
   }
 
@@ -780,7 +806,7 @@ class ProxyServer {
 
     // ── backend request ──────────────────────────────────────────────────────
     const backendResult = String(mapping.back_port).includes(',')
-      ? await this._requestHA(mapping, uri, method, headers, body)
+      ? await this._requestHA(mapping, uri, method, headers, body, req._span)
       : await this._requestSingle(mapping, uri, method, headers, body);
 
     // ── after() ──────────────────────────────────────────────────────────────
@@ -838,7 +864,7 @@ class ProxyServer {
     }
 
     const body = await this.bufferBody(req);
-    const result = await this._requestHA(mapping, req.url, req.method, req.headers, body);
+    const result = await this._requestHA(mapping, req.url, req.method, req.headers, body, req._span);
     this.sendHAResponse(res, result);
   }
 
