@@ -7,6 +7,7 @@ const DatabaseManager = require('./DatabaseManager');
 const CertificateManager = require('./CertificateManager');
 const { noop } = require('./PluginManager');
 const { URL } = require('url');
+const { tracer, trace, context: otelContext, propagation, SpanKind, SpanStatusCode } = require('./Telemetry');
 
 class ProxyServer {
   constructor(logger, pluginManager) {
@@ -34,24 +35,52 @@ class ProxyServer {
   }
 
   setupProxyErrorHandling() {
-    // Set proper forwarding headers before proxying
     this.proxy.on('proxyReq', (proxyReq, req, res, options) => {
-      // Preserve the original host
       const originalHost = req.headers.host;
       if (originalHost) {
         proxyReq.setHeader('X-Forwarded-Host', originalHost);
-        // Keep the Host header as the original domain
         proxyReq.setHeader('Host', originalHost);
       }
-      
-      // Set the protocol based on whether this is HTTPS
       const protocol = req.connection.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
       proxyReq.setHeader('X-Forwarded-Proto', protocol);
-      
-      // X-Forwarded-For is handled by xfwd: true
+
+      if (process.env.LOG_LEVEL === 'debug') {
+        this.logger.debug('proxying request', {
+          domain:  req._proxyDomain,
+          method:  req.method,
+          url:     req.url,
+          target:  options.target,
+        });
+      }
     });
-    
+
     this.proxy.on('proxyRes', (proxyRes, req, res) => {
+      // Record backend status on the active span
+      const span = req._span;
+      if (span) {
+        span.setAttribute('proxy.backend_status', proxyRes.statusCode);
+        if (proxyRes.statusCode >= 500) {
+          span.setStatus({ code: SpanStatusCode.ERROR, message: `backend HTTP ${proxyRes.statusCode}` });
+        }
+      }
+
+      if (proxyRes.statusCode >= 500) {
+        this.logger.error('backend error response', {
+          domain:         req._proxyDomain,
+          method:         req.method,
+          url:            req.url,
+          backend_status: proxyRes.statusCode,
+          mapping_id:     req._proxyMappingId,
+        });
+      } else if (process.env.LOG_LEVEL === 'debug') {
+        this.logger.debug('backend response', {
+          domain:         req._proxyDomain,
+          method:         req.method,
+          url:            req.url,
+          backend_status: proxyRes.statusCode,
+        });
+      }
+
       if (req.method === 'GET' && process.env.CACHE_HEADERS === 'true') {
         const expiry = process.env.CACHE_EXPIRY;
         const infinite = !expiry || expiry === '-1';
@@ -66,7 +95,27 @@ class ProxyServer {
     });
 
     this.proxy.on('error', (err, req, res) => {
-      this.logger.error('Proxy error:', err);
+      const domain = req?._proxyDomain || req?.headers?.host?.split(':')[0] || 'unknown';
+      const span   = req?._span;
+      if (span) {
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+        if (err.address) span.setAttribute('proxy.backend_address', err.address);
+        if (err.port)    span.setAttribute('proxy.backend_port',    String(err.port));
+        if (err.code)    span.setAttribute('error.code',            err.code);
+      }
+      this.logger.error('proxy error', {
+        domain,
+        method:     req?.method,
+        url:        req?.url,
+        mapping_id: req?._proxyMappingId,
+        error:      err.message,
+        error_code: err.code,
+        address:    err.address,
+        port:       err.port,
+        errno:      err.errno,
+        syscall:    err.syscall,
+      });
       if (res && !res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'text/plain' });
         res.end('Bad Gateway');
@@ -74,7 +123,15 @@ class ProxyServer {
     });
 
     this.proxy.on('proxyReqError', (err, req, res) => {
-      this.logger.error('Proxy request error:', err);
+      const domain = req?._proxyDomain || req?.headers?.host?.split(':')[0] || 'unknown';
+      this.logger.error('proxy request error', {
+        domain,
+        method:     req?.method,
+        url:        req?.url,
+        mapping_id: req?._proxyMappingId,
+        error:      err.message,
+        error_code: err.code,
+      });
       if (res && !res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'text/plain' });
         res.end('Bad Gateway');
@@ -136,7 +193,24 @@ class ProxyServer {
         });
 
         this.httpsServer.on('tlsClientError', (err, tlsSocket) => {
-          this.logger.error('TLS client error:', err);
+          // ECONNRESET / "socket hang up" = client disconnected mid-handshake — perfectly normal.
+          // Real TLS errors (bad cert, unknown protocol, etc.) are worth a warning.
+          const isDisconnect = err.code === 'ECONNRESET' || err.message === 'socket hang up';
+          const domain = tlsSocket.servername || tlsSocket.remoteAddress || 'unknown';
+          if (isDisconnect) {
+            this.logger.info('tls client disconnected during handshake', {
+              domain,
+              client_ip: tlsSocket.remoteAddress,
+              error_code: err.code,
+            });
+          } else {
+            this.logger.warn('tls client error', {
+              domain,
+              client_ip:  tlsSocket.remoteAddress,
+              error:      err.message,
+              error_code: err.code,
+            });
+          }
         });
         
         await new Promise((resolve) => {
@@ -156,6 +230,32 @@ class ProxyServer {
   }
 
   async handleRequest(req, res, isHttps) {
+    // Extract incoming W3C trace context, then create a server span.
+    const parentCtx = propagation.extract(otelContext.active(), req.headers);
+    const span = tracer.startSpan('proxy.request', {
+      kind: SpanKind.SERVER,
+      attributes: {
+        'http.method':    req.method,
+        'http.url':       req.url,
+        'http.host':      req.headers.host || '',
+        'http.scheme':    isHttps ? 'https' : 'http',
+        'net.peer.ip':    this.getClientIp(req),
+      },
+    }, parentCtx);
+    req._span = span;
+
+    // End the span when the response is fully sent (or connection is dropped).
+    const endSpan = () => {
+      span.setAttribute('http.status_code', res.statusCode || 0);
+      span.end();
+    };
+    res.on('finish', endSpan);
+    res.on('close',  endSpan);
+
+    return otelContext.with(trace.setSpan(parentCtx, span), () => this._handleRequest(req, res, isHttps));
+  }
+
+  async _handleRequest(req, res, isHttps) {
     try {
       // Health check endpoint
       if (req.url === '/health') {
@@ -218,12 +318,31 @@ class ProxyServer {
       }
 
       const domain = host.split(':')[0];
+      // Store domain on req so proxy error handlers can include it in logs.
+      req._proxyDomain = domain;
+      if (req._span) req._span.setAttribute('proxy.domain', domain);
+
+      if (process.env.LOG_LEVEL === 'debug') {
+        this.logger.debug('incoming request', {
+          domain, method: req.method, url: req.url,
+          client_ip: this.getClientIp(req), https: isHttps,
+        });
+      }
+
       const mapping = await this.db.getMapping(domain, req.url);
 
       if (!mapping) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
         return;
+      }
+
+      // Store mapping context for error handlers.
+      req._proxyMappingId = mapping.id;
+      if (req._span) {
+        req._span.setAttribute('proxy.mapping_id',   String(mapping.id));
+        req._span.setAttribute('proxy.backend_port', String(mapping.back_port));
+        req._span.setAttribute('proxy.backend',      mapping.backend || 'localhost');
       }
 
       if (!this.isIpAllowed(this.getClientIp(req), mapping.allowed_ips)) {
@@ -316,7 +435,18 @@ class ProxyServer {
       }
 
     } catch (error) {
-      this.logger.error('Request handling error:', error);
+      const span = req._span;
+      if (span) {
+        span.recordException(error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+      }
+      this.logger.error('request handling error', {
+        domain: req._proxyDomain,
+        method: req.method,
+        url:    req.url,
+        error:  error.message,
+        stack:  process.env.LOG_LEVEL === 'debug' ? error.stack : undefined,
+      });
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'text/plain' });
         res.end('Internal Server Error');
@@ -379,7 +509,12 @@ class ProxyServer {
       });
 
     } catch (error) {
-      this.logger.error('WebSocket handling error:', error);
+      this.logger.error('websocket handling error', {
+        domain: req.headers.host?.split(':')[0],
+        url:    req.url,
+        error:  error.message,
+        error_code: error.code,
+      });
       socket.destroy();
     }
   }
@@ -560,10 +695,18 @@ class ProxyServer {
   // Single-port backend request for the plugin path. Returns a result object or
   // a synthetic 502 on error.
   async _requestSingle(mapping, uri, method, headers, body) {
+    const port = parseInt(mapping.back_port, 10);
     try {
-      return await this._tryPort(mapping, parseInt(mapping.back_port, 10), uri, method, headers, body);
+      return await this._tryPort(mapping, port, uri, method, headers, body);
     } catch (err) {
-      this.logger.error('_requestSingle failed:', err);
+      this.logger.error('backend request failed', {
+        domain:     mapping.domain,
+        port,
+        uri,
+        error:      err.message,
+        error_code: err.code,
+        address:    err.address,
+      });
       return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway') };
     }
   }
@@ -582,16 +725,27 @@ class ProxyServer {
     for (const port of ordered) {
       try {
         const result = await this._tryPort(mapping, port, uri, method, headers, body);
-        // Port responded — boost its score and return immediately
         this.boostPort(mapping.id, port);
         return result;
       } catch (err) {
-        // Connection-level failure: penalize and probe in background
+        this.logger.warn('HA backend failed, trying next', {
+          domain:     mapping.domain,
+          port,
+          uri,
+          error:      err.message,
+          error_code: err.code,
+          address:    err.address,
+        });
         this.penalizePort(mapping.id, port);
         this.startBackgroundCheck(mapping, port);
       }
     }
 
+    this.logger.error('all backends unavailable', {
+      domain:     mapping.domain,
+      ports:      String(mapping.back_port),
+      mapping_id: mapping.id,
+    });
     return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway: all backends unavailable') };
   }
 

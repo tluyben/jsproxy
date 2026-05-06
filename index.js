@@ -1,43 +1,31 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
+// Telemetry must be initialized before anything else so the OTEL provider
+// and W3C propagator are registered before HTTP servers start.
+require('./src/Telemetry');
+
+const { createLogger } = require('./src/Logger');
 const cluster = require('cluster');
 const numCPUs = require('os').cpus().length;
-const winston = require('winston');
-const fs = require('fs').promises;
-const path = require('path');
 
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.errors({ stack: true }),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple()
-      )
-    }),
-    new winston.transports.File({ filename: 'error.log', level: 'error' }),
-    new winston.transports.File({ filename: 'combined.log' })
-  ]
+const logger = createLogger({
+  service: 'jsproxy',
+  role: cluster.isMaster ? 'master' : 'worker',
+  pid: process.pid,
 });
 
 if (cluster.isMaster) {
-  logger.info(`Master ${process.pid} is running`);
+  logger.info('master starting', { workers: Math.min(numCPUs, 4) });
 
-  // Track worker IDs for respawning
   const workerIds = new Map();
-  
+
   for (let i = 0; i < Math.min(numCPUs, 4); i++) {
     const worker = cluster.fork({ WORKER_ID: i.toString() });
     workerIds.set(worker.id, i);
   }
 
   cluster.on('exit', (worker, code, signal) => {
-    logger.error(`Worker ${worker.process.pid} died with code ${code} and signal ${signal}`);
-    logger.info('Starting a new worker');
+    logger.error('worker died', { worker_pid: worker.process.pid, code, signal });
+    logger.info('respawning worker');
     const workerId = workerIds.get(worker.id) || 0;
     workerIds.delete(worker.id);
     const newWorker = cluster.fork({ WORKER_ID: workerId.toString() });
@@ -45,46 +33,50 @@ if (cluster.isMaster) {
   });
 
   cluster.on('listening', (worker, address) => {
-    logger.info(`Worker ${worker.process.pid} listening on ${address.address}:${address.port}`);
+    logger.info('worker listening', { worker_pid: worker.process.pid, address: address.address, port: address.port });
   });
 
   process.on('uncaughtException', (error) => {
-    logger.error('Uncaught Exception in master:', error);
+    logger.error('uncaught exception in master', { error: error.message, stack: error.stack });
   });
 
-  process.on('unhandledRejection', (reason, promise) => {
-    logger.error('Unhandled Rejection in master at:', promise, 'reason:', reason);
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    logger.error('unhandled rejection in master', { error: msg, stack });
   });
 
 } else {
-  const ProxyServer = require('./src/ProxyServer');
+  const ProxyServer  = require('./src/ProxyServer');
   const { PluginManager } = require('./src/PluginManager');
 
   async function startWorker() {
-    try {
-      // Get worker ID
-      const workerId = parseInt(process.env.WORKER_ID || '0');
-      logger.info(`Worker ${process.pid} starting with ID: ${workerId}`);
+    const workerId  = parseInt(process.env.WORKER_ID || '0');
+    const wLogger   = logger.child({ worker_id: workerId });
 
-      const pluginManager = new PluginManager(logger, process.env.PLUGIN);
-      const server = new ProxyServer(logger, pluginManager);
+    wLogger.info('worker starting');
+
+    try {
+      const pluginManager = new PluginManager(wLogger, process.env.PLUGIN);
+      const server = new ProxyServer(wLogger, pluginManager);
       await server.initialize();
       await server.start();
-      
-      logger.info(`Worker ${process.pid} started successfully`);
+      wLogger.info('worker ready');
     } catch (error) {
-      logger.error(`Worker ${process.pid} failed to start:`, error);
+      wLogger.error('worker failed to start', { error: error.message, stack: error.stack });
       process.exit(1);
     }
   }
 
   process.on('uncaughtException', (error) => {
-    logger.error(`Uncaught Exception in worker ${process.pid}:`, error);
+    logger.error('uncaught exception in worker', { error: error.message, stack: error.stack });
     process.exit(1);
   });
 
-  process.on('unhandledRejection', (reason, promise) => {
-    logger.error(`Unhandled Rejection in worker ${process.pid} at:`, promise, 'reason:', reason);
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    logger.error('unhandled rejection in worker', { error: msg, stack });
     process.exit(1);
   });
 

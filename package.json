@@ -3,7 +3,9 @@
   "version": "1.0.5",
   "description": "A resilient HTTP/HTTPS proxy server with WebSocket support and automatic SSL certificate generation",
   "main": "index.js",
-  "bin": {"jsproxy": "index.js"},
+  "bin": {
+    "jsproxy": "index.js"
+  },
   "scripts": {
     "start": "node index.js",
     "demo:hello": "node scripts/run-demo.js hello",
@@ -53,12 +55,16 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/core": "^2.7.1",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.216.0",
+    "@opentelemetry/resources": "^2.7.1",
+    "@opentelemetry/sdk-trace-node": "^2.7.1",
     "acme-client": "^5.3.0",
     "dotenv": "^17.3.1",
     "http-proxy": "^1.18.1",
     "sqlite3": "^5.1.6",
-    "uuid": "^9.0.1",
-    "winston": "^3.11.0"
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "@yao-pkg/pkg": "^5.12.0",

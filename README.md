@@ -6,7 +6,7 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 
 - **Multi-protocol Support**: HTTP, HTTPS, and WebSocket proxying
 - **Automatic SSL**: Let's Encrypt integration for automatic certificate generation
-- **High Availability**: Cluster-based architecture with worker process management; multi-port round-robin load balancing with automatic dead-port detection
+- **High Availability**: Cluster-based architecture with worker process management; multi-port score-based load balancing with automatic dead-port detection and background recovery probes
 - **Zero Downtime**: Hot database replacement without service interruption
 - **Flexible Routing**: Domain and URI-based traffic routing
 - **IP Allowlisting**: Per-mapping IP restrictions with CIDR range support, works transparently behind nginx
@@ -15,6 +15,8 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 - **Plugin System**: Intercept and transform requests/responses via external HTTP services — rewrite URLs, add headers, retry failures, short-circuit with custom responses, and more
 - **External Backend Support**: Proxy to remote servers, not just localhost
 - **SQLite Backend**: WAL mode for concurrent reads during updates
+- **Structured Logging**: Single-line human-readable text format by default; switchable to newline-delimited JSON for log pipelines — all log entries include domain, method, URL, and backend context
+- **OpenTelemetry**: Built-in distributed tracing with W3C `traceparent` propagation; plugs into any OTEL-compatible backend (Jaeger, Grafana Tempo, Honeycomb, etc.) via OTLP
 - **Docker Ready**: Complete containerization with docker-compose
 - **Comprehensive Testing**: Full test suite with integration tests
 
@@ -70,17 +72,35 @@ The proxy server supports flexible port configuration through environment variab
 ### Environment Variables
 
 ```bash
+# Server
 NODE_ENV=development|production    # Environment mode
 HTTP_PORT=8080                     # HTTP port (default: 8080 dev, 80 prod)
 HTTPS_PORT=8443                    # HTTPS port (default: 8443 dev, 443 prod)
 HTTP_HOST=0.0.0.0                  # Bind address (default: 0.0.0.0)
 ENABLE_HTTPS=true|false            # Enable HTTPS (default: false dev, true prod)
-DB_PATH=./data/current.db         # Path to SQLite database file
+FORCE_HTTPS=true                   # Redirect all HTTP → HTTPS (default: false)
+DB_PATH=./data/current.db          # Path to SQLite database file
+
+# Logging
+LOG_LEVEL=debug|info|warn|error    # Log verbosity (default: info)
+LOG_FORMAT=text|json               # Output format (default: text, see Logging section)
+
+# OpenTelemetry tracing
+OTEL_SERVICE_NAME=jsproxy          # Service name in traces (default: jsproxy)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318   # OTLP collector base URL
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces  # Override traces URL
+OTEL_EXPORTER_OTLP_HEADERS=api-key=xxx,x-scope=prod  # Comma-separated extra headers
+
+# Caching
 CACHE_HEADERS=true|false           # Inject Cache-Control headers on GET responses (default: false)
 CACHE_EXPIRY=60                    # Cache expiry in minutes; omit or -1 for aggressive infinite cache
+
+# Webhook interceptor
 WEBHOOK_URL=https://…/hook         # Pre-proxy webhook endpoint (optional, see Webhook Interceptor)
 WEBHOOK_TIMEOUT=5000               # Webhook response timeout in ms (default: 5000)
 WEBHOOK_SECRET=<secret>            # HMAC-SHA256 signing secret for X-Webhook-Signature header
+
+# Plugin system
 PLUGIN=localhost:3001,localhost:3002  # Plugin endpoints (optional, see Plugin System)
 PLUGIN_TIMEOUT=5000                # Per-plugin HTTP call timeout in ms (default: 5000)
 ```
@@ -501,27 +521,25 @@ See [`docs/plugins.md`](docs/plugins.md) for the full API reference, plugin auth
 
 ## High Availability / Load Balancing
 
-When a mapping has `back_ports` set (comma-separated list), the proxy load-balances across those ports instead of using `back_port`.
+Set `back_port` to a comma-separated list of ports to enable HA mode for a mapping.
 
 **Behaviour per request:**
 
-1. Dead ports (connection refused / DNS failure) are filtered out in-memory; they are retried after **30 seconds**.
-2. The remaining alive ports are tried in round-robin order starting from the current position.
-3. The **first 2xx response wins** and is returned immediately.
-4. If no 2xx is found, all ports are tried and the best response is returned by status class: `2xx > 3xx > 4xx > 5xx`.
-5. If all ports are unreachable, returns `502 Bad Gateway`.
+1. Ports are ranked by a **score** (0–100, default 100). A successful response boosts the port to 100; a connection failure drops it to 0.
+2. Ports are tried **best-score-first** (round-robin as a tie-breaker). The first port that responds at any HTTP status code wins immediately.
+3. On a connection failure, the port is penalized (score → 0), a **background TCP probe** starts (retries every 5 s with a 3 s socket timeout), and the next port is tried.
+4. When the probe succeeds, the port's score is restored to 50 so it gets one real-request trial before being fully trusted again.
+5. If **all** ports fail, returns `502 Bad Gateway` and logs `error: all backends unavailable` with the domain and port list.
 
-Connection-refused failures are **instant** (no timeout), so a fully-down cluster fails in microseconds.
+Each individual backend attempt has a **10 s timeout**. SSE and other streaming requests (`Accept: text/event-stream`) skip the buffered failover path and stream directly via one round-robin selected port.
 
 ```sql
--- Example: domain.com load-balanced across ports 3000, 3001, 3002
-INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, back_ports)
-VALUES (uuid(), 'domain.com', '', 3000, '', NULL, '3000,3001,3002');
+-- HA mapping: domain.com balanced across three local ports
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
+VALUES ('550e8400-e29b-41d4-a716-446655440003', 'ha.example.com', '', '3000,3001,3002', '', NULL);
 ```
 
-> Note: WebSocket connections always use the single `back_port` path — HA is HTTP/HTTPS only.
-
-> Note: **SSE (Server-Sent Events)** and other streaming responses skip the buffered failover logic. The proxy detects `Accept: text/event-stream` and routes the request directly to one round-robin selected port via streaming. Dead-port filtering still applies, but there is no retry — mid-stream failover is impossible regardless.
+> **WebSocket**: always uses a single port (the first ranked port). HA applies to HTTP/HTTPS only.
 
 ## Hot Database Replacement
 
@@ -640,18 +658,96 @@ Master Process
 - **SSL Errors**: Falls back to self-signed certificate
 - **Database Errors**: Logs error, continues with cached mappings
 
-## Configuration Files
+## Observability
 
-### Environment Variables
+### Logging
+
+All log output is structured and single-line. Two formats are available, switched with `LOG_FORMAT`:
+
+**Text (default)** — human-readable, colourable with `grep` / `awk`:
+```
+[2026-05-06T09:12:33.123Z] [INFO ] HTTP server listening  service=jsproxy  worker_id=0  host=0.0.0.0  port=8080
+[2026-05-06T09:12:33.456Z] [ERROR] proxy error  service=jsproxy  worker_id=1  domain=api.example.com  method=GET  url=/v1/users  error_code=ECONNREFUSED  address=127.0.0.1  port=3041
+[2026-05-06T09:12:33.789Z] [INFO ] tls client disconnected during handshake  domain=api.example.com  client_ip=1.2.3.4  error_code=ECONNRESET
+```
+
+**JSON (`LOG_FORMAT=json`)** — newline-delimited JSON for log shippers (Loki, Fluentd, Vector, etc.):
+```json
+{"ts":"2026-05-06T09:12:33.123Z","level":"info","msg":"HTTP server listening","service":"jsproxy","worker_id":0,"host":"0.0.0.0","port":8080}
+{"ts":"2026-05-06T09:12:33.456Z","level":"error","msg":"proxy error","service":"jsproxy","worker_id":1,"domain":"api.example.com","method":"GET","url":"/v1/users","error_code":"ECONNREFUSED","address":"127.0.0.1","port":3041,"trace_id":"a1b2c3…","span_id":"d4e5f6…"}
+```
+
+Every error log line includes `domain`, `method`, `url`, and backend context (`address`, `port`, `error_code`) — no more context-free connection-refused messages.
+
+**Log levels:**
+
+| Level | What's logged |
+|-------|--------------|
+| `error` | Proxy failures (502/503), unhandled exceptions, backend completely unavailable |
+| `warn` | HA port failure (before fallover), TLS errors (non-disconnect), rate limits |
+| `info` | Startup/shutdown, request lifecycle, TLS client disconnects, cert events (default) |
+| `debug` | Every request entry, routing decision, proxy hop, span dumps via ConsoleSpanExporter |
+
+**Routing to stdout / stderr:**
+- `info` and `debug` → **stdout**
+- `warn` and `error` → **stderr**
+
+This means `2>errors.log` captures only genuine problems and `>access.log` captures the normal flow.
+
+**Notable log behaviour:**
+- `ECONNRESET` / "socket hang up" during TLS handshake → `info` (normal client disconnect, not an error)
+- Backend 5xx responses → `error` with `domain`, `backend_status`, `mapping_id`
+- HA failover → `warn` per failed port, then `error` only if all ports are exhausted
+- Stack traces are suppressed in text mode unless `LOG_LEVEL=debug`
+
+### Health Check
 
 ```bash
-NODE_ENV=production        # Environment mode
-LOG_LEVEL=info            # Logging level
-HTTP_HOST=0.0.0.0         # Bind address (default: 0.0.0.0)
-DB_PATH=./data/current.db # Path to SQLite database file
-CACHE_HEADERS=true|false  # Inject Cache-Control headers on GET responses (default: false)
-CACHE_EXPIRY=60           # Cache expiry in minutes; omit or -1 for aggressive infinite cache
-ACME_DIRECTORY_URL=...    # ACME server URL (defaults to Let's Encrypt)
+curl http://localhost:8080/health   # → 200 OK
+```
+
+### OpenTelemetry Tracing
+
+Every proxied request creates an OTEL span with the following attributes:
+
+| Attribute | Example |
+|-----------|---------|
+| `http.method` | `GET` |
+| `http.url` | `/v1/users?page=1` |
+| `http.host` | `api.example.com` |
+| `http.scheme` | `https` |
+| `http.status_code` | `200` |
+| `net.peer.ip` | `203.0.113.42` |
+| `proxy.domain` | `api.example.com` |
+| `proxy.mapping_id` | `550e8400-…` |
+| `proxy.backend_port` | `3000` |
+| `proxy.backend_status` | `200` |
+| `error.code` | `ECONNREFUSED` (on failure) |
+
+Incoming `traceparent` / `tracestate` headers are extracted (W3C format), so the proxy participates in distributed traces originating from upstream services.
+
+`trace_id` and `span_id` are automatically injected into every log line emitted while a span is active, linking logs to traces.
+
+**Enabling OTLP export:**
+
+```bash
+# Jaeger all-in-one (docker run --rm -p 4318:4318 -p 16686:16686 jaegertracing/all-in-one)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 node index.js
+
+# Grafana Tempo
+OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318 node index.js
+
+# Honeycomb
+OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io \
+OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=YOUR_API_KEY \
+node index.js
+```
+
+When no endpoint is configured, spans are still created and linked to logs but not exported (zero overhead — the OTLP exporter is simply not registered).
+
+**Debug: print spans to stdout:**
+```bash
+LOG_LEVEL=debug node index.js   # ConsoleSpanExporter also fires for every span
 ```
 
 ### Docker Environment
@@ -660,24 +756,9 @@ ACME_DIRECTORY_URL=...    # ACME server URL (defaults to Let's Encrypt)
 environment:
   - NODE_ENV=production
   - LOG_LEVEL=info
-```
-
-## Monitoring and Logs
-
-### Log Files
-
-- `error.log`: Error-level logs only
-- `combined.log`: All log levels
-- Console: Formatted output for development
-
-### Health Checks
-
-```bash
-# HTTP health check
-curl http://localhost:80/health
-
-# Docker health check (automatic)
-docker-compose ps
+  - LOG_FORMAT=json                                 # for Loki / Fluentd
+  - OTEL_SERVICE_NAME=jsproxy
+  - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318   # optional
 ```
 
 ## Performance
@@ -731,8 +812,14 @@ docker-compose ps
 ### Debug Mode
 
 ```bash
-# Enable debug logging
+# Full verbose logging — every request, routing decision, span dump
 LOG_LEVEL=debug npm start
+
+# Debug with JSON output for piping into jq
+LOG_LEVEL=debug LOG_FORMAT=json npm start | jq 'select(.level == "error")'
+
+# Watch only errors in real time
+npm start 2>&1 | grep '"level":"error"'
 ```
 
 ## Deno / Single Binary
