@@ -61,7 +61,7 @@ http.createServer((req, res) => {
 
     if (req.url === '/valid') {
       const interested = RULES.some(r => r.match(data.uri, data.method));
-      return json(res, { valid: interested });
+      return json(res, { valid: interested, needsBody: false });
     }
 
     if (req.url === '/before') {

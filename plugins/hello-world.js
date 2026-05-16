@@ -29,7 +29,7 @@ http.createServer((req, res) => {
     if (req.url === '/valid') {
       // Only interested in /hello (with or without query string)
       const interested = data.uri === '/hello' || data.uri.startsWith('/hello?') || data.uri.startsWith('/hello/');
-      return json(res, { valid: interested });
+      return json(res, { valid: interested, needsBody: false });
     }
 
     if (req.url === '/before') {

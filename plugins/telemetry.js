@@ -282,7 +282,7 @@ http.createServer((req, res) => {
       if (req.url === '/valid') {
         if (isIgnored(data.uri))          return json(res, { valid: false });
         if (Math.random() > SAMPLE_RATE)  return json(res, { valid: false });
-        return json(res, { valid: true });
+        return json(res, { valid: true, needsBody: false });
       }
 
       // ── /before ───────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ const noop = {
   hasPlugins: false,
   register() {},
   cleanup() {},
-  async runValid() { return []; },
+  async runValid() { return { interested: [], needsBody: true }; },
   async runBefore() { return { type: 'CONTINUE' }; },
   async runAfter() { return { type: 'CONTINUE' }; },
 };
@@ -53,9 +53,15 @@ class PluginManager {
 
   /**
    * Store per-request state. Only called when ≥1 plugin returned valid=true.
+   * needsBody=false only when every interested plugin explicitly declared it.
    */
-  register(requestId, interested) {
-    this._requests.set(requestId, { ignore: false, interested });
+  register(requestId, interested, needsBody = true) {
+    this._requests.set(requestId, { ignore: false, interested, needsBody });
+  }
+
+  requestNeedsBody(requestId) {
+    const state = this._requests.get(requestId);
+    return state ? state.needsBody : true;
   }
 
   /**
@@ -119,17 +125,22 @@ class PluginManager {
     const results = await Promise.allSettled(
       this.plugins.map((plugin, idx) =>
         this._post(plugin, '/valid', { requestId, domain, inPort, uri, method })
-          .then(res => ({ idx, valid: res.valid === true }))
+          .then(res => ({ idx, valid: res.valid === true, needsBody: res.needsBody !== false }))
           .catch(err => {
             this.logger.warn(`Plugin ${plugin.host}:${plugin.port} /valid error: ${err.message}`);
-            return { idx, valid: false };
+            return { idx, valid: false, needsBody: true };
           })
       )
     );
 
-    return results
+    const interested = results
       .filter(r => r.status === 'fulfilled' && r.value.valid)
-      .map(r => r.value.idx);
+      .map(r => r.value);
+
+    // Conservative: needsBody is true unless every interested plugin opts out
+    const needsBody = interested.length === 0 || interested.some(r => r.needsBody);
+
+    return { interested: interested.map(r => r.idx), needsBody };
   }
 
   /**

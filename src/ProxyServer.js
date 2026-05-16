@@ -399,11 +399,11 @@ class ProxyServer {
             ? parseInt(process.env.HTTPS_PORT || (process.env.NODE_ENV === 'production' ? '443' : '8443'), 10)
             : parseInt(process.env.HTTP_PORT || (process.env.NODE_ENV === 'production' ? '80' : '8080'), 10);
           const requestId = crypto.randomUUID();
-          const interested = await this.pluginManager.runValid(requestId, domain, inPort, req.url, req.method);
+          const { interested, needsBody } = await this.pluginManager.runValid(requestId, domain, inPort, req.url, req.method);
           if (interested.length > 0) {
-            this.pluginManager.register(requestId, interested);
+            this.pluginManager.register(requestId, interested, needsBody);
             res.once('close', () => this.pluginManager.cleanup(requestId));
-            await this._handleWithPlugins(requestId, domain, inPort, mapping, req, res);
+            await this._handleWithPlugins(requestId, domain, inPort, mapping, req, res, needsBody);
             return;
           }
         } catch (err) {
@@ -776,7 +776,11 @@ class ProxyServer {
   }
 
   // Full request/response pipeline used when ≥1 plugin expressed interest.
-  async _handleWithPlugins(requestId, domain, inPort, mapping, req, res) {
+  async _handleWithPlugins(requestId, domain, inPort, mapping, req, res, needsBody = true) {
+    if (!needsBody) {
+      return this._streamWithPlugins(requestId, domain, inPort, mapping, req, res);
+    }
+
     // Buffer request body (needed for before() payload and for re-sending to backend)
     const requestBody = await this.bufferBody(req);
 
@@ -838,6 +842,108 @@ class ProxyServer {
     this.sendHAResponse(res, backendResult);
   }
 
+  // Streaming plugin path: run before()/after() with null body, pipe request and
+  // response directly. Used when every interested plugin declared needsBody: false.
+  async _streamWithPlugins(requestId, domain, inPort, mapping, req, res) {
+    const beforeResult = await this.pluginManager.runBefore(
+      requestId, domain, inPort, req.url, req.method, req.headers, null
+    );
+
+    if (beforeResult.type === 'CANCEL') {
+      res.writeHead(beforeResult.statusCode, { 'content-type': 'text/plain' });
+      return res.end();
+    }
+
+    let uri     = req.url;
+    let method  = req.method;
+    let headers = { ...req.headers };
+    const skipAfter = beforeResult.type === 'IGNORE';
+
+    if (beforeResult.type === 'REWRITE_REQUEST') {
+      if (beforeResult.uri     != null) uri     = beforeResult.uri;
+      if (beforeResult.method  != null) method  = beforeResult.method;
+      if (beforeResult.headers != null) headers = beforeResult.headers;
+      // body rewrite intentionally ignored — plugin declared needsBody: false
+    }
+
+    const ports = String(mapping.back_port)
+      .split(',')
+      .map(p => parseInt(p.trim(), 10))
+      .filter(p => !isNaN(p));
+    const port = ports.length > 1 ? this.rankedPorts(mapping.id, ports)[0] : ports[0];
+    const backend = mapping.backend || 'http://localhost';
+    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
+    const lib = backendUrl.protocol === 'https:' ? https : http;
+
+    const targetPath = (!mapping.front_uri && !mapping.back_uri)
+      ? uri
+      : this.buildTargetPath(mapping, uri);
+
+    headers['x-forwarded-host'] = headers['host'] || '';
+    headers['host'] = `${backendUrl.hostname}:${port}`;
+
+    const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
+
+    return new Promise((resolve) => {
+      const proxyReq = lib.request(
+        { hostname: backendUrl.hostname, port, path: targetPath, method, headers },
+        async (proxyRes) => {
+          try {
+            if (!skipAfter) {
+              const afterResult = await this.pluginManager.runAfter(
+                requestId, domain, inPort, proxyRes.statusCode, proxyRes.headers, null
+              );
+              if (afterResult.type === 'CANCEL') {
+                proxyRes.destroy();
+                res.writeHead(afterResult.statusCode, { 'content-type': 'text/plain' });
+                res.end();
+                return resolve();
+              }
+              if (afterResult.type === 'REWRITE_RESPONSE') {
+                const outHeaders = {};
+                const src = afterResult.headers ?? proxyRes.headers;
+                for (const [k, v] of Object.entries(src)) {
+                  if (!skip.has(k.toLowerCase())) outHeaders[k] = v;
+                }
+                res.writeHead(afterResult.statusCode ?? proxyRes.statusCode, outHeaders);
+                proxyRes.pipe(res);
+                proxyRes.on('end', resolve);
+                proxyRes.on('error', () => resolve());
+                return;
+              }
+            }
+            const fwdHeaders = {};
+            for (const [k, v] of Object.entries(proxyRes.headers)) {
+              if (!skip.has(k.toLowerCase())) fwdHeaders[k] = v;
+            }
+            res.writeHead(proxyRes.statusCode, fwdHeaders);
+            proxyRes.pipe(res);
+            proxyRes.on('end', resolve);
+            proxyRes.on('error', () => resolve());
+          } catch (err) {
+            this.logger.error('plugin streaming after() error', { domain, error: err.message });
+            if (!res.headersSent) {
+              res.writeHead(502, { 'content-type': 'text/plain' });
+              res.end('Bad Gateway');
+            }
+            resolve();
+          }
+        }
+      );
+
+      proxyReq.on('error', (err) => {
+        this.logger.error('plugin streaming backend error', { domain, port, error: err.message });
+        if (!res.headersSent) {
+          res.writeHead(502, { 'content-type': 'text/plain' });
+          res.end('Bad Gateway');
+        }
+        resolve();
+      });
+
+      req.pipe(proxyReq);
+    });
+  }
+
   sendHAResponse(res, result) {
     const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
     const headers = {};
@@ -854,18 +960,11 @@ class ProxyServer {
       .map(p => parseInt(p.trim(), 10))
       .filter(p => !isNaN(p));
 
-    // SSE (and other streaming) can't be buffered for failover — stream directly
-    // via http-proxy using one round-robin selected port.
-    if (req.headers.accept && req.headers.accept.includes('text/event-stream')) {
-      const port = this.rankedPorts(mapping.id, ports)[0];
-      const backend = mapping.backend || 'http://localhost';
-      this.proxy.web(req, res, { target: `${backend}:${port}`, secure: false, changeOrigin: true });
-      return;
-    }
-
-    const body = await this.bufferBody(req);
-    const result = await this._requestHA(mapping, req.url, req.method, req.headers, body, req._span);
-    this.sendHAResponse(res, result);
+    // Always stream — buffering the full body for failover risks OOM on large
+    // uploads/downloads, and a half-consumed stream can't be retried anyway.
+    const port = this.rankedPorts(mapping.id, ports)[0];
+    const backend = mapping.backend || 'http://localhost';
+    this.proxy.web(req, res, { target: `${backend}:${port}`, secure: false, changeOrigin: true });
   }
 
   // ── Auth helpers ──────────────────────────────────────────────────────────
