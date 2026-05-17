@@ -980,12 +980,11 @@ class ProxyServer {
     // is unreachable the client gets a 502 and retries; penalization ensures the
     // next attempt picks a healthy port. Port scores are updated via _haStreamPort
     // in the shared proxyRes / error handlers in setupProxyErrorHandling.
-    const cl       = parseInt(req.headers['content-length'] ?? '-1', 10);
-    const isSSE    = req.headers.accept?.includes('text/event-stream');
-    const isChunked = req.headers['transfer-encoding']?.toLowerCase().includes('chunked');
-    const isLarge  = cl > ProxyServer.HA_STREAM_THRESHOLD;
+    const cl      = parseInt(req.headers['content-length'] ?? '-1', 10);
+    const isSSE   = req.headers.accept?.includes('text/event-stream');
+    const isLarge = cl > ProxyServer.HA_STREAM_THRESHOLD;
 
-    if (isSSE || isChunked || isLarge) {
+    if (isSSE || isLarge) {
       const port = this.rankedPorts(mapping.id, ports)[0];
       req._haStreamPort = port; // picked up by proxyRes / error handlers for scoring
       const backend = mapping.backend || 'http://localhost';
