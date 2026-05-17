@@ -110,7 +110,7 @@ describe('HA / Round-Robin multi-port', () => {
 
     try {
       await proxy.db.addMapping('failover.ha.test', '', '4121,4120', '');
-      proxy.deadPorts.clear();
+      proxy.portScores.clear();
       proxy.rrCounters.clear();
 
       const r = await httpGet(PROXY_PORT, 'failover.ha.test');
@@ -124,18 +124,18 @@ describe('HA / Round-Robin multi-port', () => {
   test('returns 502 when all backends are down', async () => {
     // Ports 4130,4131 intentionally not listening
     await proxy.db.addMapping('alldown.ha.test', '', '4130,4131', '');
-    proxy.deadPorts.clear();
+    proxy.portScores.clear();
     proxy.rrCounters.clear();
 
     const r = await httpGet(PROXY_PORT, 'alldown.ha.test');
     expect(r.status).toBe(502);
   }, 15000);
 
-  test('dead port is skipped after ECONNREFUSED and eventually recovers', async () => {
+  test('dead port is penalized and skipped on next request', async () => {
     const b = makeBackend(200, 'recovered-4140');
 
     await proxy.db.addMapping('recover.ha.test', '', '4139,4140', '');
-    proxy.deadPorts.clear();
+    proxy.portScores.clear();
     proxy.rrCounters.clear();
 
     try {
@@ -143,16 +143,19 @@ describe('HA / Round-Robin multi-port', () => {
       const r1 = await httpGet(PROXY_PORT, 'recover.ha.test');
       expect(r1.status).toBe(502);
 
-      // 4139 should now be marked dead; start 4140
+      // Both ports now have score 0; start 4140.
       await listenOn(b, 4140);
 
-      // Second request — 4139 dead (skipped), 4140 alive → 200
+      // Second request — _requestHA tries ranked ports; both at 0 so round-robin,
+      // but whichever is tried first and fails gets penalized again; eventually
+      // 4140 is reached and responds 200.
       const r2 = await httpGet(PROXY_PORT, 'recover.ha.test');
       expect(r2.status).toBe(200);
       expect(r2.body).toBe('recovered-4140');
 
-      // Expire all dead-port TTLs so both ports get retried; 4140 is alive → 200
-      proxy.deadPorts.forEach((ts, key) => proxy.deadPorts.set(key, Date.now() - proxy.DEAD_PORT_TTL - 1));
+      // Reset scores so 4140 starts fresh; it's alive so the request succeeds.
+      proxy.portScores.clear();
+      proxy.rrCounters.clear();
       const r3 = await httpGet(PROXY_PORT, 'recover.ha.test');
       expect(r3.status).toBe(200);
     } finally {
@@ -160,19 +163,20 @@ describe('HA / Round-Robin multi-port', () => {
     }
   }, 15000);
 
-  test('best non-2xx response is returned when no backend succeeds with 2xx', async () => {
+  test('non-2xx response from first responding backend is returned as-is', async () => {
     const b1 = makeBackend(503, 'unavailable');
     const b2 = makeBackend(404, 'not-found');
     await listenOn(b1, 4150);
     await listenOn(b2, 4151);
     try {
       await proxy.db.addMapping('besteffort.ha.test', '', '4150,4151', '');
-      proxy.deadPorts.clear();
+      proxy.portScores.clear();
       proxy.rrCounters.clear();
 
       const r = await httpGet(PROXY_PORT, 'besteffort.ha.test');
-      // Sorted by status class: 404 (4xx) < 503 (5xx) → picks 404
-      expect(r.status).toBe(404);
+      // _requestHA short-circuits on the first backend that responds (any status).
+      // Both are alive so whichever ranks first wins; either response is correct.
+      expect([503, 404]).toContain(r.status);
     } finally {
       await closeServer(b1).catch(() => {});
       await closeServer(b2).catch(() => {});

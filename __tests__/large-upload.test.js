@@ -101,18 +101,21 @@ describe('large upload — single backend (direct proxy)', () => {
   }, 30000);
 });
 
-// ── HA path (multiple backend ports, always streams) ─────────────────────────
+// ── HA path — streaming for large bodies, failover for small bodies ───────────
 describe('large upload — HA path', () => {
-  const PROXY_PORT   = 9701;
-  const BACKEND_PORT = 9720;
-  let proxy, backend, testDataDir;
+  const PROXY_PORT    = 9701;
+  const BACKEND_A     = 9720;
+  const BACKEND_B     = 9721;
+  let proxy, backendA, backendB, testDataDir;
 
   beforeAll(async () => {
     testDataDir = path.join(__dirname, 'large-upload-data-ha');
     await fs.mkdir(testDataDir, { recursive: true }).catch(() => {});
 
-    backend = makeEchoBackend();
-    await listen(backend, BACKEND_PORT);
+    backendA = makeEchoBackend();
+    backendB = makeEchoBackend();
+    await listen(backendA, BACKEND_A);
+    await listen(backendB, BACKEND_B);
 
     process.env.HTTP_PORT    = String(PROXY_PORT);
     process.env.ENABLE_HTTPS = 'false';
@@ -123,13 +126,15 @@ describe('large upload — HA path', () => {
     await proxy.initialize();
     await proxy.start();
 
-    // Two-port HA mapping; second port intentionally absent (scoring skips it)
-    await proxy.db.addMapping('upload-ha.test', '', `${BACKEND_PORT},${BACKEND_PORT + 1}`, '');
+    await proxy.db.addMapping('upload-ha.test',   '', `${BACKEND_A},${BACKEND_B}`, '');
+    await proxy.db.addMapping('failover-ha.test',  '', `${BACKEND_A},${BACKEND_B}`, '');
+    await proxy.db.addMapping('smallbody-ha.test', '', `${BACKEND_A},${BACKEND_B}`, '');
   }, 15000);
 
   afterAll(async () => {
-    if (proxy)   await proxy.stop();
-    if (backend) await close(backend);
+    if (proxy)    await proxy.stop();
+    if (backendA) await close(backendA);
+    if (backendB) await close(backendB);
     delete process.env.HTTP_PORT;
     delete process.env.ENABLE_HTTPS;
     try {
@@ -139,12 +144,67 @@ describe('large upload — HA path', () => {
     } catch (_) {}
   });
 
+  // ── streaming path (large body) ──────────────────────────────────────────
+
   test('100 MB upload streams through HA path without buffering', async () => {
+    proxy.portScores.clear();
+    proxy.rrCounters.clear();
     const data   = Buffer.alloc(SIZE);
     const result = await upload(PROXY_PORT, 'upload-ha.test', data);
     expect(result.status).toBe(200);
     expect(Number(result.body)).toBe(SIZE);
   }, 30000);
+
+  test('large upload to dead port is penalized so next request hits live port', async () => {
+    // Manually score BACKEND_A to 0 (simulate dead) so BACKEND_B is picked.
+    // This also proves that score-based routing still works for streaming requests.
+    const mappingId = (await proxy.db.getMapping('failover-ha.test', '/')).id;
+    proxy.portScores.clear();
+    proxy.rrCounters.clear();
+    proxy.penalizePort(mappingId, BACKEND_A); // A is "dead"
+
+    const data   = Buffer.alloc(SIZE);
+    const result = await upload(PROXY_PORT, 'failover-ha.test', data);
+    // B is alive → should succeed despite A being penalized
+    expect(result.status).toBe(200);
+    expect(Number(result.body)).toBe(SIZE);
+  }, 30000);
+
+  // ── buffered path (small body) — failover must still work ────────────────
+  // THIS IS THE REGRESSION TEST. If haRequest ever stops buffering small
+  // bodies, these will fail and catch the breakage before it hits production.
+
+  test('small body HA: fails over from dead port to live port transparently', async () => {
+    proxy.portScores.clear();
+    proxy.rrCounters.clear();
+
+    // Put dead port first — a non-streaming proxy would OOM on large uploads but
+    // must still failover transparently for small bodies.
+    await proxy.db.addMapping('smallfailover-ha.test', '', `${BACKEND_A + 99},${BACKEND_A}`, '');
+
+    const result = await upload(PROXY_PORT, 'smallfailover-ha.test', Buffer.from('hello'));
+    expect(result.status).toBe(200);
+    // Backend echoes byte count: 5 bytes
+    expect(Number(result.body)).toBe(5);
+  }, 15000);
+
+  test('small body HA: dead port gets penalized so subsequent requests skip it', async () => {
+    const mappingId = (await proxy.db.getMapping('smallbody-ha.test', '/')).id;
+    proxy.portScores.clear();
+    proxy.rrCounters.clear();
+
+    // Poison A so it's always tried last
+    proxy.penalizePort(mappingId, BACKEND_A);
+
+    // Even with A penalized, B is alive → success
+    const result = await upload(PROXY_PORT, 'smallbody-ha.test', Buffer.from('x'));
+    expect(result.status).toBe(200);
+    expect(Number(result.body)).toBe(1);
+
+    // Verify A stayed penalized (score 0) and B was boosted (score 100)
+    expect(proxy.getPortScore(mappingId, BACKEND_A)).toBe(0);
+    expect(proxy.getPortScore(mappingId, BACKEND_B)).toBe(100);
+  }, 15000);
 });
 
 // ── plugin path with needsBody: false ────────────────────────────────────────

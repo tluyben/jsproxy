@@ -65,6 +65,12 @@ class ProxyServer {
         }
       }
 
+      // Keep HA port scores up to date for streamed requests (buffered requests
+      // update scores inside _requestHA; streamed ones have no other hook).
+      if (req._haStreamPort != null) {
+        this.boostPort(req._proxyMappingId, req._haStreamPort);
+      }
+
       if (proxyRes.statusCode >= 500) {
         this.logger.error('backend error response', {
           domain:         req._proxyDomain,
@@ -105,6 +111,12 @@ class ProxyServer {
         if (err.port)    span.setAttribute('proxy.backend_port',    String(err.port));
         if (err.code)    span.setAttribute('error.code',            err.code);
       }
+
+      // Penalize the port so the next request picks a healthy backend.
+      if (req?._haStreamPort != null && req?._proxyMappingId) {
+        this.penalizePort(req._proxyMappingId, req._haStreamPort);
+      }
+
       const logProxyError = req?._proxyIsHA ? this.logger.warn.bind(this.logger) : this.logger.error.bind(this.logger);
       logProxyError('proxy error', {
         domain,
@@ -960,12 +972,34 @@ class ProxyServer {
       .map(p => parseInt(p.trim(), 10))
       .filter(p => !isNaN(p));
 
-    // Always stream — buffering the full body for failover risks OOM on large
-    // uploads/downloads, and a half-consumed stream can't be retried anyway.
-    const port = this.rankedPorts(mapping.id, ports)[0];
-    const backend = mapping.backend || 'http://localhost';
-    this.proxy.web(req, res, { target: `${backend}:${port}`, secure: false, changeOrigin: true });
+    // Stream directly when buffering the body would be unsafe:
+    //   - SSE / event-streams
+    //   - bodies larger than HA_STREAM_THRESHOLD (avoids OOM on large uploads)
+    //   - chunked bodies with no declared content-length (size unknown)
+    // Failover is not possible for streamed requests — if the selected backend
+    // is unreachable the client gets a 502 and retries; penalization ensures the
+    // next attempt picks a healthy port. Port scores are updated via _haStreamPort
+    // in the shared proxyRes / error handlers in setupProxyErrorHandling.
+    const cl       = parseInt(req.headers['content-length'] ?? '-1', 10);
+    const isSSE    = req.headers.accept?.includes('text/event-stream');
+    const isChunked = req.headers['transfer-encoding']?.toLowerCase().includes('chunked');
+    const isLarge  = cl > ProxyServer.HA_STREAM_THRESHOLD;
+
+    if (isSSE || isChunked || isLarge) {
+      const port = this.rankedPorts(mapping.id, ports)[0];
+      req._haStreamPort = port; // picked up by proxyRes / error handlers for scoring
+      const backend = mapping.backend || 'http://localhost';
+      this.proxy.web(req, res, { target: `${backend}:${port}`, secure: false, changeOrigin: true });
+      return;
+    }
+
+    // Small / known-size body: buffer and retry across ports for true failover.
+    const body = await this.bufferBody(req);
+    const result = await this._requestHA(mapping, req.url, req.method, req.headers, body, req._span);
+    this.sendHAResponse(res, result);
   }
+
+  static get HA_STREAM_THRESHOLD() { return 512 * 1024; } // 512 KB
 
   // ── Auth helpers ──────────────────────────────────────────────────────────
 
