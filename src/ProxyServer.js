@@ -22,11 +22,20 @@ class ProxyServer {
     this.rrCounters   = new Map();  // mappingId -> rotation counter (tie-break)
     this.bgChecks     = new Set();  // keys currently being TCP-probed
 
+    // proxyTimeout is the outbound (proxy → backend) socket idle timeout used
+    // by the streamed HA / SSE path. Default 30s, override via the same env
+    // var the buffered HA path consults so both paths agree on how long a
+    // healthy-but-slow backend may take. The inbound timeout is kept ≥ the
+    // outbound one so slow backends don't have the client-facing socket
+    // drop out from underneath them (which surfaces as "socket hang up").
+    const proxyTimeoutMs    = parseInt(process.env.HA_RESPONSE_TIMEOUT_MS || '30000', 10);
+    const incomingTimeoutMs = Math.max(30000, proxyTimeoutMs);
+
     this.proxy = httpProxy.createProxyServer({
       ws: true,
       changeOrigin: true,
-      timeout: 30000,
-      proxyTimeout: 30000,
+      timeout: incomingTimeoutMs,
+      proxyTimeout: proxyTimeoutMs,
       xfwd: true  // Automatically adds X-Forwarded-For, X-Forwarded-Port, X-Forwarded-Proto
     });
     
@@ -44,6 +53,21 @@ class ProxyServer {
       }
       const protocol = req.connection.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
       proxyReq.setHeader('X-Forwarded-Proto', protocol);
+
+      // For HA streamed requests (SSE / large body), track whether the TCP
+      // connect to the backend actually completed. The shared 'error' handler
+      // uses this flag to distinguish a connect-phase failure (penalize) from
+      // a post-connect failure (don't penalize — port is provably up).
+      if (req._haStreamPort != null) {
+        proxyReq.on('socket', (socket) => {
+          if (socket.connecting) {
+            socket.once('connect', () => { req._haStreamConnected = true; });
+          } else {
+            // Pooled / keepalive socket: already connected.
+            req._haStreamConnected = true;
+          }
+        });
+      }
 
       if (process.env.LOG_LEVEL === 'debug') {
         this.logger.debug('proxying request', {
@@ -112,8 +136,12 @@ class ProxyServer {
         if (err.code)    span.setAttribute('error.code',            err.code);
       }
 
-      // Penalize the port so the next request picks a healthy backend.
-      if (req?._haStreamPort != null && req?._proxyMappingId) {
+      // Penalize the port so the next request picks a healthy backend — but
+      // only when the failure happened before the TCP connect succeeded. A
+      // post-connect error (read timeout, mid-response reset, etc.) means the
+      // port is reachable; penalizing would falsely mark a healthy-but-slow
+      // backend as down on every request.
+      if (req?._haStreamPort != null && req?._proxyMappingId && !req._haStreamConnected) {
         this.penalizePort(req._proxyMappingId, req._haStreamPort);
       }
 
@@ -664,6 +692,15 @@ class ProxyServer {
   }
 
   // Core single-backend request. Used by both the HA path and the plugin path.
+  //
+  // Timeouts are phased: a short window while the TCP connect is in progress
+  // (so a genuinely-dead port fails fast for HA failover), then a longer window
+  // once we've connected and are waiting for the response. Rejections are
+  // tagged with `err.phase` so _requestHA can distinguish:
+  //   - phase === 'connect'  → backend unreachable; safe to penalize + failover.
+  //   - phase === 'response' → connection succeeded, request may already be in
+  //     flight on the backend; failing over would risk duplicating non-idempotent
+  //     operations and the port is provably up. Surface to client as-is.
   _tryPort(mapping, port, uri, method, reqHeaders, body) {
     return new Promise((resolve, reject) => {
       const backend = mapping.backend || 'http://localhost';
@@ -681,13 +718,16 @@ class ProxyServer {
       if (body && body.length > 0) headers['content-length'] = body.length;
       else delete headers['content-length'];
 
+      const connectTimeoutMs  = parseInt(process.env.HA_CONNECT_TIMEOUT_MS  || '3000',  10);
+      const responseTimeoutMs = parseInt(process.env.HA_RESPONSE_TIMEOUT_MS || '30000', 10);
+      let connected = false;
+
       const proxyReq = lib.request({
         hostname: backendUrl.hostname,
         port,
         path: targetPath,
         method,
         headers,
-        timeout: 10000,
       }, (proxyRes) => {
         const chunks = [];
         proxyRes.on('data', chunk => chunks.push(chunk));
@@ -697,16 +737,35 @@ class ProxyServer {
           headers: proxyRes.headers,
           body: Buffer.concat(chunks),
         }));
-        proxyRes.on('error', reject);
+        proxyRes.on('error', (err) => { err.phase = 'response'; reject(err); });
+      });
+
+      proxyReq.on('socket', (socket) => {
+        if (socket.connecting) {
+          socket.setTimeout(connectTimeoutMs);
+          socket.once('connect', () => {
+            connected = true;
+            socket.setTimeout(responseTimeoutMs);
+          });
+        } else {
+          // Pooled / keepalive socket — already connected.
+          connected = true;
+          socket.setTimeout(responseTimeoutMs);
+        }
       });
 
       proxyReq.on('timeout', () => {
+        const phase = connected ? 'response' : 'connect';
+        const err   = new Error(connected ? 'Response timeout' : 'Connect timeout');
+        err.code    = connected ? 'EREADTIMEOUT' : 'ECONNTIMEOUT';
+        err.phase   = phase;
+        reject(err);
         proxyReq.destroy();
-        const err = new Error('Connection timeout');
-        err.code = 'ETIMEOUT';
+      });
+      proxyReq.on('error', (err) => {
+        if (!err.phase) err.phase = connected ? 'response' : 'connect';
         reject(err);
       });
-      proxyReq.on('error', reject);
 
       if (body && body.length > 0) proxyReq.write(body);
       proxyReq.end();
@@ -749,6 +808,27 @@ class ProxyServer {
         this.boostPort(mapping.id, port);
         return result;
       } catch (err) {
+        // Post-connect failure: backend accepted the TCP connection. The request
+        // may already be in flight (failing over could duplicate non-idempotent
+        // work) and the port is provably up (don't penalize). Surface to client.
+        if (err.phase === 'response') {
+          this.logger.error('HA backend errored mid-request (not failing over)', {
+            domain:     mapping.domain,
+            port,
+            uri,
+            error:      err.message,
+            error_code: err.code,
+          });
+          if (span) {
+            span.setAttribute('ha.response_phase_error', true);
+            span.setAttribute('ha.response_phase_port',  String(port));
+          }
+          return {
+            statusCode: 504,
+            headers: { 'content-type': 'text/plain' },
+            body: Buffer.from('Gateway Timeout'),
+          };
+        }
         this.logger.warn('HA backend failed, trying next', {
           domain:     mapping.domain,
           port,
