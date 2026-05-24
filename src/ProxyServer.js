@@ -49,7 +49,10 @@ class ProxyServer {
       const originalHost = req.headers.host;
       if (originalHost) {
         proxyReq.setHeader('X-Forwarded-Host', originalHost);
-        proxyReq.setHeader('Host', originalHost);
+        // back_host (when set on the mapping) overrides the Host sent upstream,
+        // so a proxy hop can target a backend that routes on a different domain.
+        // Falls back to the original Host when unset → unchanged behavior.
+        proxyReq.setHeader('Host', req._proxyBackHost || originalHost);
       }
       const protocol = req.connection.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
       proxyReq.setHeader('X-Forwarded-Proto', protocol);
@@ -382,6 +385,10 @@ class ProxyServer {
 
       // Store mapping context for error handlers.
       req._proxyMappingId = mapping.id;
+      // Optional per-mapping override of the Host header sent to the backend.
+      // Null/absent (the default for every mapping) → forward the original Host
+      // unchanged, i.e. exactly today's behavior.
+      req._proxyBackHost = mapping.back_host || null;
       req._proxyIsHA = String(mapping.back_port).includes(',');
       if (req._span) {
         req._span.setAttribute('proxy.mapping_id',   String(mapping.id));
