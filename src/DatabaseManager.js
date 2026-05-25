@@ -68,6 +68,7 @@ class DatabaseManager {
         back_uri TEXT NOT NULL,
         backend TEXT DEFAULT NULL,
         allowed_ips TEXT DEFAULT NULL,
+        back_host TEXT DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
@@ -159,6 +160,7 @@ class DatabaseManager {
         const toAdd = [];
         if (!names.has('auth_type')) toAdd.push('ALTER TABLE mappings ADD COLUMN auth_type TEXT DEFAULT NULL');
         if (!names.has('auth_credentials')) toAdd.push('ALTER TABLE mappings ADD COLUMN auth_credentials TEXT DEFAULT NULL');
+        if (!names.has('back_host')) toAdd.push('ALTER TABLE mappings ADD COLUMN back_host TEXT DEFAULT NULL');
         if (toAdd.length === 0) { resolve(); return; }
         let i = 0;
         const next = () => {
