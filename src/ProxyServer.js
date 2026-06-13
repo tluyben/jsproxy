@@ -720,8 +720,13 @@ class ProxyServer {
         : this.buildTargetPath(mapping, uri);
 
       const headers = Object.assign({}, reqHeaders);
+      // Mirror the streaming path's Host handling (setupProxyErrorHandling): keep
+      // the original client Host in X-Forwarded-Host and forward either the
+      // per-mapping back_host override or the original Host upstream. Forwarding
+      // `localhost:<port>` would break a backend that routes on Host — e.g. a
+      // downstream jsproxy — so the real Host is preserved instead.
       if (!headers['x-forwarded-host']) headers['x-forwarded-host'] = headers['host'];
-      headers['host'] = `${backendUrl.hostname}:${port}`;
+      headers['host'] = mapping.back_host || headers['host'];
       if (body && body.length > 0) headers['content-length'] = body.length;
       else delete headers['content-length'];
 
@@ -736,6 +741,9 @@ class ProxyServer {
         path: targetPath,
         method,
         headers,
+        // Match the streaming path's `secure: false`: accept self-signed certs on
+        // HTTPS backends (e.g. a downstream jsproxy terminating its own TLS).
+        ...(isHttpsBackend ? { rejectUnauthorized: false } : {}),
       }, (proxyRes) => {
         responseStarted = true;
         const chunks = [];
