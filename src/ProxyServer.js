@@ -728,6 +728,7 @@ class ProxyServer {
       const connectTimeoutMs  = parseInt(process.env.HA_CONNECT_TIMEOUT_MS  || '3000',  10);
       const responseTimeoutMs = parseInt(process.env.HA_RESPONSE_TIMEOUT_MS || '30000', 10);
       let connected = false;
+      let responseStarted = false; // true once the backend sends any response bytes
 
       const proxyReq = lib.request({
         hostname: backendUrl.hostname,
@@ -736,6 +737,7 @@ class ProxyServer {
         method,
         headers,
       }, (proxyRes) => {
+        responseStarted = true;
         const chunks = [];
         proxyRes.on('data', chunk => chunks.push(chunk));
         proxyRes.on('end', () => resolve({
@@ -761,16 +763,23 @@ class ProxyServer {
         }
       });
 
+      // Phase classification:
+      //   - not connected            → 'connect'      (TCP never established)
+      //   - connected, no bytes yet  → 'no-response'  (accepted but app not serving)
+      //   - connected, bytes flowing → 'response'     (response genuinely in flight)
+      const phaseOf = () => !connected ? 'connect' : (responseStarted ? 'response' : 'no-response');
+
       proxyReq.on('timeout', () => {
-        const phase = connected ? 'response' : 'connect';
-        const err   = new Error(connected ? 'Response timeout' : 'Connect timeout');
+        const err   = new Error(connected ? (responseStarted ? 'Response timeout' : 'No response timeout') : 'Connect timeout');
         err.code    = connected ? 'EREADTIMEOUT' : 'ECONNTIMEOUT';
-        err.phase   = phase;
+        err.phase   = phaseOf();
+        err.responseStarted = responseStarted;
         reject(err);
         proxyReq.destroy();
       });
       proxyReq.on('error', (err) => {
-        if (!err.phase) err.phase = connected ? 'response' : 'connect';
+        if (!err.phase) err.phase = phaseOf();
+        if (err.responseStarted === undefined) err.responseStarted = responseStarted;
         reject(err);
       });
 
@@ -809,26 +818,44 @@ class ProxyServer {
 
     const ordered = this.rankedPorts(mapping.id, ports);
 
+    // Idempotent (safe) methods can be retried on another port without risk of
+    // duplicating side effects, because the HA path fully buffers the response
+    // and only flushes it to the client in sendHAResponse *after* success — so
+    // nothing is ever committed to the client on a failed attempt.
+    const idempotent = ProxyServer.SAFE_METHODS.has(String(method).toUpperCase());
+
     for (const port of ordered) {
       try {
         const result = await this._tryPort(mapping, port, uri, method, headers, body);
         this.boostPort(mapping.id, port);
         return result;
       } catch (err) {
-        // Post-connect failure: backend accepted the TCP connection. The request
-        // may already be in flight (failing over could duplicate non-idempotent
-        // work) and the port is provably up (don't penalize). Surface to client.
-        if (err.phase === 'response') {
-          this.logger.error('HA backend errored mid-request (not failing over)', {
+        // A post-connect failure ('no-response' or 'response') means the backend
+        // accepted the TCP connection but never completed a response — e.g. a
+        // container that has started listening during a blue/green deploy but is
+        // not yet ready to serve. Such a port is NOT healthy: penalize it so the
+        // ranking sheds it (and a background probe restores it once it recovers).
+        const postConnect = err.phase === 'response' || err.phase === 'no-response';
+
+        if (postConnect && !idempotent) {
+          // Non-idempotent request (POST/PATCH/…): it may already have been
+          // processed by the backend, so retrying could duplicate work. Surface a
+          // 504 — but still penalize so subsequent requests avoid this port.
+          this.penalizePort(mapping.id, port);
+          this.startBackgroundCheck(mapping, port);
+          this.logger.error('HA backend failed post-connect on non-idempotent request (not failing over)', {
             domain:     mapping.domain,
             port,
             uri,
+            method,
+            phase:      err.phase,
             error:      err.message,
             error_code: err.code,
           });
           if (span) {
             span.setAttribute('ha.response_phase_error', true);
             span.setAttribute('ha.response_phase_port',  String(port));
+            span.setAttribute('ha.response_phase',        err.phase);
           }
           return {
             statusCode: 504,
@@ -836,13 +863,20 @@ class ProxyServer {
             body: Buffer.from('Gateway Timeout'),
           };
         }
+
+        // connect-phase failure (any method) OR post-connect on an idempotent
+        // request: penalize, probe in the background, and fail over to the next
+        // ranked port.
         this.logger.warn('HA backend failed, trying next', {
-          domain:     mapping.domain,
+          domain:           mapping.domain,
           port,
           uri,
-          error:      err.message,
-          error_code: err.code,
-          address:    err.address,
+          method,
+          phase:            err.phase,
+          response_started: err.responseStarted,
+          error:            err.message,
+          error_code:       err.code,
+          address:          err.address,
         });
         this.penalizePort(mapping.id, port);
         this.startBackgroundCheck(mapping, port);
@@ -1086,6 +1120,11 @@ class ProxyServer {
   }
 
   static get HA_STREAM_THRESHOLD() { return 512 * 1024; } // 512 KB
+
+  // HTTP methods safe to retry on another backend without risking duplicate
+  // side effects. Used by _requestHA to decide whether a post-connect failure
+  // should fail over or surface a 504.
+  static get SAFE_METHODS() { return new Set(['GET', 'HEAD', 'OPTIONS']); }
 
   // ── Auth helpers ──────────────────────────────────────────────────────────
 

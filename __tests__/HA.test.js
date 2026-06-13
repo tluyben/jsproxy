@@ -11,8 +11,29 @@ function makeBackend(statusCode, body) {
   });
 }
 
+// A backend that accepts the TCP connection but never sends a response — it
+// resets the socket instead. Mimics a container that has started listening
+// during a blue/green deploy but isn't ready to serve yet.
+function makeNotReadyBackend() {
+  return http.createServer((req, res) => {
+    req.socket.destroy(); // accept connection, then drop it with no response
+  });
+}
+
 function listenOn(server, port) {
   return new Promise(resolve => server.listen(port, resolve));
+}
+
+function httpRequest(port, host, method) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname: 'localhost', port, path: '/', method, headers: { Host: host } }, res => {
+      let body = '';
+      res.on('data', c => { body += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 function closeServer(server) {
@@ -160,6 +181,55 @@ describe('HA / Round-Robin multi-port', () => {
       expect(r3.status).toBe(200);
     } finally {
       await closeServer(b).catch(() => {});
+    }
+  }, 15000);
+
+  test('blue/green: GET fails over from a not-ready (accept-then-reset) backend', async () => {
+    // 4160 accepts connections but never responds (deploy in progress);
+    // 4161 is healthy. A GET must NOT return 504 — it must fail over to 4161.
+    const notReady = makeNotReadyBackend();
+    const healthy  = makeBackend(200, 'healthy-4161');
+    await listenOn(notReady, 4160);
+    await listenOn(healthy, 4161);
+    try {
+      // Order the not-ready port first and clear scores so it is tried first.
+      await proxy.db.addMapping('bluegreen.ha.test', '', '4160,4161', '');
+      proxy.portScores.clear();
+      proxy.rrCounters.clear();
+
+      const r = await httpGet(PROXY_PORT, 'bluegreen.ha.test');
+      expect(r.status).toBe(200);
+      expect(r.body).toBe('healthy-4161');
+
+      // The not-ready port must have been penalized so it stops drawing traffic.
+      const m = await proxy.db.getMapping('bluegreen.ha.test', '/');
+      expect(proxy.getPortScore(m.id, 4160)).toBe(0);
+    } finally {
+      await closeServer(notReady).catch(() => {});
+      await closeServer(healthy).catch(() => {});
+    }
+  }, 15000);
+
+  test('blue/green: POST to a not-ready backend returns 504 and penalizes it (no unsafe retry)', async () => {
+    const notReady = makeNotReadyBackend();
+    const healthy  = makeBackend(200, 'healthy-4171');
+    await listenOn(notReady, 4170);
+    await listenOn(healthy, 4171);
+    try {
+      await proxy.db.addMapping('bluegreenpost.ha.test', '', '4170,4171', '');
+      proxy.portScores.clear();
+      proxy.rrCounters.clear();
+
+      // Non-idempotent: may already have been processed, so no failover → 504.
+      const r = await httpRequest(PROXY_PORT, 'bluegreenpost.ha.test', 'POST');
+      expect(r.status).toBe(504);
+
+      // But the bad port is penalized, so subsequent requests avoid it.
+      const m = await proxy.db.getMapping('bluegreenpost.ha.test', '/');
+      expect(proxy.getPortScore(m.id, 4170)).toBe(0);
+    } finally {
+      await closeServer(notReady).catch(() => {});
+      await closeServer(healthy).catch(() => {});
     }
   }, 15000);
 
