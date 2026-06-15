@@ -15,9 +15,17 @@ class DatabaseManager {
     await this.connectToDatabase();
     await this.enableWALMode();
     await this.createMappingsTable();
+    await this.applyMigrations();
+  }
+
+  // Idempotent column migrations, applied on initialize() and again after a hot
+  // database swap so a freshly-copied DB always has every column the running code
+  // expects (notably `protocol`, which getMapping() filters on).
+  async applyMigrations() {
     await this.addBackendColumnIfMissing();
     await this.addAllowedIpsColumnIfMissing();
     await this.addAuthColumnsIfMissing();
+    await this.addTcpColumnsIfMissing();
   }
 
   async ensureDataDirectory() {
@@ -172,6 +180,66 @@ class DatabaseManager {
     });
   }
 
+  // Adds the columns that back raw-TCP routes. Both default in a way that leaves
+  // every existing (HTTP) row untouched: protocol becomes 'http', listen_port NULL.
+  // Idempotent — same guarded pattern as the auth/allowed_ips migrations above.
+  async addTcpColumnsIfMissing() {
+    return new Promise((resolve, reject) => {
+      this.db.all('PRAGMA table_info(mappings)', (err, columns) => {
+        if (err) { reject(err); return; }
+        const names = new Set(columns.map(c => c.name));
+        const toAdd = [];
+        if (!names.has('protocol')) toAdd.push("ALTER TABLE mappings ADD COLUMN protocol TEXT DEFAULT 'http'");
+        if (!names.has('listen_port')) toAdd.push('ALTER TABLE mappings ADD COLUMN listen_port INTEGER DEFAULT NULL');
+        if (toAdd.length === 0) { resolve(); return; }
+        let i = 0;
+        const next = () => {
+          if (i >= toAdd.length) { this.logger.info('Added TCP columns to mappings table'); resolve(); return; }
+          this.db.run(toAdd[i++], (err2) => { if (err2) reject(err2); else next(); });
+        };
+        next();
+      });
+    });
+  }
+
+  // Raw-TCP routes are stored in the same table but isolated by protocol='tcp'.
+  // They are keyed by listen_port (TCP has no Host header to route on), and carry
+  // domain/front_uri/back_uri as '' so they can never match a getMapping() lookup.
+  async getTcpRoutes() {
+    const sql = "SELECT * FROM mappings WHERE protocol = 'tcp' ORDER BY listen_port";
+    return new Promise((resolve, reject) => {
+      this.db.all(sql, [], (err, rows) => {
+        if (err) { this.logger.error('Error getting TCP routes:', err); reject(err); }
+        else resolve(rows || []);
+      });
+    });
+  }
+
+  async addTcpRoute(listenPort, backend, backPort, allowedIps = null) {
+    const id = uuidv4();
+    const sql = `
+      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port)
+      VALUES (?, '', '', ?, '', ?, ?, 'tcp', ?)
+    `;
+    const port = parseInt(listenPort, 10);
+    return new Promise((resolve, reject) => {
+      this.db.run(sql, [id, String(backPort), backend, allowedIps, port], function (err) {
+        if (err) reject(err);
+        else resolve({ id, protocol: 'tcp', listen_port: port, back_port: String(backPort), backend, allowed_ips: allowedIps });
+      });
+    });
+  }
+
+  async removeTcpRoute(listenPort) {
+    const port = parseInt(listenPort, 10);
+    return new Promise((resolve, reject) => {
+      this.db.run("DELETE FROM mappings WHERE protocol = 'tcp' AND listen_port = ?", [port], function (err) {
+        if (err) reject(err);
+        else resolve(this.changes);
+      });
+    });
+  }
+
   async recordAuthUse(mappingId, credentialIndex) {
     return new Promise((resolve) => {
       this.db.get('SELECT auth_credentials FROM mappings WHERE id = ?', [mappingId], (err, row) => {
@@ -197,6 +265,7 @@ class DatabaseManager {
     const sql = `
       SELECT * FROM mappings
       WHERE domain = ? AND (? LIKE '/' || front_uri || '%' OR front_uri = '')
+        AND (protocol = 'http' OR protocol IS NULL)
       ORDER BY LENGTH(front_uri) DESC
       LIMIT 1
     `;
@@ -219,6 +288,7 @@ class DatabaseManager {
         const wildcardSql = `
           SELECT * FROM mappings
           WHERE domain = ? AND (? LIKE '/' || front_uri || '%' OR front_uri = '')
+            AND (protocol = 'http' OR protocol IS NULL)
           ORDER BY LENGTH(front_uri) DESC
           LIMIT 1
         `;
@@ -311,7 +381,10 @@ class DatabaseManager {
       // Reconnect
       await this.connectToDatabase();
       await this.enableWALMode();
-      
+      // Ensure the swapped-in DB has every column the running code expects
+      // (e.g. `protocol`, which getMapping filters on). Idempotent.
+      await this.applyMigrations();
+
       this.logger.info('Database hot replacement completed successfully');
     } catch (error) {
       this.logger.error('Database hot replacement failed:', error);

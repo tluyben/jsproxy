@@ -41,6 +41,7 @@ class ProxyServer {
     
     this.httpServer = null;
     this.httpsServer = null;
+    this.tcpServers = new Map();  // listen_port -> net.Server (raw TCP proxy, opt-in)
     this.setupProxyErrorHandling();
   }
 
@@ -273,6 +274,151 @@ class ProxyServer {
     } else {
       this.logger.info(`HTTPS disabled (set ENABLE_HTTPS=true to enable in ${isProduction ? 'production' : 'development'})`);
     }
+
+    // Raw TCP proxying is entirely opt-in: a listener exists only because a
+    // protocol='tcp' row exists. With no such rows this is a no-op and the
+    // proxy behaves exactly as it did before TCP support existed.
+    await this.startTcpListeners(httpPort, httpsPort, httpHost);
+  }
+
+  // ── Raw TCP proxy ─────────────────────────────────────────────────────────
+  //
+  // Each TCP route is a dedicated net.Server on its own listen_port that forwards
+  // raw bytes to backend:back_port. It never touches the http/https request path.
+  // HA (multiple back_port values) reuses the exact same scoring machinery as the
+  // HTTP path (rankedPorts / boostPort / penalizePort / startBackgroundCheck).
+  // TLS is pure passthrough — bytes are forwarded untouched and the backend
+  // terminates TLS. No auth/webhook/plugins apply here; only the IP allowlist does.
+  async startTcpListeners(httpPort, httpsPort, httpHost) {
+    let routes;
+    try {
+      routes = await this.db.getTcpRoutes();
+    } catch (err) {
+      this.logger.error('Could not load TCP routes (TCP proxying disabled):', err.message || err);
+      return;
+    }
+    if (!routes || routes.length === 0) return;
+
+    for (const route of routes) {
+      const port = parseInt(route.listen_port, 10);
+      if (!Number.isInteger(port) || port <= 0) {
+        this.logger.warn(`TCP route ${route.id} has invalid listen_port (${route.listen_port}); skipping`);
+        continue;
+      }
+      if (port === parseInt(httpPort, 10) || port === parseInt(httpsPort, 10)) {
+        this.logger.warn(`TCP route ${route.id} listen_port ${port} collides with HTTP/HTTPS port; skipping`);
+        continue;
+      }
+      if (this.tcpServers.has(port)) {
+        this.logger.warn(`TCP route ${route.id} listen_port ${port} already bound; skipping duplicate`);
+        continue;
+      }
+
+      const server = net.createServer((socket) => this.handleTcpConnection(route, socket));
+      server.on('error', (err) => {
+        this.logger.error(`TCP listener on ${port} error: ${err.message || err}`);
+      });
+      // Await the bind so a bad port (e.g. EADDRINUSE) logs and is skipped without
+      // throwing out of start() (which would take the whole worker down). Only
+      // track listeners that actually bound.
+      const bound = await new Promise((resolve) => {
+        server.once('error', () => resolve(false));
+        server.listen(port, httpHost, () => {
+          this.logger.info(`TCP proxy listening on ${httpHost}:${port} -> ${route.backend || 'localhost'}:${route.back_port}`);
+          resolve(true);
+        });
+      });
+      if (bound) this.tcpServers.set(port, server);
+    }
+  }
+
+  handleTcpConnection(route, clientSocket) {
+    // Don't lose any bytes the client sends before the upstream is connected.
+    clientSocket.pause();
+
+    let clientIp = clientSocket.remoteAddress || '';
+    if (clientIp.startsWith('::ffff:')) clientIp = clientIp.slice(7);
+
+    if (!this.isIpAllowed(clientIp, route.allowed_ips)) {
+      this.logger.warn(`TCP: rejected ${clientIp} on port ${route.listen_port} (not in allowlist)`);
+      clientSocket.destroy();
+      return;
+    }
+
+    const ports = String(route.back_port)
+      .split(',')
+      .map((p) => parseInt(p.trim(), 10))
+      .filter((p) => !isNaN(p));
+
+    if (ports.length === 0) {
+      this.logger.error(`TCP route ${route.id} has no valid back_port; dropping connection`);
+      clientSocket.destroy();
+      return;
+    }
+
+    const backend = route.backend || 'http://localhost';
+    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
+    const host = backendUrl.hostname;
+    const connectTimeoutMs = parseInt(
+      process.env.TCP_CONNECT_TIMEOUT_MS || process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
+    const idleTimeoutMs = parseInt(process.env.TCP_IDLE_TIMEOUT_MS || '0', 10);
+
+    const ordered = this.rankedPorts(route.id, ports);
+
+    // Try ranked ports until one connects. Failover here is always safe: no client
+    // bytes have been forwarded yet (the client socket is paused), so there is no
+    // duplication risk regardless of protocol.
+    const tryNext = (idx) => {
+      if (clientSocket.destroyed) return;
+      if (idx >= ordered.length) {
+        this.logger.warn(`TCP: all backends down for route ${route.id} (port ${route.listen_port})`);
+        clientSocket.destroy();
+        return;
+      }
+      const port = ordered[idx];
+      const upstream = new net.Socket();
+      let settled = false;
+
+      const fail = () => {
+        if (settled) return;
+        settled = true;
+        upstream.destroy();
+        this.penalizePort(route.id, port);
+        this.startBackgroundCheck(route, port);
+        tryNext(idx + 1);
+      };
+
+      upstream.setTimeout(connectTimeoutMs, fail);
+      upstream.once('error', fail);
+
+      upstream.connect(port, host, () => {
+        if (settled) { upstream.destroy(); return; }
+        settled = true;
+        upstream.setTimeout(0);              // clear the connect timeout
+        upstream.removeListener('error', fail);
+        this.boostPort(route.id, port);
+
+        if (idleTimeoutMs > 0) {
+          clientSocket.setTimeout(idleTimeoutMs, () => clientSocket.destroy());
+          upstream.setTimeout(idleTimeoutMs, () => upstream.destroy());
+        }
+
+        // Bidirectional pipe. Tear down the peer when either side ends/errors so
+        // no half-open socket lingers.
+        const teardown = () => { clientSocket.destroy(); upstream.destroy(); };
+        clientSocket.on('error', teardown);
+        upstream.on('error', teardown);
+        clientSocket.pipe(upstream);
+        upstream.pipe(clientSocket);
+        clientSocket.resume();
+
+        if (process.env.LOG_LEVEL === 'debug') {
+          this.logger.debug(`TCP: ${clientIp} -> ${host}:${port} (route ${route.id})`);
+        }
+      });
+    };
+
+    tryNext(0);
   }
 
   async handleRequest(req, res, isHttps) {
@@ -1356,6 +1502,11 @@ class ProxyServer {
       this.httpsServer.closeAllConnections();
       await new Promise((resolve) => this.httpsServer.close(resolve));
     }
+    for (const server of this.tcpServers.values()) {
+      if (server.closeAllConnections) server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+    this.tcpServers.clear();
     await this.db.close();
   }
 }

@@ -5,6 +5,7 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 ## Features
 
 - **Multi-protocol Support**: HTTP, HTTPS, and WebSocket proxying
+- **Raw TCP Proxying**: Optional, opt-in per-port TCP forwarding with TLS passthrough and the same score-based HA failover (zero impact on the HTTP path when unused)
 - **Automatic SSL**: Let's Encrypt integration for automatic certificate generation
 - **High Availability**: Cluster-based architecture with worker process management; multi-port score-based load balancing with automatic dead-port detection and background recovery probes
 - **Zero Downtime**: Hot database replacement without service interruption
@@ -540,6 +541,63 @@ VALUES ('550e8400-e29b-41d4-a716-446655440003', 'ha.example.com', '', '3000,3001
 ```
 
 > **WebSocket**: always uses a single port (the first ranked port). HA applies to HTTP/HTTPS only.
+
+## Raw TCP Proxying
+
+In addition to HTTP/HTTPS, jsproxy can forward **raw TCP** (e.g. databases, message
+brokers, or any TLS service via passthrough). This is **fully opt-in**: a TCP listener
+exists only because you've added a TCP route. With no TCP routes, the proxy behaves
+exactly as a pure HTTP/HTTPS proxy — the HTTP path is untouched.
+
+Because raw TCP has no Host header, each route listens on its **own dedicated port**
+and forwards to a backend host + port:
+
+```
+client → jsproxy:<listen_port> → <backend>:<back_port>
+```
+
+**Add / list / delete routes** with the CLI:
+
+```bash
+# Forward TCP :5432 -> localhost:5432 (e.g. Postgres)
+node scripts/add-tcp-route.js 5432 localhost 5432
+
+# HA across two backend ports (same score-based failover engine as HTTP HA)
+node scripts/add-tcp-route.js 5432 db.internal 5432,5433
+
+# Restrict to a CIDR (IP allowlist works on raw sockets too)
+node scripts/add-tcp-route.js 6379 localhost 6379 10.0.0.0/8
+
+node scripts/add-tcp-route.js --list
+node scripts/add-tcp-route.js 5432 --delete
+```
+
+TCP routes are stored in the same `mappings` table with `protocol = 'tcp'` and a
+`listen_port`. They are **invisible to the HTTP router** (filtered by `protocol`), so
+they cannot affect domain-based HTTP routing.
+
+**Behaviour:**
+
+- **HA / failover**: a comma-separated `back_port` reuses the exact HTTP HA engine
+  (best-score-first, penalize-and-probe, background recovery). TCP failover happens
+  strictly at the connect phase — before any client bytes are forwarded — so it is
+  always safe. If all backends are down, the client connection is closed.
+- **TLS**: pure passthrough — bytes are forwarded untouched and the **backend
+  terminates TLS**. jsproxy does not decrypt, and no certificate is needed on this path.
+- **Not applied to TCP**: auth, webhooks, and plugins are HTTP-layer features and do
+  **not** run for TCP routes. Only the IP allowlist applies.
+- **Lifecycle**: TCP routes are read once at startup. **Restart jsproxy** after adding
+  or removing them (unlike HTTP mappings, which are read per request).
+
+**Tuning** (optional env vars):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TCP_CONNECT_TIMEOUT_MS` | `HA_CONNECT_TIMEOUT_MS` (3000) | Upstream connect timeout before failover |
+| `TCP_IDLE_TIMEOUT_MS` | `0` (never) | Idle timeout for established connections |
+
+> A TCP `listen_port` must differ from `HTTP_PORT`/`HTTPS_PORT`; a colliding route is
+> logged and skipped.
 
 ## Hot Database Replacement
 
