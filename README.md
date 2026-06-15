@@ -549,12 +549,32 @@ brokers, or any TLS service via passthrough). This is **fully opt-in**: a TCP li
 exists only because you've added a TCP route. With no TCP routes, the proxy behaves
 exactly as a pure HTTP/HTTPS proxy — the HTTP path is untouched.
 
-Because raw TCP has no Host header, each route listens on its **own dedicated port**
-and forwards to a backend host + port:
+### How routing works (the port is the key)
+
+Raw TCP has no Host header, so jsproxy **cannot** route by inspecting the data.
+Instead, **the port the client connects to _is_ the routing decision** — each route
+listens on its own dedicated port and forwards every byte to one backend host + port:
 
 ```
 client → jsproxy:<listen_port> → <backend>:<back_port>
 ```
+
+It's one wire per port, not a shared front door. Unlike HTTP (one port :443, many
+hostnames demuxed by the `Host:` header), each TCP service needs **its own port**:
+
+```
+client → jsproxy:5432  → db.internal:5432      (Postgres)
+client → jsproxy:6379  → cache.internal:6379   (Redis)
+client → jsproxy:25565 → game.internal:25565   (a game server)
+```
+
+jsproxy never reads the payload — bytes arriving on `:5432` go to the `:5432` route's
+backend, full stop. The client chooses the destination purely by which port it dials.
+
+> A comma-separated `back_port` (HA) still does **not** inspect content — it just fails
+> over between interchangeable copies of the *same* service behind that one port. There
+> is no way to multiplex multiple hostnames onto a single TCP port (that would require
+> TLS SNI peeking, which is intentionally out of scope for the raw passthrough path).
 
 **Add / list / delete routes** with the CLI:
 
