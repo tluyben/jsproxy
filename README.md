@@ -619,6 +619,49 @@ they cannot affect domain-based HTTP routing.
 > A TCP `listen_port` must differ from `HTTP_PORT`/`HTTPS_PORT`; a colliding route is
 > logged and skipped.
 
+### Chaining jsproxy → jsproxy (raw TCP)
+
+Forwarding raw TCP from one jsproxy to another works **out of the box**, and it is
+simpler than the HTTP case — you do **not** need (and there is no) `back_host`.
+
+With **HTTP**, chaining uses `back_host` because the downstream jsproxy routes on the
+`Host:` header, so the upstream hop rewrites it. **Raw TCP has no header in the byte
+stream**, and the downstream jsproxy routes purely by **which port the connection
+lands on**. So the "what to route as" decision is simply *which `back_port` you target
+on the downstream* — there is nothing to override, and injecting bytes would corrupt
+the protocol. (`back_host` is therefore ignored on `protocol='tcp'` routes.)
+
+To chain, point the upstream hop's `backend` at the downstream host and its `back_port`
+at the downstream's `listen_port`:
+
+```bash
+# Edge proxy A (public): listen :5432, forward to proxy B's host
+#   on B's TCP listen port 5432
+[on host A]  node scripts/add-tcp-route.js 5432 proxy-b.internal 5432
+
+# Inner proxy B (near the DB): listen :5432, forward to the real database
+[on host B]  node scripts/add-tcp-route.js 5432 db.internal 5432
+```
+
+```
+client → A:5432 ──raw bytes──→ B:5432 ──raw bytes──→ db.internal:5432
+         (backend=proxy-b      (B routes by the port
+          back_port=5432)        it received on, not a header)
+```
+
+The full byte stream — TLS ClientHello, Postgres startup packet, anything — passes
+through both hops untouched. HA still composes: give either hop a comma-separated
+`back_port` to fail over between interchangeable downstreams (e.g. two inner proxies,
+or two DB replicas).
+
+> **Client IP across hops**: a raw TCP hop does not preserve the original client
+> address — the downstream proxy sees the *previous* proxy's IP as the source. If you
+> use `allowed_ips`, the inner hop's allowlist must permit the outer proxy's IP, and
+> any client-IP-based restriction should be enforced at the **first** (edge) hop, where
+> the real client address is still visible. (PROXY-protocol header injection, which
+> would carry the original IP across hops, is intentionally out of scope for the raw
+> passthrough path.)
+
 ## Hot Database Replacement
 
 Replace the database contents without downtime:
