@@ -35,6 +35,7 @@
 const http  = require('http');
 const https = require('https');
 const { randomUUID } = require('crypto');
+const { readJson, readHook, sendValid, sendDecision } = require('./_protocol');
 
 const PORT             = parseInt(process.env.PORT             || '3003',        10);
 const BASE_DELAY_MS    = parseInt(process.env.BASE_DELAY_MS    || '1000',        10);
@@ -274,55 +275,63 @@ const GC = setInterval(() => {
 GC.unref();
 
 http.createServer((req, res) => {
-  let raw = '';
-  req.on('data', d => (raw += d));
-  req.on('end', async () => {
-    let data;
-    try { data = JSON.parse(raw); } catch { res.writeHead(400); return res.end('bad json'); }
+  if (req.url === '/valid') {
+    return readJson(req, (err, data) => {
+      if (err) { res.writeHead(400); return res.end('bad json'); }
+      sendValid(res, isInterested(data.uri));
+    });
+  }
 
-    try {
-      if (req.url === '/valid') {
-        return json(res, { valid: isInterested(data.uri) });
-      }
+  if (req.url === '/before') {
+    return readHook(req, (err, meta, payloadBuffer) => {
+      if (err) { res.writeHead(400); return res.end('bad meta'); }
+      pending.set(meta.requestId, {
+        uri:     meta.uri,
+        method:  meta.method,
+        headers: meta.headers,
+        payload: payloadBuffer,
+        ts:      Date.now(),
+      });
+      sendDecision(res, 'CONTINUE');
+    });
+  }
 
-      if (req.url === '/before') {
-        pending.set(data.requestId, {
-          uri:     data.uri,
-          method:  data.method,
-          headers: data.headers,
-          payload: data.payload,
-          ts:      Date.now(),
-        });
-        return json(res, { result: 'CONTINUE' });
-      }
+  if (req.url === '/after') {
+    return readHook(req, async (err, meta, payloadBuffer) => {
+      if (err) { res.writeHead(400); return res.end('bad meta'); }
 
-      if (req.url === '/after') {
-        const info = pending.get(data.requestId);
-        pending.delete(data.requestId);
+      try {
+        const info = pending.get(meta.requestId);
+        pending.delete(meta.requestId);
 
         // 4xx and below — pass through
-        if (data.statusCode < 500 || !info) {
-          return json(res, { result: 'CONTINUE' });
+        if (meta.statusCode < 500 || !info) {
+          return sendDecision(res, 'CONTINUE');
         }
 
         // Decode response body for inspection
-        const bodyText = data.payload
-          ? Buffer.from(data.payload, 'base64').toString('utf8').slice(0, REASON_MAX)
+        const bodyText = payloadBuffer.length
+          ? payloadBuffer.toString('utf8').slice(0, REASON_MAX)
           : '';
 
+        // DB stores the captured request body base64-encoded (TEXT column).
+        const payloadB64 = info.payload && info.payload.length
+          ? info.payload.toString('base64')
+          : null;
+
         // 500: check if permanent external failure → pass through to client, DLQ for record
-        if (data.statusCode === 500 && isPermanentFailure(bodyText)) {
+        if (meta.statusCode === 500 && isPermanentFailure(bodyText)) {
           // Store in DLQ for visibility but don't retry — pass the real error back to client
           const id = randomUUID();
           const now = Date.now();
           await dbRun(
             `INSERT INTO retry_dlq (id, uri, method, headers, payload, attempts, fail_status, fail_reason, created_at)
              VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-            [id, info.uri, info.method, JSON.stringify(info.headers), info.payload || null,
+            [id, info.uri, info.method, JSON.stringify(info.headers), payloadB64,
              500, bodyText, now]
           );
           console.log(`[retry] permanent 500 for ${info.uri} — DLQ'd (id=${id}), passing error to client`);
-          return json(res, { result: 'CONTINUE' }); // client sees the real 500
+          return sendDecision(res, 'CONTINUE'); // client sees the real 500
         }
 
         // 500 (our crash) or 502/503/504 → queue for retry, return 202 to client
@@ -330,27 +339,25 @@ http.createServer((req, res) => {
         await dbRun(
           `INSERT INTO retry_queue (id, uri, method, headers, payload, next_retry, fail_status, fail_reason)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [id, info.uri, info.method, JSON.stringify(info.headers), info.payload || null,
-           Date.now(), data.statusCode, bodyText]
+          [id, info.uri, info.method, JSON.stringify(info.headers), payloadB64,
+           Date.now(), meta.statusCode, bodyText]
         );
 
-        console.log(`[retry] queued ${info.method} ${info.uri} (${data.statusCode}) id=${id} — "${bodyText.slice(0, 80)}"`);
+        console.log(`[retry] queued ${info.method} ${info.uri} (${meta.statusCode}) id=${id} — "${bodyText.slice(0, 80)}"`);
 
-        const body = JSON.stringify({ queued: true, id, message: 'Request accepted and queued for delivery' });
-        return json(res, {
-          result:     'REWRITE_RESPONSE',
+        const body = Buffer.from(JSON.stringify({ queued: true, id, message: 'Request accepted and queued for delivery' }));
+        return sendDecision(res, 'REWRITE_RESPONSE', {
           statusCode: 202,
-          headers:    { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)) },
-          payload:    Buffer.from(body).toString('base64'),
-        });
+          headers:    { 'content-type': 'application/json', 'content-length': String(body.length) },
+        }, body);
+      } catch (e) {
+        console.error('[retry] plugin error:', e);
+        sendDecision(res, 'CONTINUE');
       }
+    });
+  }
 
-      res.writeHead(404); res.end();
-    } catch (err) {
-      console.error('[retry] plugin error:', err);
-      json(res, { result: 'CONTINUE' });
-    }
-  });
+  res.writeHead(404); res.end();
 }).listen(PORT, () => {
   console.log(`[retry] plugin listening on :${PORT}`);
   console.log(`[retry]   routes:            ${PLUGIN_ROUTES.join(', ')}`);
@@ -359,9 +366,3 @@ http.createServer((req, res) => {
   console.log(`[retry]   permanent-fail:    ${PERMANENT_FAIL_PATTERNS.join(' | ')}`);
   console.log(`[retry]   queue:             ${RETRY_DB_PATH}`);
 });
-
-function json(res, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-  res.end(body);
-}

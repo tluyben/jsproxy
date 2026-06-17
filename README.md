@@ -447,12 +447,12 @@ PLUGIN_TIMEOUT=5000                          # per-call timeout in ms (default: 
                  → each returns { valid: true|false }
                  → if ALL return false: skip plugins, proxy normally, no buffering
 
-2. POST /before  (interested plugins in order, request body included as base64)
+2. POST /before  (interested plugins in order, request body as the raw HTTP body)
                  → first non-CONTINUE result wins
 
 3. Forward to backend  (with any rewrite applied)
 
-4. POST /after   (interested plugins in order, response body included as base64)
+4. POST /after   (interested plugins in order, response body as the raw HTTP body)
                  → called even on 502 (backend down) so plugins can produce fallbacks
                  → first non-CONTINUE result wins
 
@@ -461,9 +461,13 @@ PLUGIN_TIMEOUT=5000                          # per-call timeout in ms (default: 
 
 ### Plugin endpoints
 
-Each plugin endpoint receives a JSON `POST` and must return JSON.
+`/valid` exchanges small JSON. `/before` and `/after` carry the payload as the **raw HTTP
+body** (never base64), with metadata in the `x-plugin-meta` header and the decision in the
+`x-plugin-result` header — so bodies stream through untouched (a 100 MB upload costs 100 MB,
+not ~1 GB). The bundled `plugins/_protocol.js` helper implements this; copy it into your own
+plugin.
 
-**`/valid`** — lightweight opt-in, called in parallel:
+**`/valid`** — lightweight opt-in, called in parallel (JSON in, JSON out):
 ```json
 // request
 { "requestId": "…", "domain": "example.com", "inPort": 8080, "uri": "/api/v1/users", "method": "GET" }
@@ -472,30 +476,31 @@ Each plugin endpoint receives a JSON `POST` and must return JSON.
 ```
 
 **`/before`** — full request available, called sequentially on interested plugins:
-```json
-// request  (payload is base64 or null)
-{ "requestId": "…", "domain": "example.com", "inPort": 8080,
-  "uri": "/api/v1/users", "method": "GET", "headers": {…}, "payload": null }
+```
+// request: metadata header + raw body bytes
+x-plugin-meta: {"requestId":"…","domain":"example.com","inPort":8080,
+                "uri":"/api/v1/users","method":"GET","headers":{…}}
+<raw request body>
 
-// response options:
-{ "result": "CONTINUE" }
-{ "result": "IGNORE" }                                        // forward unchanged, skip /after
-{ "result": "CANCEL", "statusCode": 403 }                    // don't forward, respond immediately
-{ "result": "REWRITE_REQUEST", "uri": "…", "method": null, "headers": {…}, "payload": null }
-//   null fields keep the original value
+// response: decision header (+ optional meta), raw rewritten body
+x-plugin-result: CONTINUE
+x-plugin-result: IGNORE                                              // forward unchanged, skip /after
+x-plugin-result: CANCEL          x-plugin-meta: {"statusCode":403}   // don't forward, respond now
+x-plugin-result: REWRITE_REQUEST x-plugin-meta: {"uri":"…","headers":{…}}
+//   null/omitted meta fields keep the original; empty body keeps the original payload
 ```
 
 **`/after`** — full response available, called sequentially on interested plugins:
-```json
-// request  (payload is base64 or null)
-{ "requestId": "…", "domain": "example.com", "inPort": 8080,
-  "statusCode": 200, "headers": {…}, "payload": "…" }
+```
+// request: metadata header + raw body bytes
+x-plugin-meta: {"requestId":"…","domain":"example.com","inPort":8080,"statusCode":200,"headers":{…}}
+<raw response body>
 
 // response options:
-{ "result": "CONTINUE" }
-{ "result": "CANCEL", "statusCode": 503 }
-{ "result": "REWRITE_RESPONSE", "statusCode": 200, "headers": {…}, "payload": "…" }
-//   null fields keep the original backend value
+x-plugin-result: CONTINUE
+x-plugin-result: CANCEL           x-plugin-meta: {"statusCode":503}
+x-plugin-result: REWRITE_RESPONSE x-plugin-meta: {"statusCode":200,"headers":{…}}
+//   null/omitted meta fields keep the original backend value; empty body keeps the original payload
 ```
 
 ### Included plugins and demos

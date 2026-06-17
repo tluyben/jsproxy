@@ -77,45 +77,44 @@ entirely and the request proceeds as if no plugins are configured.
 
 ## HTTP API — `/before`
 
+Unlike `/valid`, `/before` and `/after` carry the request/response **payload as the raw
+HTTP body** — never base64. Metadata that used to live alongside the payload in a JSON
+envelope now rides in the `x-plugin-meta` header (compact JSON). This keeps bodies
+byte-for-byte and lets plugins stream them: a 100 MB upload costs 100 MB, not ~1 GB.
+
 **jsproxy → plugin:**
 
 ```
 POST /before
-Content-Type: application/json
+Content-Type: application/octet-stream
+x-plugin-meta: {"requestId":"550e8400-…","domain":"example.com","inPort":443,
+                "uri":"/api/users?page=2","method":"GET","headers":{"accept":"application/json"}}
 
-{
-  "requestId":  "550e8400-e29b-41d4-a716-446655440000",
-  "domain":     "example.com",
-  "inPort":     443,
-  "uri":        "/api/users?page=2",
-  "method":     "GET",
-  "headers":    { "accept": "application/json", ... },
-  "payload":    "<base64-encoded body, or null>"
-}
+<raw request body bytes — may be empty>
 ```
 
 `domain` and `inPort` are the frontend domain and port the client connected to on jsproxy
 (not the backend). This lets plugins make routing/auth decisions based on the virtual host.
 
-**plugin → jsproxy:**
+**plugin → jsproxy:** the decision verb goes in the `x-plugin-result` header, verb-specific
+fields in `x-plugin-meta`, and any rewritten body as the raw response body.
 
-```json
-{ "result": "CONTINUE" }
+```
+x-plugin-result: CONTINUE
 
-{ "result": "IGNORE" }
+x-plugin-result: IGNORE
 
-{ "result": "CANCEL", "statusCode": 403 }
+x-plugin-result: CANCEL
+x-plugin-meta: {"statusCode":403}
 
-{
-  "result":   "REWRITE_REQUEST",
-  "uri":      "/internal/users?page=2",
-  "method":   "GET",
-  "headers":  { "x-internal": "1" },
-  "payload":  "<base64 or null>"
-}
+x-plugin-result: REWRITE_REQUEST
+x-plugin-meta: {"uri":"/internal/users?page=2","method":"GET","headers":{"x-internal":"1"}}
+
+<raw rewritten request body — omit/empty to keep the original body>
 ```
 
-Any field in `REWRITE_REQUEST` that is `null` (or omitted) retains its original value.
+Any field in the `REWRITE_REQUEST` meta that is `null` (or omitted) retains its original
+value; an empty response body keeps the original payload.
 
 ---
 
@@ -125,16 +124,11 @@ Any field in `REWRITE_REQUEST` that is `null` (or omitted) retains its original 
 
 ```
 POST /after
-Content-Type: application/json
+Content-Type: application/octet-stream
+x-plugin-meta: {"requestId":"550e8400-…","domain":"example.com","inPort":443,
+                "statusCode":200,"headers":{"content-type":"application/json"}}
 
-{
-  "requestId":  "550e8400-e29b-41d4-a716-446655440000",
-  "domain":     "example.com",
-  "inPort":     443,
-  "statusCode": 200,
-  "headers":    { "content-type": "application/json", ... },
-  "payload":    "<base64-encoded response body>"
-}
+<raw response body bytes>
 ```
 
 `/after` is also called when the backend is unreachable — in that case jsproxy supplies
@@ -142,20 +136,24 @@ Content-Type: application/json
 
 **plugin → jsproxy:**
 
-```json
-{ "result": "CONTINUE" }
+```
+x-plugin-result: CONTINUE
 
-{ "result": "CANCEL", "statusCode": 503 }
+x-plugin-result: CANCEL
+x-plugin-meta: {"statusCode":503}
 
-{
-  "result":     "REWRITE_RESPONSE",
-  "statusCode": 200,
-  "headers":    { "content-type": "application/json" },
-  "payload":    "<base64>"
-}
+x-plugin-result: REWRITE_RESPONSE
+x-plugin-meta: {"statusCode":200,"headers":{"content-type":"application/json"}}
+
+<raw rewritten response body>
 ```
 
-Any field in `REWRITE_RESPONSE` that is `null` (or omitted) retains its original value.
+Any field in the `REWRITE_RESPONSE` meta that is `null` (or omitted) retains its original
+value; an empty response body keeps the original payload.
+
+> Helper: bundled plugins use `plugins/_protocol.js` (`readJson`, `readHook`, `sendValid`,
+> `sendDecision`) which implements this wire format — copy it into your own plugin to avoid
+> hand-rolling header parsing.
 
 ---
 
@@ -239,46 +237,46 @@ const server = new ProxyServer(db, certManager, pluginManager);
 
 ## Example plugin (Node.js)
 
+Uses the bundled `plugins/_protocol.js` helper, which implements the raw wire format
+(metadata in `x-plugin-meta`, payload as the raw body — no base64).
+
 ```js
 const http = require('http');
+const { readJson, readHook, sendValid, sendDecision } = require('./_protocol');
 
 http.createServer((req, res) => {
-  let body = '';
-  req.on('data', d => body += d);
-  req.on('end', () => {
-    const data = JSON.parse(body);
+  if (req.url === '/valid') {
+    // /valid carries small JSON metadata
+    return readJson(req, (err, data) => {
+      if (err) { res.writeHead(400); return res.end(); }
+      sendValid(res, data.uri.startsWith('/admin'));   // only interested in /admin
+    });
+  }
 
-    if (req.url === '/valid') {
-      // only interested in /admin requests
-      return respond(res, { valid: data.uri.startsWith('/admin') });
-    }
-
-    if (req.url === '/before') {
-      if (!data.headers['x-internal-token']) {
-        return respond(res, { result: 'CANCEL', statusCode: 403 });
+  if (req.url === '/before') {
+    // meta from header, request body as a raw Buffer (payload)
+    return readHook(req, (err, meta, payload) => {
+      if (!meta.headers['x-internal-token']) {
+        return sendDecision(res, 'CANCEL', { statusCode: 403 });
       }
-      return respond(res, { result: 'CONTINUE' });
-    }
+      sendDecision(res, 'CONTINUE');
+    });
+  }
 
-    if (req.url === '/after') {
-      if (data.statusCode === 502) {
-        return respond(res, {
-          result: 'REWRITE_RESPONSE',
-          statusCode: 503,
-          headers: { 'content-type': 'application/json' },
-          payload: Buffer.from(JSON.stringify({ error: 'service_unavailable' })).toString('base64'),
-        });
+  if (req.url === '/after') {
+    return readHook(req, (err, meta, payload) => {
+      if (meta.statusCode === 502) {
+        return sendDecision(res, 'REWRITE_RESPONSE',
+          { statusCode: 503, headers: { 'content-type': 'application/json' } },
+          Buffer.from(JSON.stringify({ error: 'service_unavailable' })));   // raw, not base64
       }
-      return respond(res, { result: 'CONTINUE' });
-    }
-  });
+      sendDecision(res, 'CONTINUE');
+    });
+  }
+
+  res.writeHead(404);
+  res.end();
 }).listen(3001);
-
-function respond(res, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(body);
-}
 ```
 
 ```

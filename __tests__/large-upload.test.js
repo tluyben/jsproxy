@@ -226,10 +226,11 @@ describe('large upload — plugin path (needsBody: false)', () => {
       const chunks = [];
       req.on('data', c => chunks.push(c));
       req.on('end', () => {
-        if (req.url === '/valid')  return res.end(JSON.stringify({ valid: true, needsBody: false }));
-        if (req.url === '/before') return res.end(JSON.stringify({ result: 'CONTINUE' }));
-        if (req.url === '/after')  return res.end(JSON.stringify({ result: 'CONTINUE' }));
-        res.end('{}');
+        // /valid carries JSON metadata; /before & /after use the raw protocol
+        // (decision in the x-plugin-result header, payload as the raw body).
+        if (req.url === '/valid') return res.end(JSON.stringify({ valid: true, needsBody: false }));
+        res.writeHead(200, { 'x-plugin-result': 'CONTINUE' });
+        res.end();
       });
     });
     await listen(pluginServer, PLUGIN_PORT);
@@ -274,9 +275,13 @@ describe('large upload — plugin path (needsBody: false)', () => {
       const chunks = [];
       req.on('data', c => chunks.push(c));
       req.on('end', () => {
-        if (req.url === '/valid')  return res.end(JSON.stringify({ valid: true, needsBody: false }));
-        if (req.url === '/before') return res.end(JSON.stringify({ result: 'CANCEL', statusCode: 403 }));
-        res.end('{}');
+        if (req.url === '/valid') return res.end(JSON.stringify({ valid: true, needsBody: false }));
+        if (req.url === '/before') {
+          res.writeHead(200, { 'x-plugin-result': 'CANCEL', 'x-plugin-meta': JSON.stringify({ statusCode: 403 }) });
+          return res.end();
+        }
+        res.writeHead(200, { 'x-plugin-result': 'CONTINUE' });
+        res.end();
       });
     });
     const CANCEL_PLUGIN_PORT = 9732;

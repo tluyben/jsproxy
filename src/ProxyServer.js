@@ -873,6 +873,11 @@ class ProxyServer {
       // downstream jsproxy — so the real Host is preserved instead.
       if (!headers['x-forwarded-host']) headers['x-forwarded-host'] = headers['host'];
       headers['host'] = mapping.back_host || headers['host'];
+      // We send a fully-buffered body with an explicit Content-Length, so any
+      // inbound Transfer-Encoding (e.g. chunked) no longer applies. Forwarding
+      // both is an HTTP framing violation that backends reject with 400 — strip
+      // it and let Content-Length describe the buffered body.
+      delete headers['transfer-encoding'];
       if (body && body.length > 0) headers['content-length'] = body.length;
       else delete headers['content-length'];
 
@@ -1092,7 +1097,7 @@ class ProxyServer {
       if (beforeResult.uri     != null) uri     = beforeResult.uri;
       if (beforeResult.method  != null) method  = beforeResult.method;
       if (beforeResult.headers != null) headers = beforeResult.headers;
-      if (beforeResult.payload != null) body    = Buffer.from(beforeResult.payload, 'base64');
+      if (beforeResult.payload != null) body    = beforeResult.payload;
     }
 
     // ── backend request ──────────────────────────────────────────────────────
@@ -1119,7 +1124,7 @@ class ProxyServer {
       const status  = afterResult.statusCode ?? backendResult.statusCode;
       const hdrs    = afterResult.headers    ?? backendResult.headers;
       const resBody = afterResult.payload != null
-        ? Buffer.from(afterResult.payload, 'base64')
+        ? afterResult.payload
         : backendResult.body;
       res.writeHead(status, hdrs);
       return res.end(resBody);
@@ -1150,7 +1155,19 @@ class ProxyServer {
       if (beforeResult.uri     != null) uri     = beforeResult.uri;
       if (beforeResult.method  != null) method  = beforeResult.method;
       if (beforeResult.headers != null) headers = beforeResult.headers;
-      // body rewrite intentionally ignored — plugin declared needsBody: false
+    }
+
+    // A before() hook can supply a replacement request body even on the streaming
+    // path: the plugin produced those bytes itself (it never needed the client's
+    // body), so we send them with an explicit Content-Length rather than piping
+    // the original — no buffering required.
+    const rewriteReqBody = beforeResult.type === 'REWRITE_REQUEST' && beforeResult.payload != null
+      ? beforeResult.payload
+      : null;
+    if (rewriteReqBody) {
+      headers = { ...headers };
+      headers['content-length'] = rewriteReqBody.length;
+      delete headers['transfer-encoding'];
     }
 
     const ports = String(mapping.back_port)
@@ -1192,6 +1209,19 @@ class ProxyServer {
                 for (const [k, v] of Object.entries(src)) {
                   if (!skip.has(k.toLowerCase())) outHeaders[k] = v;
                 }
+                // If after() produced a replacement body, send it and discard the
+                // backend's. The plugin's bytes are already in hand, so this works
+                // on the streaming path without buffering the backend response.
+                if (afterResult.payload != null) {
+                  for (const k of Object.keys(outHeaders)) {
+                    if (k.toLowerCase() === 'content-length') delete outHeaders[k];
+                  }
+                  outHeaders['content-length'] = afterResult.payload.length;
+                  res.writeHead(afterResult.statusCode ?? proxyRes.statusCode, outHeaders);
+                  proxyRes.destroy();
+                  res.end(afterResult.payload);
+                  return resolve();
+                }
                 res.writeHead(afterResult.statusCode ?? proxyRes.statusCode, outHeaders);
                 proxyRes.pipe(res);
                 proxyRes.on('end', resolve);
@@ -1227,7 +1257,12 @@ class ProxyServer {
         resolve();
       });
 
-      req.pipe(proxyReq);
+      if (rewriteReqBody) {
+        req.resume();                 // drain & discard the original client body
+        proxyReq.end(rewriteReqBody);
+      } else {
+        req.pipe(proxyReq);
+      }
     });
   }
 

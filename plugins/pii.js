@@ -54,6 +54,7 @@
  */
 
 const http = require('http');
+const { readJson, readHook, sendValid, sendDecision } = require('./_protocol');
 
 const PORT          = parseInt(process.env.PORT || '3005', 10);
 const PII_MODE      = (process.env.PII_MODE || 'mock').toLowerCase();   // mock | redact
@@ -260,31 +261,32 @@ function scrubObject(obj, path, detectedFields) {
 }
 
 /**
- * Attempt to scrub PII from a base64-encoded body.
- * Returns { b64, fields } where fields lists the JSON paths that were replaced.
- * If the body is not valid JSON, returns the original b64 unchanged with empty fields.
+ * Attempt to scrub PII from a raw body Buffer (or string).
+ * Returns { buffer, fields } where fields lists the JSON paths that were replaced.
+ * If the body is empty or not valid JSON, returns a null buffer with empty fields
+ * (signalling "keep the original body" to the caller).
  */
-function scrubBody(b64, label) {
-  if (!b64) return { b64: null, fields: [] };
+function scrubBody(payload, label) {
+  if (!payload || payload.length === 0) return { buffer: null, fields: [] };
 
-  const text = Buffer.from(b64, 'base64').toString('utf8');
+  const text = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload);
 
   let parsed;
   try { parsed = JSON.parse(text); } catch {
-    return { b64, fields: [] }; // not JSON — pass through unchanged
+    return { buffer: null, fields: [] }; // not JSON — pass through unchanged
   }
 
   const fields = [];
   const scrubbed = scrubObject(parsed, '', fields);
 
-  if (fields.length === 0) return { b64, fields: [] }; // nothing to do
+  if (fields.length === 0) return { buffer: null, fields: [] }; // nothing to do
 
   if (PII_LOG) {
     console.log(`[pii] ${label} — scrubbed ${fields.length} field(s): ${fields.join(', ')}`);
   }
 
   return {
-    b64:    Buffer.from(JSON.stringify(scrubbed)).toString('base64'),
+    buffer: Buffer.from(JSON.stringify(scrubbed)),
     fields,
   };
 }
@@ -292,69 +294,72 @@ function scrubBody(b64, label) {
 // ── plugin server ─────────────────────────────────────────────────────────────
 
 http.createServer((req, res) => {
-  let raw = '';
-  req.on('data', d => (raw += d));
-  req.on('end', () => {
-    let data;
-    try { data = JSON.parse(raw); } catch { res.writeHead(400); return res.end(); }
+  // ── /valid ──────────────────────────────────────────────────────────────
+  if (req.url === '/valid') {
+    return readJson(req, (err) => {
+      if (err) { res.writeHead(400); return res.end(); }
+      // Claim every request — we check content at the body level in /before and /after
+      sendValid(res, true);
+    });
+  }
 
-    try {
-      // ── /valid ────────────────────────────────────────────────────────────
-      if (req.url === '/valid') {
-        // Claim every request — we check content at the body level in /before and /after
-        return json(res, { valid: true });
-      }
-
-      // ── /before ───────────────────────────────────────────────────────────
-      if (req.url === '/before') {
+  // ── /before ─────────────────────────────────────────────────────────────
+  if (req.url === '/before') {
+    return readHook(req, (err, meta, payload) => {
+      if (err) { res.writeHead(400); return res.end(); }
+      try {
         if (PII_DIRECTION === 'response') {
-          return json(res, { result: 'CONTINUE' }); // nothing to do on the request side
+          return sendDecision(res, 'CONTINUE'); // nothing to do on the request side
         }
 
-        const label = `${data.method} ${data.uri} [req]`;
-        const { b64, fields } = scrubBody(data.payload, label);
+        const label = `${meta.method} ${meta.uri} [req]`;
+        const { buffer, fields } = scrubBody(payload, label);
 
         if (fields.length === 0) {
-          return json(res, { result: 'CONTINUE' }); // no PII found
+          return sendDecision(res, 'CONTINUE'); // no PII found
         }
 
-        return json(res, {
-          result:  'REWRITE_REQUEST',
-          payload: b64,
+        return sendDecision(res, 'REWRITE_REQUEST', {
           uri:     null,    // null = keep original
           method:  null,
           headers: null,
-        });
+        }, buffer);
+      } catch (e) {
+        console.error('[pii] plugin error:', e);
+        sendDecision(res, 'CONTINUE'); // always fail-open
       }
+    });
+  }
 
-      // ── /after ────────────────────────────────────────────────────────────
-      if (req.url === '/after') {
+  // ── /after ──────────────────────────────────────────────────────────────
+  if (req.url === '/after') {
+    return readHook(req, (err, meta, payload) => {
+      if (err) { res.writeHead(400); return res.end(); }
+      try {
         if (PII_DIRECTION === 'request') {
-          return json(res, { result: 'CONTINUE' }); // nothing to do on the response side
+          return sendDecision(res, 'CONTINUE'); // nothing to do on the response side
         }
 
-        const label = `${data.statusCode} [res]`;
-        const { b64, fields } = scrubBody(data.payload, label);
+        const label = `${meta.statusCode} [res]`;
+        const { buffer, fields } = scrubBody(payload, label);
 
         if (fields.length === 0) {
-          return json(res, { result: 'CONTINUE' }); // no PII found
+          return sendDecision(res, 'CONTINUE'); // no PII found
         }
 
-        return json(res, {
-          result:     'REWRITE_RESPONSE',
-          payload:    b64,
+        return sendDecision(res, 'REWRITE_RESPONSE', {
           statusCode: null,  // null = keep original
           headers:    null,
-        });
+        }, buffer);
+      } catch (e) {
+        console.error('[pii] plugin error:', e);
+        sendDecision(res, 'CONTINUE'); // always fail-open
       }
+    });
+  }
 
-      res.writeHead(404);
-      res.end();
-    } catch (err) {
-      console.error('[pii] plugin error:', err);
-      json(res, { result: 'CONTINUE' }); // always fail-open
-    }
-  });
+  res.writeHead(404);
+  res.end();
 }).listen(PORT, () => {
   console.log(`pii plugin listening on port ${PORT}`);
   console.log(`  Mode:      ${PII_MODE}`);
@@ -362,9 +367,3 @@ http.createServer((req, res) => {
   console.log(`  Patterns:  ${PII_RULES.length} PII field patterns`);
   console.log(`  Log:       ${PII_LOG ? 'enabled' : 'disabled'}`);
 });
-
-function json(res, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-  res.end(body);
-}

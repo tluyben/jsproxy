@@ -38,6 +38,7 @@
 
 const http  = require('http');
 const https = require('https');
+const { readJson, readHook, sendValid, sendDecision } = require('./_protocol');
 const { randomBytes } = require('crypto');
 
 const PORT          = parseInt(process.env.PORT || '3004', 10);
@@ -271,64 +272,61 @@ async function emit(span) {
 // ── plugin server ─────────────────────────────────────────────────────────────
 
 http.createServer((req, res) => {
-  let raw = '';
-  req.on('data', d => (raw += d));
-  req.on('end', async () => {
-    let data;
-    try { data = JSON.parse(raw); } catch { res.writeHead(400); return res.end(); }
+  // ── /valid ──────────────────────────────────────────────────────────────
+  if (req.url === '/valid') {
+    return readJson(req, (err, data) => {
+      if (err) { res.writeHead(400); return res.end(); }
+      if (isIgnored(data.uri))          return sendValid(res, false, false);
+      if (Math.random() > SAMPLE_RATE)  return sendValid(res, false, false);
+      sendValid(res, true, false);
+    });
+  }
 
-    try {
-      // ── /valid ────────────────────────────────────────────────────────────
-      if (req.url === '/valid') {
-        if (isIgnored(data.uri))          return json(res, { valid: false });
-        if (Math.random() > SAMPLE_RATE)  return json(res, { valid: false });
-        return json(res, { valid: true, needsBody: false });
+  // ── /before ───────────────────────────────────────────────────────────────
+  if (req.url === '/before') {
+    return readHook(req, (err, meta) => {
+      if (err) return sendDecision(res, 'CONTINUE'); // fail-open
+      state.set(meta.requestId, {
+        startMs: Date.now(),
+        method:  meta.method,
+        uri:     meta.uri,
+        domain:  meta.domain,
+        inPort:  meta.inPort,
+      });
+      sendDecision(res, 'CONTINUE');
+    });
+  }
+
+  // ── /after ──────────────────────────────────────────────────────────────
+  if (req.url === '/after') {
+    return readHook(req, (err, meta) => {
+      if (err) return sendDecision(res, 'CONTINUE'); // fail-open
+      const saved = state.get(meta.requestId);
+      state.delete(meta.requestId);
+
+      if (saved) {
+        const span = {
+          traceId:    meta.requestId,
+          service:    SERVICE_NAME,
+          method:     saved.method,
+          uri:        saved.uri,
+          domain:     saved.domain,
+          inPort:     saved.inPort,
+          statusCode: meta.statusCode,
+          latencyMs:  Date.now() - saved.startMs,
+          error:      meta.statusCode >= 500,
+          timestamp:  new Date().toISOString(),
+        };
+        // Fire-and-forget: don't hold up the response waiting for the backend
+        emit(span).catch(() => {});
       }
 
-      // ── /before ───────────────────────────────────────────────────────────
-      if (req.url === '/before') {
-        state.set(data.requestId, {
-          startMs: Date.now(),
-          method:  data.method,
-          uri:     data.uri,
-          domain:  data.domain,
-          inPort:  data.inPort,
-        });
-        return json(res, { result: 'CONTINUE' });
-      }
+      sendDecision(res, 'CONTINUE');
+    });
+  }
 
-      // ── /after ────────────────────────────────────────────────────────────
-      if (req.url === '/after') {
-        const saved = state.get(data.requestId);
-        state.delete(data.requestId);
-
-        if (saved) {
-          const span = {
-            traceId:    data.requestId,
-            service:    SERVICE_NAME,
-            method:     saved.method,
-            uri:        saved.uri,
-            domain:     saved.domain,
-            inPort:     saved.inPort,
-            statusCode: data.statusCode,
-            latencyMs:  Date.now() - saved.startMs,
-            error:      data.statusCode >= 500,
-            timestamp:  new Date().toISOString(),
-          };
-          // Fire-and-forget: don't hold up the response waiting for the backend
-          emit(span).catch(() => {});
-        }
-
-        return json(res, { result: 'CONTINUE' });
-      }
-
-      res.writeHead(404);
-      res.end();
-    } catch (err) {
-      console.error('[telemetry] plugin error:', err);
-      json(res, { result: 'CONTINUE' }); // always fail-open
-    }
-  });
+  res.writeHead(404);
+  res.end();
 }).listen(PORT, () => {
   console.log(`telemetry plugin listening on port ${PORT}`);
   console.log(`  Target:      ${TARGET}`);
@@ -339,9 +337,3 @@ http.createServer((req, res) => {
   if (TARGET === 'sentry')  console.log(`  Sentry DSN:  ${SENTRY_DSN ? '(set)' : '(NOT SET — set TELEMETRY_SENTRY_DSN)'}`);
   if (TARGET === 'webhook') console.log(`  Webhook URL: ${WEBHOOK_URL || '(NOT SET — set TELEMETRY_WEBHOOK_URL)'}`);
 });
-
-function json(res, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-  res.end(body);
-}

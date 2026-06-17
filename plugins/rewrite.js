@@ -14,6 +14,7 @@
  */
 
 const http = require('http');
+const { readJson, readHook, sendValid, sendDecision } = require('./_protocol');
 const PORT = parseInt(process.env.PORT || '3002', 10);
 
 /**
@@ -48,44 +49,37 @@ const RULES = [
 ];
 
 http.createServer((req, res) => {
-  let raw = '';
-  req.on('data', d => (raw += d));
-  req.on('end', () => {
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      res.writeHead(400);
-      return res.end('bad json');
-    }
-
-    if (req.url === '/valid') {
+  if (req.url === '/valid') {
+    return readJson(req, (err, data) => {
+      if (err) { res.writeHead(400); return res.end('bad json'); }
       const interested = RULES.some(r => r.match(data.uri, data.method));
-      return json(res, { valid: interested, needsBody: false });
-    }
+      sendValid(res, interested, false);
+    });
+  }
 
-    if (req.url === '/before') {
-      const rule = RULES.find(r => r.match(data.uri, data.method));
-      if (!rule) return json(res, { result: 'CONTINUE' });
+  if (req.url === '/before') {
+    return readHook(req, (err, meta) => {
+      if (err) { res.writeHead(400); return res.end('bad meta'); }
+      const rule = RULES.find(r => r.match(meta.uri, meta.method));
+      if (!rule) return sendDecision(res, 'CONTINUE');
 
-      const rewritten = rule.rewrite(data);
-      return json(res, { result: 'REWRITE_REQUEST', ...rewritten });
-    }
+      const rw = rule.rewrite(meta);   // { uri, method, headers, payload }
+      sendDecision(
+        res,
+        'REWRITE_REQUEST',
+        { uri: rw.uri, method: rw.method, headers: rw.headers },
+        rw.payload != null ? Buffer.from(rw.payload) : null,
+      );
+    });
+  }
 
-    if (req.url === '/after') {
-      return json(res, { result: 'CONTINUE' });
-    }
+  if (req.url === '/after') {
+    return readHook(req, () => sendDecision(res, 'CONTINUE'));
+  }
 
-    res.writeHead(404);
-    res.end();
-  });
+  res.writeHead(404);
+  res.end();
 }).listen(PORT, () => {
   console.log(`rewrite plugin listening on port ${PORT}`);
   console.log(`  Rule: /api/v1/* → /api/v2/*`);
 });
-
-function json(res, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-  res.end(body);
-}
