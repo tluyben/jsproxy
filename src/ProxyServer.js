@@ -521,6 +521,18 @@ class ProxyServer {
       req._proxyDomain = domain;
       if (req._span) req._span.setAttribute('proxy.domain', domain);
 
+      // Terminate Expect: 100-continue here. Node's HTTP server already answered
+      // 100 Continue to the client (its default before this handler runs), so the
+      // handshake is complete and the client is sending the body. Strip the header
+      // at this single chokepoint — BEFORE any forward path runs — so no backend
+      // ever re-negotiates a second 100-continue. This is the reliable fix: the
+      // http-proxy streaming path flushes outbound headers before its 'proxyReq'
+      // event fires, so removing it there is too late; removing it from req.headers
+      // (which every path copies from) covers proxy.web, the buffered HA path, the
+      // streaming HA path, and the plugin paths alike. A downstream app that sees a
+      // stale Expect has been observed to reject the upload with 404.
+      delete req.headers['expect'];
+
       if (process.env.LOG_LEVEL === 'debug') {
         this.logger.debug('incoming request', {
           domain, method: req.method, url: req.url,
