@@ -168,7 +168,7 @@ describe('Expect: 100-continue is stripped before forwarding', () => {
     expect(backend._state.lastExpect).toBe('none'); // backend never saw Expect
   }, 15000);
 
-  test('(a) single backend, large body (streamed via proxy.web)', async () => {
+  test('(a) single backend, large body (streamed via _streamHA)', async () => {
     const r = await uploadExpect(single.port, 'single.test', LARGE);
     expect(r.status).toBe(200);
     expect(Number(r.body)).toBe(LARGE.length);
@@ -218,20 +218,22 @@ describe('Expect: 100-continue is stripped before forwarding', () => {
 describe('streaming HA response timeout', () => {
   let dir, savedTimeout;
 
-  beforeAll(() => { savedTimeout = process.env.HA_RESPONSE_TIMEOUT_MS; dir = path.join(__dirname, 'timeout-data'); });
+  beforeAll(() => { savedTimeout = process.env.STREAM_IDLE_TIMEOUT_MS; dir = path.join(__dirname, 'timeout-data'); });
   afterAll(() => {
-    if (savedTimeout === undefined) delete process.env.HA_RESPONSE_TIMEOUT_MS;
-    else process.env.HA_RESPONSE_TIMEOUT_MS = savedTimeout;
+    if (savedTimeout === undefined) delete process.env.STREAM_IDLE_TIMEOUT_MS;
+    else process.env.STREAM_IDLE_TIMEOUT_MS = savedTimeout;
   });
 
-  test('a slow upload longer than the timeout still succeeds', async () => {
-    process.env.HA_RESPONSE_TIMEOUT_MS = '400';
+  test('an active upload slower than the idle timeout still succeeds (idle resets on data)', async () => {
+    // Idle timeout 500 ms, but chunks keep arriving every 100 ms for ~2 s — the
+    // stream is never idle, so it must NOT be torn down despite running 4× the
+    // idle window. This is the core "don't time out an active stream" guarantee.
+    process.env.STREAM_IDLE_TIMEOUT_MS = '500';
     const backend = strictBackend();
     const bport = await listen(backend);
     const ha = await makeProxy(path.join(dir, 'slow'), null);
     await ha.proxy.db.addMapping('slow.test', '', `${bport},${await deadPort()}`, '');
     try {
-      // ~2 MB trickled over ~2 s (20 chunks × 100 ms) — far past the 400 ms timeout.
       const r = await uploadExpect(ha.port, 'slow.test', LARGE, { trickleMs: 100 });
       expect(r.status).toBe(200);
       expect(Number(r.body)).toBe(LARGE.length);
@@ -240,9 +242,28 @@ describe('streaming HA response timeout', () => {
     }
   }, 30000);
 
-  test('a backend that goes silent AFTER the body is sent still trips the timeout', async () => {
-    process.env.HA_RESPONSE_TIMEOUT_MS = '400';
-    // Reads the whole body, then never responds.
+  test('SINGLE-backend slow upload (the https-entry path) also survives the idle timeout', async () => {
+    // A single-backend large upload now streams through _streamHA (not http-proxy's
+    // fixed-timeout proxy.web). With a 500 ms idle timeout and chunks every 100 ms,
+    // a ~2 s upload must complete — this is exactly the jsproxy-https entry hop.
+    process.env.STREAM_IDLE_TIMEOUT_MS = '500';
+    const backend = strictBackend();
+    const bport = await listen(backend);
+    const ha = await makeProxy(path.join(dir, 'single-slow'), null);
+    await ha.proxy.db.addMapping('singleslow.test', '', String(bport), ''); // single backend, no comma
+    try {
+      const r = await uploadExpect(ha.port, 'singleslow.test', LARGE, { trickleMs: 100 });
+      expect(r.status).toBe(200);
+      expect(Number(r.body)).toBe(LARGE.length);
+    } finally {
+      await ha.proxy.stop(); await close(backend);
+    }
+  }, 30000);
+
+  test('a genuinely idle connection (no data either way) is torn down', async () => {
+    // Reads the whole body, then goes silent forever. With nothing moving in
+    // either direction the idle timeout must bite — that is what a timeout is for.
+    process.env.STREAM_IDLE_TIMEOUT_MS = '500';
     const hung = http.createServer((req, res) => { req.resume(); /* no res.end */ });
     const bport = await listen(hung);
     const ha = await makeProxy(path.join(dir, 'hung'), null);
@@ -257,9 +278,8 @@ describe('streaming HA response timeout', () => {
         req.end(LARGE);
       });
       const elapsed = Date.now() - started;
-      // The deadline must still bite — a 502 (or a torn connection) within a few
-      // seconds, NOT an indefinite hang.
-      expect([502, 'ERR']).toContain(r.status);
+      // 504 (idle), 502, or a torn connection — within a few seconds, not forever.
+      expect([502, 504, 'ERR']).toContain(r.status);
       expect(elapsed).toBeLessThan(5000);
     } finally {
       await ha.proxy.stop(); await close(hung);

@@ -174,25 +174,25 @@ describe.each([2, 3, 4])('HA chain depth %i — large uploads stream end-to-end'
   }, 60000);
 });
 
-// A slow upload sends data for a long time while receiving nothing back. The HA
-// response timeout must NOT fire during that window — it is only a deadline for
-// the backend to start responding *after* the body is fully sent. Here the body
-// is trickled for ~1.5 s with the response timeout pinned to 500 ms.
-describe('slow streaming upload is not killed by the HA response timeout', () => {
+// A slow upload sends data for a long time. The streaming idle timeout must NOT
+// fire while bytes are actively moving — it resets on every chunk. Here the body
+// is trickled for ~1.5 s with the idle timeout pinned to 500 ms; chunks arrive
+// every 50 ms so the connection is never idle and must survive.
+describe('slow streaming upload is not killed by the idle timeout', () => {
   let chain, savedTimeout;
   beforeAll(async () => {
-    savedTimeout = process.env.HA_RESPONSE_TIMEOUT_MS;
-    process.env.HA_RESPONSE_TIMEOUT_MS = '500';
+    savedTimeout = process.env.STREAM_IDLE_TIMEOUT_MS;
+    process.env.STREAM_IDLE_TIMEOUT_MS = '500';
     chain = await buildChain(2, path.join(__dirname, 'chain-data-slow'));
   }, 30000);
   afterAll(async () => {
     if (chain) await chain.teardown();
-    if (savedTimeout === undefined) delete process.env.HA_RESPONSE_TIMEOUT_MS;
-    else process.env.HA_RESPONSE_TIMEOUT_MS = savedTimeout;
+    if (savedTimeout === undefined) delete process.env.STREAM_IDLE_TIMEOUT_MS;
+    else process.env.STREAM_IDLE_TIMEOUT_MS = savedTimeout;
     delete process.env.ENABLE_HTTPS;
   });
 
-  test('1 MB trickled over ~1.5 s completes despite 500 ms response timeout', async () => {
+  test('1 MB trickled over ~1.5 s completes despite 500 ms idle timeout', async () => {
     const data = Buffer.alloc(1024 * 1024);
     const result = await new Promise((resolve, reject) => {
       const req = http.request({
@@ -200,7 +200,7 @@ describe('slow streaming upload is not killed by the HA response timeout', () =>
         headers: { Host: 'chain.test', 'content-type': 'application/octet-stream', 'content-length': data.length },
       }, res => { let b = ''; res.on('data', c => b += c); res.on('end', () => resolve({ status: res.statusCode, body: b })); });
       req.on('error', reject);
-      // 30 chunks × ~50 ms ≈ 1.5 s of upload, far longer than the 500 ms timeout.
+      // 30 chunks × ~50 ms ≈ 1.5 s of upload; each chunk resets the 500 ms idle timer.
       const chunkSize = Math.ceil(data.length / 30);
       let off = 0;
       (function pump() {

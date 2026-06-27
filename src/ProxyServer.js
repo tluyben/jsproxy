@@ -631,6 +631,16 @@ class ProxyServer {
         return;
       }
 
+      // Single backend, but a large / chunked / SSE stream: route through the
+      // streaming pipe (with a single port → no failover) rather than http-proxy.
+      // http-proxy applies fixed connection/proxy timeouts that tear down an
+      // ACTIVE long upload or download; _streamHA uses a true idle timeout that
+      // only fires when no bytes are moving in either direction. This is the
+      // path a jsproxy-https -> jsproxy-http entry hop takes for big uploads.
+      if (this._isStreamingRequest(req)) {
+        return this._streamHA(mapping, req, res);
+      }
+
       // For simple port forwarding (no URI mapping), just proxy directly
       if (!mapping.front_uri && !mapping.back_uri) {
         const backend = mapping.backend || 'http://localhost';
@@ -1311,21 +1321,11 @@ class ProxyServer {
 
     // Stream directly (never buffer) when the body is large, of unknown size, or
     // an open-ended response stream — buffering these into memory would OOM and,
-    // for an "infinite" upload, can never complete:
-    //   - SSE / event-streams
-    //   - bodies larger than HA_STREAM_THRESHOLD
-    //   - chunked bodies with no declared content-length (size unknown — this is
-    //     the streaming-upload case; it MUST NOT be buffered)
-    // _streamHA still fails over across ports on a connect-phase failure (no body
-    // bytes have been sent yet, so retrying another backend is safe). Once the
-    // backend connection is established the body starts flowing and failover is no
-    // longer possible — a mid-stream failure surfaces to the client, which retries.
-    const cl       = parseInt(req.headers['content-length'] ?? '-1', 10);
-    const isSSE    = req.headers.accept?.includes('text/event-stream');
-    const isChunked = req.headers['transfer-encoding']?.toLowerCase().includes('chunked');
-    const isLarge  = cl > ProxyServer.HA_STREAM_THRESHOLD;
-
-    if (isSSE || isLarge || isChunked) {
+    // for an "infinite" upload, can never complete. _streamHA fails over across
+    // ports on a connect-phase failure (no body bytes sent yet, so retrying is
+    // safe); once the connection is established the body flows and a mid-stream
+    // failure surfaces to the client.
+    if (this._isStreamingRequest(req)) {
       return this._streamHA(mapping, req, res);
     }
 
@@ -1334,6 +1334,19 @@ class ProxyServer {
     const body = await this.bufferBody(req);
     const result = await this._requestHA(mapping, req.url, req.method, req.headers, body, req._span);
     this.sendHAResponse(res, result);
+  }
+
+  // A request must be streamed (never buffered) when its body is large, of unknown
+  // size, or it is an open-ended response stream:
+  //   - SSE / event-streams
+  //   - bodies larger than HA_STREAM_THRESHOLD
+  //   - chunked bodies with no declared content-length (the streaming-upload case)
+  _isStreamingRequest(req) {
+    const cl        = parseInt(req.headers['content-length'] ?? '-1', 10);
+    const isSSE     = req.headers.accept?.includes('text/event-stream');
+    const isChunked = req.headers['transfer-encoding']?.toLowerCase().includes('chunked');
+    const isLarge   = cl > ProxyServer.HA_STREAM_THRESHOLD;
+    return Boolean(isSSE || isLarge || isChunked);
   }
 
   // Streaming HA proxy with connect-phase failover. Pipes the request body
@@ -1396,8 +1409,15 @@ class ProxyServer {
         : clientIp;
     }
 
-    const connectTimeoutMs  = parseInt(process.env.HA_CONNECT_TIMEOUT_MS  || '3000',  10);
-    const responseTimeoutMs = parseInt(process.env.HA_RESPONSE_TIMEOUT_MS || '30000', 10);
+    const connectTimeoutMs = parseInt(process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
+    // Idle timeout: the ONLY deadline once a backend is connected. It is reset on
+    // every chunk in EITHER direction — upload progress (client→backend) AND
+    // download progress (backend→client) — so an actively-moving stream never
+    // trips it: a multi-GB upload, a slow-but-steady download, a long-lived SSE
+    // feed all keep resetting it. It fires only when nothing has moved either way
+    // for idleMs, i.e. a genuinely stalled connection. A timeout is for when
+    // NOTHING is happening — not for a stream that is busy transferring.
+    const idleMs = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '120000', 10);
     const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
 
     // Hold the body until a backend connection is committed. Nothing is read from
@@ -1406,11 +1426,29 @@ class ProxyServer {
 
     const span = req._span;
     let currentProxyReq = null;
+    let idleTimer = null;
+    const onIdle = () => {
+      this.logger.warn('HA stream idle timeout — no data in either direction', {
+        domain: mapping.domain, url: req.url, idle_ms: idleMs,
+      });
+      if (currentProxyReq) currentProxyReq.destroy(new Error('Idle timeout'));
+      if (!res.headersSent) { res.writeHead(504, { 'Content-Type': 'text/plain' }); res.end('Gateway Timeout'); }
+      else if (!res.writableEnded) res.destroy();
+    };
+    const resetIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(onIdle, idleMs);
+      if (idleTimer.unref) idleTimer.unref();
+    };
+    const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+
     // If the client aborts the upload, tear down whichever backend request is live.
-    req.on('error', () => { if (currentProxyReq) currentProxyReq.destroy(); });
+    req.on('error', () => { clearIdle(); if (currentProxyReq) currentProxyReq.destroy(); });
+    res.on('close', clearIdle);
 
     const attempt = (idx) => {
       if (idx >= ordered.length) {
+        clearIdle();
         this.logger.error('all backends unavailable (stream)', {
           domain: mapping.domain, mapping_id: mapping.id, ports: ordered.join(','),
         });
@@ -1427,7 +1465,6 @@ class ProxyServer {
 
       const port = ordered[idx];
       let committed = false; // true once TCP connect succeeds and the body starts flowing
-      let bodySent  = false; // true once the whole request body has been flushed upstream
 
       const proxyReq = lib.request({
         hostname: backendUrl.hostname,
@@ -1437,7 +1474,8 @@ class ProxyServer {
         headers,
         ...(isHttpsBackend ? { rejectUnauthorized: false } : {}),
       }, (proxyRes) => {
-        // Response received → backend is healthy. Stream it straight back.
+        // Response received → backend is healthy. Stream it straight back, resetting
+        // the idle deadline on every response chunk so a long download stays alive.
         this.boostPort(mapping.id, port);
         if (span) span.setAttribute('proxy.backend_status', proxyRes.statusCode);
         const fwd = {};
@@ -1445,8 +1483,10 @@ class ProxyServer {
           if (!skip.has(k.toLowerCase())) fwd[k] = v;
         }
         res.writeHead(proxyRes.statusCode, fwd);
+        proxyRes.on('data', resetIdle);          // download progress = activity
+        proxyRes.on('end', clearIdle);
         proxyRes.pipe(res);
-        proxyRes.on('error', () => { if (!res.writableEnded) res.destroy(); });
+        proxyRes.on('error', () => { clearIdle(); if (!res.writableEnded) res.destroy(); });
       });
 
       currentProxyReq = proxyReq;
@@ -1454,15 +1494,15 @@ class ProxyServer {
       proxyReq.on('socket', (socket) => {
         const onConnect = () => {
           committed = true;
-          // Clear the connect deadline. Do NOT arm a response timeout yet: a large
-          // upload sends data for minutes while receiving nothing back, and a
-          // socket idle-timer is only reset by *inbound* bytes — so a response
-          // timeout here would falsely kill any upload slower than the timeout
-          // (the "Response timeout on a healthy backend" bug). The response
-          // deadline is armed only once the whole body has been flushed (below).
+          // Connect succeeded: drop the connect deadline and switch to the idle
+          // timeout. We use our own timer (reset on real data both ways) rather
+          // than socket.setTimeout, whose idle clock is only nudged by inbound
+          // bytes and so would wrongly kill a long upload that sends but never
+          // receives until the very end.
           socket.setTimeout(0);
-          // Connection established — now (and only now) start streaming the body.
+          resetIdle();
           req.pipe(proxyReq);
+          req.on('data', resetIdle);             // upload progress = activity
         };
         if (socket.connecting) {
           socket.setTimeout(connectTimeoutMs);
@@ -1473,20 +1513,9 @@ class ProxyServer {
         }
       });
 
-      // Body fully sent → now bound how long we wait for the backend to start
-      // responding. Until this fires, the upload is free to take as long as it
-      // needs (multi-GB / slow links included).
-      proxyReq.on('finish', () => {
-        bodySent = true;
-        if (proxyReq.socket) proxyReq.socket.setTimeout(responseTimeoutMs);
-      });
-
       proxyReq.on('timeout', () => {
-        // Before connect → connect-phase timeout (failover-safe). After the body
-        // is sent → the backend is genuinely unresponsive (surface, no failover).
-        // While the body is still uploading the timeout is disabled, so we never
-        // get here mid-upload.
-        proxyReq.destroy(new Error(committed && bodySent ? 'Response timeout' : 'Connect timeout'));
+        // Only the pre-connect socket deadline can fire (post-connect we set 0).
+        proxyReq.destroy(new Error('Connect timeout'));
       });
 
       proxyReq.on('error', (err) => {
@@ -1500,6 +1529,7 @@ class ProxyServer {
           attempt(idx + 1);
         } else {
           // Post-connect failure: body already in flight, cannot fail over.
+          clearIdle();
           this.logger.warn('HA stream backend failed mid-request (no failover)', {
             domain: mapping.domain, port, url: req.url, error: err.message, error_code: err.code,
           });
