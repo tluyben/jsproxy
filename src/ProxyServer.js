@@ -1423,8 +1423,8 @@ class ProxyServer {
     // req.on('data') goes silent for long stretches even though bytes are pouring
     // out to the backend. The socket's bytesWritten still advances, so polling it
     // sees the real activity that 'data' events miss.
-    const idleMs = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '120000', 10);
-    const pollMs = Math.max(250, Math.min(Math.floor(idleMs / 4), 30000));
+    const idleMs = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '300000', 10);
+    const pollMs = Math.max(250, Math.min(Math.floor(idleMs / 4), 15000));
     const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
 
     // Hold the body until a backend connection is committed. Nothing is read from
@@ -1450,8 +1450,16 @@ class ProxyServer {
       lastBytes = -1;
       idleElapsed = 0;
       idleTimer = setInterval(() => {
-        const sock = currentProxyReq && currentProxyReq.socket;
-        const cur = sock ? (sock.bytesRead + sock.bytesWritten) : lastBytes;
+        // Sum byte movement on BOTH legs of the proxied connection: the client
+        // socket (req) and the backend socket (proxyReq). The connection is active
+        // if EITHER is moving — e.g. the client is still uploading into us while
+        // the backend leg is briefly backpressured, or the backend is responding
+        // while the client side is quiet. Watching only the backend socket would
+        // wrongly call a still-uploading request idle.
+        const inSock  = req.socket;
+        const outSock = currentProxyReq && currentProxyReq.socket;
+        const cur = (inSock  ? inSock.bytesRead  + inSock.bytesWritten  : 0)
+                  + (outSock ? outSock.bytesRead + outSock.bytesWritten : 0);
         if (cur !== lastBytes) { lastBytes = cur; idleElapsed = 0; return; } // active
         idleElapsed += pollMs;
         if (idleElapsed >= idleMs) { clearIdle(); onIdle(); }
