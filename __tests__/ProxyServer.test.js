@@ -7,18 +7,13 @@ const CertificateManager = require('../src/CertificateManager');
 
 jest.mock('../src/DatabaseManager');
 jest.mock('../src/CertificateManager');
-jest.mock('winston', () => ({
-  createLogger: () => ({
-    info: jest.fn(),
-    error: jest.fn(),
-    warn: jest.fn()
-  })
-}));
 
 describe('ProxyServer', () => {
   let proxyServer;
   let mockBackendServer;
+  let backendPort;
   let logger;
+  let savedEnv;
 
   beforeAll(async () => {
     mockBackendServer = http.createServer((req, res) => {
@@ -34,8 +29,10 @@ describe('ProxyServer', () => {
       }
     });
 
+    // Listen on an OS-assigned free port so the suite never collides with other
+    // services (or other tests) that happen to hold a fixed port.
     await new Promise((resolve) => {
-      mockBackendServer.listen(3001, resolve);
+      mockBackendServer.listen(0, () => { backendPort = mockBackendServer.address().port; resolve(); });
     });
   });
 
@@ -43,14 +40,23 @@ describe('ProxyServer', () => {
     logger = {
       info: jest.fn(),
       error: jest.fn(),
-      warn: jest.fn()
+      warn: jest.fn(),
+      debug: jest.fn()
     };
+
+    // Bind the proxy to OS-assigned ports and keep HTTPS off so start() never
+    // hangs on an already-bound fixed port (e.g. 8080 held by another service).
+    savedEnv = { HTTP_PORT: process.env.HTTP_PORT, HTTPS_PORT: process.env.HTTPS_PORT, ENABLE_HTTPS: process.env.ENABLE_HTTPS };
+    process.env.HTTP_PORT = '0';
+    process.env.HTTPS_PORT = '0';
+    process.env.ENABLE_HTTPS = 'false';
 
     // Mock the constructors
     DatabaseManager.mockImplementation(() => ({
       initialize: jest.fn().mockResolvedValue(),
       close: jest.fn().mockResolvedValue(),
-      getMapping: jest.fn()
+      getMapping: jest.fn(),
+      getTcpRoutes: jest.fn().mockResolvedValue([])
     }));
 
     CertificateManager.mockImplementation(() => ({
@@ -74,6 +80,10 @@ describe('ProxyServer', () => {
   afterEach(async () => {
     if (proxyServer) {
       await proxyServer.stop();
+    }
+    for (const k of ['HTTP_PORT', 'HTTPS_PORT', 'ENABLE_HTTPS']) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
     }
   });
 
@@ -117,7 +127,7 @@ describe('ProxyServer', () => {
   test('should proxy request to backend', async () => {
     proxyServer.db.getMapping.mockResolvedValue({
       front_uri: '',
-      back_port: 3001,
+      back_port: backendPort,
       back_uri: ''
     });
 

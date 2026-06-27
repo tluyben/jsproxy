@@ -10,6 +10,8 @@ describe('Simple WebSocket Test', () => {
   let wsServer;
   let logger;
   let testDataDir;
+  let backendPort;
+  let proxyPort;
 
   beforeAll(async () => {
     testDataDir = path.join(__dirname, 'simple-ws-data');
@@ -51,9 +53,11 @@ describe('Simple WebSocket Test', () => {
       });
     });
 
+    // OS-assigned free port → no collision with other services/tests.
     await new Promise((resolve) => {
-      backendServer.listen(3010, () => {
-        console.log('WebSocket backend started on port 3010');
+      backendServer.listen(0, () => {
+        backendPort = backendServer.address().port;
+        console.log('WebSocket backend started on port', backendPort);
         resolve();
       });
     });
@@ -63,19 +67,20 @@ describe('Simple WebSocket Test', () => {
     proxyServer.db.dbPath = path.join(testDataDir, 'test.db');
     proxyServer.certManager.certsDir = path.join(testDataDir, 'certs');
     
-    // Use a different port for testing
+    // Use an OS-assigned port for the proxy too.
     const originalEnv = process.env.HTTP_PORT;
-    process.env.HTTP_PORT = '9090';
+    process.env.HTTP_PORT = '0';
     process.env.ENABLE_HTTPS = 'false';
 
     await proxyServer.initialize();
 
     // Add mapping for WebSocket
-    await proxyServer.db.addMapping('test.example.com', '', 3010, '');
-    
+    await proxyServer.db.addMapping('test.example.com', '', backendPort, '');
+
     await proxyServer.start();
-    
-    console.log('Proxy started on port 9090');
+    proxyPort = proxyServer.httpServer.address().port;
+
+    console.log('Proxy started on port', proxyPort);
     
     // Restore original env
     if (originalEnv) {
@@ -127,7 +132,7 @@ describe('Simple WebSocket Test', () => {
   test('should proxy WebSocket connection', (done) => {
     console.log('Starting WebSocket test...');
     
-    const ws = new WebSocket('ws://localhost:9090/', {
+    const ws = new WebSocket(`ws://localhost:${proxyPort}/`, {
       headers: {
         'Host': 'test.example.com'
       }
@@ -186,7 +191,7 @@ describe('Simple WebSocket Test', () => {
     const http = require('http');
     const req = http.request({
       hostname: 'localhost',
-      port: 9090,
+      port: proxyPort,
       path: '/',
       headers: { Host: 'test.example.com' }
     }, (res) => {

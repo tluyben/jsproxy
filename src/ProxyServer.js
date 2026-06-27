@@ -1282,30 +1282,188 @@ class ProxyServer {
       .map(p => parseInt(p.trim(), 10))
       .filter(p => !isNaN(p));
 
-    // Stream directly when buffering the body would be unsafe:
+    // Stream directly (never buffer) when the body is large, of unknown size, or
+    // an open-ended response stream — buffering these into memory would OOM and,
+    // for an "infinite" upload, can never complete:
     //   - SSE / event-streams
-    //   - bodies larger than HA_STREAM_THRESHOLD (avoids OOM on large uploads)
-    //   - chunked bodies with no declared content-length (size unknown)
-    // Failover is not possible for streamed requests — if the selected backend
-    // is unreachable the client gets a 502 and retries; penalization ensures the
-    // next attempt picks a healthy port. Port scores are updated via _haStreamPort
-    // in the shared proxyRes / error handlers in setupProxyErrorHandling.
-    const cl      = parseInt(req.headers['content-length'] ?? '-1', 10);
-    const isSSE   = req.headers.accept?.includes('text/event-stream');
-    const isLarge = cl > ProxyServer.HA_STREAM_THRESHOLD;
+    //   - bodies larger than HA_STREAM_THRESHOLD
+    //   - chunked bodies with no declared content-length (size unknown — this is
+    //     the streaming-upload case; it MUST NOT be buffered)
+    // _streamHA still fails over across ports on a connect-phase failure (no body
+    // bytes have been sent yet, so retrying another backend is safe). Once the
+    // backend connection is established the body starts flowing and failover is no
+    // longer possible — a mid-stream failure surfaces to the client, which retries.
+    const cl       = parseInt(req.headers['content-length'] ?? '-1', 10);
+    const isSSE    = req.headers.accept?.includes('text/event-stream');
+    const isChunked = req.headers['transfer-encoding']?.toLowerCase().includes('chunked');
+    const isLarge  = cl > ProxyServer.HA_STREAM_THRESHOLD;
 
-    if (isSSE || isLarge) {
-      const port = this.rankedPorts(mapping.id, ports)[0];
-      req._haStreamPort = port; // picked up by proxyRes / error handlers for scoring
-      const backend = mapping.backend || 'http://localhost';
-      this.proxy.web(req, res, { target: `${backend}:${port}`, secure: false, changeOrigin: true });
-      return;
+    if (isSSE || isLarge || isChunked) {
+      return this._streamHA(mapping, req, res);
     }
 
-    // Small / known-size body: buffer and retry across ports for true failover.
+    // Small / known-size body: buffer and retry across ports for true failover
+    // (including post-connect failures, which the streaming path cannot retry).
     const body = await this.bufferBody(req);
     const result = await this._requestHA(mapping, req.url, req.method, req.headers, body, req._span);
     this.sendHAResponse(res, result);
+  }
+
+  // Streaming HA proxy with connect-phase failover. Pipes the request body
+  // straight through to the backend without ever buffering it — so a 1 GB or an
+  // open-ended/chunked upload costs only socket buffers, not memory. Used for
+  // SSE, large bodies, and chunked/unknown-size bodies, including jsproxy ->
+  // jsproxy -> ... chains of arbitrary depth (every hop streams; nothing is held
+  // in memory at any hop).
+  //
+  // Failover semantics mirror _requestHA but are constrained by streaming:
+  //   - connect-phase failure (TCP never established) → no body bytes have been
+  //     sent, so penalize the port and try the next ranked backend. This is the
+  //     case that previously surfaced a 502 (the old proxy.web path picked one
+  //     port and never failed over).
+  //   - post-connect failure (backend accepted, then reset/timed out) → the body
+  //     is already in flight; retrying could duplicate a non-idempotent upload
+  //     and the original bytes are gone. Surface to the client, which retries.
+  _streamHA(mapping, req, res) {
+    const ports = String(mapping.back_port)
+      .split(',')
+      .map(p => parseInt(p.trim(), 10))
+      .filter(p => !isNaN(p));
+    const ordered = this.rankedPorts(mapping.id, ports);
+
+    const backend = mapping.backend || 'http://localhost';
+    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
+    const isHttpsBackend = backendUrl.protocol === 'https:';
+    const lib = isHttpsBackend ? https : http;
+
+    const targetPath = (!mapping.front_uri && !mapping.back_uri)
+      ? req.url
+      : this.buildTargetPath(mapping, req.url);
+
+    // Outbound headers mirror the streaming path in setupProxyErrorHandling:
+    // preserve the client Host (or back_host) so a downstream Host-routing jsproxy
+    // can still match the original domain. Strip hop-by-hop headers, including
+    // transfer-encoding — when we pipe the body, Node re-frames it itself (fixed
+    // length if Content-Length is present, otherwise chunked), so forwarding the
+    // inbound framing header would risk a duplicate/conflicting one.
+    const hopByHop = new Set(['connection', 'keep-alive', 'proxy-authenticate',
+      'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+    const headers = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (!hopByHop.has(k.toLowerCase())) headers[k] = v;
+    }
+    if (!headers['x-forwarded-host']) headers['x-forwarded-host'] = req.headers['host'] || '';
+    headers['host'] = mapping.back_host || req.headers['host'] || `${backendUrl.hostname}`;
+    const proto = req.connection.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    headers['x-forwarded-proto'] = proto;
+    const clientIp = this.getClientIp(req);
+    if (clientIp) {
+      headers['x-forwarded-for'] = req.headers['x-forwarded-for']
+        ? `${req.headers['x-forwarded-for']}, ${clientIp}`
+        : clientIp;
+    }
+
+    const connectTimeoutMs  = parseInt(process.env.HA_CONNECT_TIMEOUT_MS  || '3000',  10);
+    const responseTimeoutMs = parseInt(process.env.HA_RESPONSE_TIMEOUT_MS || '30000', 10);
+    const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
+
+    // Hold the body until a backend connection is committed. Nothing is read from
+    // the client socket (and thus nothing buffered) until we start piping.
+    req.pause();
+
+    const span = req._span;
+    let currentProxyReq = null;
+    // If the client aborts the upload, tear down whichever backend request is live.
+    req.on('error', () => { if (currentProxyReq) currentProxyReq.destroy(); });
+
+    const attempt = (idx) => {
+      if (idx >= ordered.length) {
+        this.logger.error('all backends unavailable (stream)', {
+          domain: mapping.domain, mapping_id: mapping.id, ports: ordered.join(','),
+        });
+        if (span) {
+          span.setAttribute('ha.all_backends_down', true);
+          span.setAttribute('ha.failed_ports', ordered.join(','));
+        }
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+          res.end('Bad Gateway: all backends unavailable');
+        }
+        return;
+      }
+
+      const port = ordered[idx];
+      let committed = false; // true once TCP connect succeeds and the body starts flowing
+
+      const proxyReq = lib.request({
+        hostname: backendUrl.hostname,
+        port,
+        path: targetPath,
+        method: req.method,
+        headers,
+        ...(isHttpsBackend ? { rejectUnauthorized: false } : {}),
+      }, (proxyRes) => {
+        // Response received → backend is healthy. Stream it straight back.
+        this.boostPort(mapping.id, port);
+        if (span) span.setAttribute('proxy.backend_status', proxyRes.statusCode);
+        const fwd = {};
+        for (const [k, v] of Object.entries(proxyRes.headers)) {
+          if (!skip.has(k.toLowerCase())) fwd[k] = v;
+        }
+        res.writeHead(proxyRes.statusCode, fwd);
+        proxyRes.pipe(res);
+        proxyRes.on('error', () => { if (!res.writableEnded) res.destroy(); });
+      });
+
+      currentProxyReq = proxyReq;
+
+      proxyReq.on('socket', (socket) => {
+        const onConnect = () => {
+          committed = true;
+          socket.setTimeout(responseTimeoutMs);
+          // Connection established — now (and only now) start streaming the body.
+          req.pipe(proxyReq);
+        };
+        if (socket.connecting) {
+          socket.setTimeout(connectTimeoutMs);
+          socket.once('connect', onConnect);
+        } else {
+          // Pooled / keepalive socket — already connected.
+          onConnect();
+        }
+      });
+
+      proxyReq.on('timeout', () => {
+        // Treat a connect-phase timeout like a connect failure (failover-safe).
+        proxyReq.destroy(new Error(committed ? 'Response timeout' : 'Connect timeout'));
+      });
+
+      proxyReq.on('error', (err) => {
+        if (!committed) {
+          // Connect-phase failure: no body sent yet → penalize and fail over.
+          this.penalizePort(mapping.id, port);
+          this.startBackgroundCheck(mapping, port);
+          this.logger.warn('HA stream connect failed, trying next backend', {
+            domain: mapping.domain, port, url: req.url, error: err.message, error_code: err.code,
+          });
+          attempt(idx + 1);
+        } else {
+          // Post-connect failure: body already in flight, cannot fail over.
+          this.logger.warn('HA stream backend failed mid-request (no failover)', {
+            domain: mapping.domain, port, url: req.url, error: err.message, error_code: err.code,
+          });
+          req.unpipe(proxyReq);
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'text/plain' });
+            res.end('Bad Gateway');
+          } else if (!res.writableEnded) {
+            res.destroy();
+          }
+        }
+      });
+    };
+
+    attempt(0);
   }
 
   static get HA_STREAM_THRESHOLD() { return 512 * 1024; } // 512 KB
