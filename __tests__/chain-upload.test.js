@@ -17,12 +17,33 @@ const BIG = 8 * 1024 * 1024; // 8 MB — well over the 512 KB stream threshold
 function listen(server, port) { return new Promise(r => server.listen(port, r)); }
 function close(server)         { return new Promise(r => server.close(r)); }
 
-// Counts incoming bytes without buffering; echoes the total.
+// Counts incoming bytes without buffering; echoes the total. Rejects with 404 if
+// it still sees a stale `Expect: 100-continue` (mimics app servers that 404 when
+// a proxy forwards an already-answered continue handshake).
 function makeEchoBackend() {
   return http.createServer((req, res) => {
+    if ((req.headers.expect || '').toLowerCase().includes('100-continue')) {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      return res.end('Not Found');
+    }
     let bytes = 0;
     req.on('data', c => { bytes += c.length; });
     req.on('end', () => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(String(bytes)); });
+  });
+}
+
+// Upload that sets Expect: 100-continue (as curl does for any body >1 KB) and
+// only sends the body after a 100 Continue is received.
+function uploadExpect(proxyPort, host, data) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: 'localhost', port: proxyPort, path: '/upload', method: 'POST',
+      headers: { Host: host, 'content-type': 'application/octet-stream', 'content-length': data.length, Expect: '100-continue' },
+    }, res => { let b = ''; res.on('data', c => b += c); res.on('end', () => resolve({ status: res.statusCode, body: b })); });
+    req.on('continue', () => req.end(data));
+    // Fallback: if no 100 arrives promptly, send anyway so the test can't hang.
+    setTimeout(() => { if (req.writableEnded === false) { try { req.end(data); } catch (_) {} } }, 2000).unref?.();
+    req.on('error', reject);
   });
 }
 
@@ -140,4 +161,57 @@ describe.each([2, 3, 4])('HA chain depth %i — large uploads stream end-to-end'
       expect(Number(r.body)).toBe(BIG);
     }
   }, 60000);
+
+  // curl adds Expect: 100-continue for any body > 1 KB. Each proxy hop answers
+  // 100 itself and must strip the stale Expect before forwarding, or the backend
+  // 404s. Run several times to cover every HA rotation.
+  test('large upload with Expect: 100-continue is not 404-ed by the chain', async () => {
+    for (let i = 0; i < 6; i++) {
+      const r = await uploadExpect(chain.entryPort, 'chain.test', Buffer.alloc(BIG));
+      expect(r.status).toBe(200);
+      expect(Number(r.body)).toBe(BIG);
+    }
+  }, 60000);
+});
+
+// A slow upload sends data for a long time while receiving nothing back. The HA
+// response timeout must NOT fire during that window — it is only a deadline for
+// the backend to start responding *after* the body is fully sent. Here the body
+// is trickled for ~1.5 s with the response timeout pinned to 500 ms.
+describe('slow streaming upload is not killed by the HA response timeout', () => {
+  let chain, savedTimeout;
+  beforeAll(async () => {
+    savedTimeout = process.env.HA_RESPONSE_TIMEOUT_MS;
+    process.env.HA_RESPONSE_TIMEOUT_MS = '500';
+    chain = await buildChain(2, path.join(__dirname, 'chain-data-slow'));
+  }, 30000);
+  afterAll(async () => {
+    if (chain) await chain.teardown();
+    if (savedTimeout === undefined) delete process.env.HA_RESPONSE_TIMEOUT_MS;
+    else process.env.HA_RESPONSE_TIMEOUT_MS = savedTimeout;
+    delete process.env.ENABLE_HTTPS;
+  });
+
+  test('1 MB trickled over ~1.5 s completes despite 500 ms response timeout', async () => {
+    const data = Buffer.alloc(1024 * 1024);
+    const result = await new Promise((resolve, reject) => {
+      const req = http.request({
+        hostname: 'localhost', port: chain.entryPort, path: '/upload', method: 'POST',
+        headers: { Host: 'chain.test', 'content-type': 'application/octet-stream', 'content-length': data.length },
+      }, res => { let b = ''; res.on('data', c => b += c); res.on('end', () => resolve({ status: res.statusCode, body: b })); });
+      req.on('error', reject);
+      // 30 chunks × ~50 ms ≈ 1.5 s of upload, far longer than the 500 ms timeout.
+      const chunkSize = Math.ceil(data.length / 30);
+      let off = 0;
+      (function pump() {
+        if (off >= data.length) return req.end();
+        const end = Math.min(off + chunkSize, data.length);
+        req.write(data.subarray(off, end));
+        off = end;
+        setTimeout(pump, 50);
+      })();
+    });
+    expect(result.status).toBe(200);
+    expect(Number(result.body)).toBe(data.length);
+  }, 30000);
 });

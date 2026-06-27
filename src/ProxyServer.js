@@ -58,6 +58,13 @@ class ProxyServer {
       const protocol = req.connection.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
       proxyReq.setHeader('X-Forwarded-Proto', protocol);
 
+      // Our HTTP server already answered any Expect: 100-continue to the client
+      // (Node's default before the request handler runs), so the handshake is
+      // complete. Don't forward a stale Expect — a backend that re-negotiates
+      // 100-continue has been observed to reject the request (404) and it can
+      // surface a duplicate 100 to the client.
+      proxyReq.removeHeader('Expect');
+
       // For HA streamed requests (SSE / large body), track whether the TCP
       // connect to the backend actually completed. The shared 'error' handler
       // uses this flag to distinguish a connect-phase failure (penalize) from
@@ -878,6 +885,10 @@ class ProxyServer {
       // both is an HTTP framing violation that backends reject with 400 — strip
       // it and let Content-Length describe the buffered body.
       delete headers['transfer-encoding'];
+      // We've already buffered the full body and answered any 100-continue to the
+      // client ourselves, so a forwarded Expect is stale — drop it (a downstream
+      // app re-negotiating 100-continue has been seen to 404 the request).
+      delete headers['expect'];
       if (body && body.length > 0) headers['content-length'] = body.length;
       else delete headers['content-length'];
 
@@ -1157,6 +1168,10 @@ class ProxyServer {
       if (beforeResult.headers != null) headers = beforeResult.headers;
     }
 
+    // We already answered any Expect: 100-continue to the client; a forwarded
+    // stale Expect can make the backend re-negotiate and 404 the request.
+    delete headers['expect'];
+
     // A before() hook can supply a replacement request body even on the streaming
     // path: the plugin produced those bytes itself (it never needed the client's
     // body), so we send them with an explicit Content-Length rather than piping
@@ -1346,8 +1361,14 @@ class ProxyServer {
     // transfer-encoding — when we pipe the body, Node re-frames it itself (fixed
     // length if Content-Length is present, otherwise chunked), so forwarding the
     // inbound framing header would risk a duplicate/conflicting one.
+    //
+    // 'expect' (100-continue) is stripped too: our own HTTP server already
+    // answered 100 Continue to the client (Node's default) before this handler
+    // ran, so the continue handshake is finished. Forwarding a stale Expect would
+    // make the backend negotiate a second 100 — which breaks some app servers
+    // (observed as a spurious 404) and can emit a duplicate 100 to the client.
     const hopByHop = new Set(['connection', 'keep-alive', 'proxy-authenticate',
-      'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+      'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'expect']);
     const headers = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (!hopByHop.has(k.toLowerCase())) headers[k] = v;
@@ -1394,6 +1415,7 @@ class ProxyServer {
 
       const port = ordered[idx];
       let committed = false; // true once TCP connect succeeds and the body starts flowing
+      let bodySent  = false; // true once the whole request body has been flushed upstream
 
       const proxyReq = lib.request({
         hostname: backendUrl.hostname,
@@ -1420,7 +1442,13 @@ class ProxyServer {
       proxyReq.on('socket', (socket) => {
         const onConnect = () => {
           committed = true;
-          socket.setTimeout(responseTimeoutMs);
+          // Clear the connect deadline. Do NOT arm a response timeout yet: a large
+          // upload sends data for minutes while receiving nothing back, and a
+          // socket idle-timer is only reset by *inbound* bytes — so a response
+          // timeout here would falsely kill any upload slower than the timeout
+          // (the "Response timeout on a healthy backend" bug). The response
+          // deadline is armed only once the whole body has been flushed (below).
+          socket.setTimeout(0);
           // Connection established — now (and only now) start streaming the body.
           req.pipe(proxyReq);
         };
@@ -1433,9 +1461,20 @@ class ProxyServer {
         }
       });
 
+      // Body fully sent → now bound how long we wait for the backend to start
+      // responding. Until this fires, the upload is free to take as long as it
+      // needs (multi-GB / slow links included).
+      proxyReq.on('finish', () => {
+        bodySent = true;
+        if (proxyReq.socket) proxyReq.socket.setTimeout(responseTimeoutMs);
+      });
+
       proxyReq.on('timeout', () => {
-        // Treat a connect-phase timeout like a connect failure (failover-safe).
-        proxyReq.destroy(new Error(committed ? 'Response timeout' : 'Connect timeout'));
+        // Before connect → connect-phase timeout (failover-safe). After the body
+        // is sent → the backend is genuinely unresponsive (surface, no failover).
+        // While the body is still uploading the timeout is disabled, so we never
+        // get here mid-upload.
+        proxyReq.destroy(new Error(committed && bodySent ? 'Response timeout' : 'Connect timeout'));
       });
 
       proxyReq.on('error', (err) => {
