@@ -53,6 +53,22 @@ function strictBackend() {
   return srv;
 }
 
+// Reads the body SLOWLY: pauses after each chunk so the upload is throttled and
+// backpressure propagates up the chain (the proxy ends up pausing the client
+// request). This is the scenario that broke 1.0.24 — an active-but-paused upload.
+function throttledBackend(tickMs = 60) {
+  const srv = http.createServer((req, res) => {
+    let bytes = 0;
+    req.on('data', c => {
+      bytes += c.length;
+      req.pause();
+      setTimeout(() => req.resume(), tickMs);
+    });
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(String(bytes)); });
+  });
+  return srv;
+}
+
 async function makeProxy(dir, backPort, pluginMgr) {
   // Start from a clean dir every time: the SQLite mapping DB persists on disk, so
   // a leftover file from a previous run would resurrect stale mappings (pointing
@@ -259,6 +275,41 @@ describe('streaming HA response timeout', () => {
       await ha.proxy.stop(); await close(backend);
     }
   }, 30000);
+
+  test('backpressure: a slow backend that pauses the upload does NOT trip the idle timeout', async () => {
+    // THE production regression (the 504-mid-upload bug). A throttled backend
+    // forces pipe() to PAUSE the client request for long stretches, so req 'data'
+    // events go silent even though bytes are pouring out to the backend. The idle
+    // monitor watches the backend socket's byte counters (which keep advancing)
+    // instead, so the actively-transferring stream — here ~3 s, well past the 2 s
+    // idle window — must NOT be torn down. (With the old 'data'-event reset this
+    // returned 504 while the upload was still flowing.)
+    // Margins (all comfortably separated so the test isn't timing-flaky):
+    //   transfer (~7-9 s, throttle-paced) ≫ idle window (3 s) ≫ post-delivery
+    //   tail (~1.5 s, the kernel buffer the backend drains after our last write).
+    process.env.STREAM_IDLE_TIMEOUT_MS = '3000';
+    const backend = throttledBackend(10);
+    const bport = await listen(backend);
+    const ha = await makeProxy(path.join(dir, 'backpressure'), null);
+    await ha.proxy.db.addMapping('bp.test', '', String(bport), '');
+    try {
+      const body = Buffer.alloc(40 * 1024 * 1024); // throttled reads make this take well over the idle window
+      const started = Date.now();
+      const r = await new Promise((resolve) => {
+        const req = http.request({ hostname: 'localhost', port: ha.port, path: '/upload', method: 'POST',
+          headers: { Host: 'bp.test', 'content-type': 'application/octet-stream', 'content-length': body.length } },
+          res => { let b = ''; res.on('data', c => b += c); res.on('end', () => resolve({ status: res.statusCode, body: b })); });
+        req.on('error', e => resolve({ status: 'ERR', body: e.message }));
+        req.end(body);
+      });
+      const elapsed = Date.now() - started;
+      expect(r.status).toBe(200);
+      expect(Number(r.body)).toBe(body.length);
+      expect(elapsed).toBeGreaterThan(3000); // outlived the idle window while actively transferring
+    } finally {
+      await ha.proxy.stop(); await close(backend);
+    }
+  }, 40000);
 
   test('a genuinely idle connection (no data either way) is torn down', async () => {
     // Reads the whole body, then goes silent forever. With nothing moving in

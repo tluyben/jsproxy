@@ -1410,14 +1410,21 @@ class ProxyServer {
     }
 
     const connectTimeoutMs = parseInt(process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
-    // Idle timeout: the ONLY deadline once a backend is connected. It is reset on
-    // every chunk in EITHER direction — upload progress (client→backend) AND
-    // download progress (backend→client) — so an actively-moving stream never
-    // trips it: a multi-GB upload, a slow-but-steady download, a long-lived SSE
-    // feed all keep resetting it. It fires only when nothing has moved either way
-    // for idleMs, i.e. a genuinely stalled connection. A timeout is for when
-    // NOTHING is happening — not for a stream that is busy transferring.
+    // Idle timeout: the ONLY deadline once a backend is connected. "Idle" is
+    // measured directly from real byte movement on the backend socket —
+    // bytesWritten (upload progress, client→backend) PLUS bytesRead (download
+    // progress, backend→client). As long as either counter advances, the stream
+    // is active and is never torn down: a multi-GB upload, a slow-but-steady
+    // download, a long-lived SSE feed all keep it alive. It fires only when
+    // NOTHING has moved either way for idleMs — a genuinely stalled connection.
+    //
+    // Why poll the socket counters instead of listening to 'data' events: under
+    // backpressure (a slow backend), pipe() PAUSES the client request, so
+    // req.on('data') goes silent for long stretches even though bytes are pouring
+    // out to the backend. The socket's bytesWritten still advances, so polling it
+    // sees the real activity that 'data' events miss.
     const idleMs = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '120000', 10);
+    const pollMs = Math.max(250, Math.min(Math.floor(idleMs / 4), 30000));
     const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
 
     // Hold the body until a backend connection is committed. Nothing is read from
@@ -1427,20 +1434,30 @@ class ProxyServer {
     const span = req._span;
     let currentProxyReq = null;
     let idleTimer = null;
+    let lastBytes = -1;
+    let idleElapsed = 0;
     const onIdle = () => {
-      this.logger.warn('HA stream idle timeout — no data in either direction', {
+      this.logger.warn('HA stream idle timeout — no bytes moved in either direction', {
         domain: mapping.domain, url: req.url, idle_ms: idleMs,
       });
       if (currentProxyReq) currentProxyReq.destroy(new Error('Idle timeout'));
       if (!res.headersSent) { res.writeHead(504, { 'Content-Type': 'text/plain' }); res.end('Gateway Timeout'); }
       else if (!res.writableEnded) res.destroy();
     };
-    const resetIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(onIdle, idleMs);
+    const clearIdle = () => { if (idleTimer) { clearInterval(idleTimer); idleTimer = null; } };
+    const startIdleMonitor = () => {
+      clearIdle();
+      lastBytes = -1;
+      idleElapsed = 0;
+      idleTimer = setInterval(() => {
+        const sock = currentProxyReq && currentProxyReq.socket;
+        const cur = sock ? (sock.bytesRead + sock.bytesWritten) : lastBytes;
+        if (cur !== lastBytes) { lastBytes = cur; idleElapsed = 0; return; } // active
+        idleElapsed += pollMs;
+        if (idleElapsed >= idleMs) { clearIdle(); onIdle(); }
+      }, pollMs);
       if (idleTimer.unref) idleTimer.unref();
     };
-    const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
 
     // If the client aborts the upload, tear down whichever backend request is live.
     req.on('error', () => { clearIdle(); if (currentProxyReq) currentProxyReq.destroy(); });
@@ -1483,7 +1500,8 @@ class ProxyServer {
           if (!skip.has(k.toLowerCase())) fwd[k] = v;
         }
         res.writeHead(proxyRes.statusCode, fwd);
-        proxyRes.on('data', resetIdle);          // download progress = activity
+        // Download progress keeps the idle monitor satisfied via the socket's
+        // bytesRead counter; stop monitoring once the response completes.
         proxyRes.on('end', clearIdle);
         proxyRes.pipe(res);
         proxyRes.on('error', () => { clearIdle(); if (!res.writableEnded) res.destroy(); });
@@ -1500,9 +1518,8 @@ class ProxyServer {
           // bytes and so would wrongly kill a long upload that sends but never
           // receives until the very end.
           socket.setTimeout(0);
-          resetIdle();
+          startIdleMonitor();   // watch real bytes on this socket, both directions
           req.pipe(proxyReq);
-          req.on('data', resetIdle);             // upload progress = activity
         };
         if (socket.connecting) {
           socket.setTimeout(connectTimeoutMs);
