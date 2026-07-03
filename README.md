@@ -80,6 +80,10 @@ HTTPS_PORT=8443                    # HTTPS port (default: 8443 dev, 443 prod)
 HTTP_HOST=0.0.0.0                  # Bind address (default: 0.0.0.0)
 ENABLE_HTTPS=true|false            # Enable HTTPS (default: false dev, true prod)
 FORCE_HTTPS=true                   # Redirect all HTTP → HTTPS (default: false)
+TRUSTED_PROXIES=private            # Proxies whose X-Forwarded-* headers to trust
+                                   #   (default: empty = trust none / edge posture).
+                                   #   Comma list of CIDRs/IPs, or keywords
+                                   #   `loopback` / `private` / `all`.
 DB_PATH=./data/current.db          # Path to SQLite database file
 
 # Logging
@@ -230,12 +234,25 @@ Supported formats (comma-separated):
 | CIDR range | `192.168.1.0/24` | 192.168.1.0 – 192.168.1.255 |
 | Mixed | `10.0.0.5,192.168.0.0/16` | Both |
 
-Works transparently behind nginx — the real client IP is read from the `X-Forwarded-For` header when present, falling back to the direct socket address.
+The client IP checked against the allowlist is resolved securely: by default (no
+`TRUSTED_PROXIES`) it is the **direct socket peer**, so a client cannot bypass an
+allowlist by forging an `X-Forwarded-For` header. When this instance sits *behind*
+another proxy (nginx, or an upstream jsproxy hop), set `TRUSTED_PROXIES` to that
+proxy's address(es) so the real client is resolved from the forwarded chain —
+jsproxy walks `X-Forwarded-For` right-to-left, skipping trusted hops, and uses the
+first non-trusted address.
 
 ```bash
+# This jsproxy runs behind nginx on the same host → trust the loopback hop.
+TRUSTED_PROXIES=loopback
+
 # Nginx config — pass the real client IP through
 proxy_set_header X-Forwarded-For $remote_addr;
 ```
+
+`TRUSTED_PROXIES` also gates whether inbound `X-Forwarded-Proto` / `-Ssl` /
+`Front-End-Https` are believed (for `FORCE_HTTPS` and the proto forwarded
+upstream) — an untrusted client can't claim `https` over a plaintext connection.
 
 ```sql
 -- Restrict admin panel to office subnet + one jump host

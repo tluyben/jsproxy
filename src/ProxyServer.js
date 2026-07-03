@@ -22,6 +22,14 @@ class ProxyServer {
     this.rrCounters   = new Map();  // mappingId -> rotation counter (tie-break)
     this.bgChecks     = new Set();  // keys currently being TCP-probed
 
+    // Proxies whose X-Forwarded-* headers we believe. Default: EMPTY — the secure
+    // "edge" posture: the client IP is always the real socket peer and inbound
+    // X-Forwarded-For / X-Forwarded-Proto are ignored for auth, so a client can't
+    // spoof its IP or scheme. On INTERNAL hops that sit behind other trusted
+    // proxies, set TRUSTED_PROXIES to a comma list of CIDRs/IPs or the keywords
+    // `loopback` / `private` / `all` so the real client is resolved from the chain.
+    this.trustedProxies = this._parseTrustedProxies(process.env.TRUSTED_PROXIES || '');
+
     // proxyTimeout is the outbound (proxy → backend) socket idle timeout used
     // by the streamed HA / SSE path. Default 30s, override via the same env
     // var the buffered HA path consults so both paths agree on how long a
@@ -36,7 +44,17 @@ class ProxyServer {
       changeOrigin: true,
       timeout: incomingTimeoutMs,
       proxyTimeout: proxyTimeoutMs,
-      xfwd: true  // Automatically adds X-Forwarded-For, X-Forwarded-Port, X-Forwarded-Proto
+      // xfwd is deliberately OFF. http-proxy's xfwd only covers the proxy.web /
+      // proxy.ws paths; the buffered-HA, streaming-HA and plugin paths use raw
+      // lib.request and never saw it, so X-Forwarded-For was set on only 2 of 5
+      // paths. We instead append the real socket peer to X-Forwarded-For at a
+      // single chokepoint (_handleRequest / handleWebSocket) that EVERY path
+      // copies from — guaranteeing the client IP propagates identically down a
+      // chain of jsproxy hops. Leaving xfwd on would double-append on proxy.web.
+      // (X-Forwarded-Proto/Host are still set per-path; X-Forwarded-Port, which
+      // was xfwd-only and never sent by the other 3 paths, is intentionally
+      // dropped so all paths now emit an identical forwarded-header set.)
+      xfwd: false
     });
     
     this.httpServer = null;
@@ -55,7 +73,7 @@ class ProxyServer {
         // Falls back to the original Host when unset → unchanged behavior.
         proxyReq.setHeader('Host', req._proxyBackHost || originalHost);
       }
-      const protocol = req.connection.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+      const protocol = this.isClientHttps(req) ? 'https' : 'http';
       proxyReq.setHeader('X-Forwarded-Proto', protocol);
 
       // Our HTTP server already answered any Expect: 100-continue to the client
@@ -491,13 +509,11 @@ class ProxyServer {
         return;
       }
 
-      // Redirect HTTP to HTTPS if FORCE_HTTPS is enabled
-      // Check multiple headers set by reverse proxies (nginx, caddy, cloudflare, haproxy, etc.)
-      const isSecure = isHttps ||
-        req.connection.encrypted ||
-        req.headers['x-forwarded-proto'] === 'https' ||
-        req.headers['x-forwarded-ssl'] === 'on' ||
-        req.headers['front-end-https'] === 'on';
+      // Redirect HTTP to HTTPS if FORCE_HTTPS is enabled. The forwarded scheme
+      // headers (X-Forwarded-Proto / -Ssl / Front-End-Https, set by nginx, caddy,
+      // cloudflare, haproxy, etc.) are honored only when the immediate peer is a
+      // trusted proxy — see isClientHttps.
+      const isSecure = isHttps || this.isClientHttps(req);
       if (!isSecure && process.env.FORCE_HTTPS === 'true') {
         const host = req.headers.host;
         const httpsPort = process.env.HTTPS_PORT || (process.env.NODE_ENV === 'production' ? 443 : 8443);
@@ -532,6 +548,17 @@ class ProxyServer {
       // streaming HA path, and the plugin paths alike. A downstream app that sees a
       // stale Expect has been observed to reject the upload with 404.
       delete req.headers['expect'];
+
+      // Append this hop's real socket peer to X-Forwarded-For at the SAME single
+      // chokepoint, BEFORE any forward path runs, so proxy.web, buffered HA,
+      // streaming HA and the plugin paths all forward one identical, correct
+      // chain (each path copies from req.headers). We append req.socket's peer
+      // (getPeerIp) rather than trusting an inbound value: when a browser hits
+      // the first jsproxy directly there is no inbound XFF, so its IP becomes the
+      // leftmost entry and stays leftmost through every subsequent jsproxy hop —
+      // the backend always reads the true client as the first XFF token. Done
+      // once per request (never in a per-port retry), so failover can't duplicate.
+      this._appendForwardedFor(req);
 
       if (process.env.LOG_LEVEL === 'debug') {
         this.logger.debug('incoming request', {
@@ -727,6 +754,16 @@ class ProxyServer {
       if (mapping.front_uri || mapping.back_uri) {
         req.url = this.buildTargetPath(mapping, req.url);
       }
+
+      // WebSocket upgrades bypass _handleRequest, so apply the same forwarded
+      // headers here (xfwd is off — see createProxyServer). proxy.ws forwards
+      // req.headers verbatim, so setting them here reaches the backend. Append
+      // this hop's peer to X-Forwarded-For (original client stays leftmost down a
+      // chain) and preserve X-Forwarded-Proto (was xfwd-provided); also record
+      // X-Forwarded-Host, which the WS path never sent before.
+      this._appendForwardedFor(req);
+      req.headers['x-forwarded-proto'] = this.isClientHttps(req) ? 'https' : 'http';
+      if (!req.headers['x-forwarded-host']) req.headers['x-forwarded-host'] = req.headers.host || '';
 
       const backend = mapping.backend || 'http://localhost';
       const target = `${backend}:${mapping.back_port}`;
@@ -1400,14 +1437,10 @@ class ProxyServer {
     }
     if (!headers['x-forwarded-host']) headers['x-forwarded-host'] = req.headers['host'] || '';
     headers['host'] = mapping.back_host || req.headers['host'] || `${backendUrl.hostname}`;
-    const proto = req.connection.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
-    headers['x-forwarded-proto'] = proto;
-    const clientIp = this.getClientIp(req);
-    if (clientIp) {
-      headers['x-forwarded-for'] = req.headers['x-forwarded-for']
-        ? `${req.headers['x-forwarded-for']}, ${clientIp}`
-        : clientIp;
-    }
+    headers['x-forwarded-proto'] = this.isClientHttps(req) ? 'https' : 'http';
+    // X-Forwarded-For is already correct here: the header-copy loop above carried
+    // it over from req.headers, where _handleRequest appended this hop's peer at
+    // the single chokepoint. Re-appending would duplicate the peer entry.
 
     const connectTimeoutMs = parseInt(process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
     // Idle timeout: the ONLY deadline once a backend is connected. "Idle" is
@@ -1653,13 +1686,50 @@ class ProxyServer {
 
   // ── IP allowlist helpers ───────────────────────────────────────────────────
 
+  // The ORIGINAL client IP, resolved against the trusted-proxy set. Start from the
+  // real socket peer (unspoofable); only if that peer is a trusted proxy do we
+  // believe X-Forwarded-For, walking it right-to-left and skipping further trusted
+  // hops — the first non-trusted address is the true client. With no trusted
+  // proxies configured (default edge posture) inbound XFF is ignored entirely and
+  // the socket peer wins, so a client cannot spoof its IP via X-Forwarded-For.
   getClientIp(req) {
+    const peer = this.getPeerIp(req);
+    if (!this._isTrusted(peer)) return peer;
     const xff = req.headers['x-forwarded-for'];
-    if (xff) return xff.split(',')[0].trim();
+    const chain = xff ? xff.split(',').map(s => s.trim()).filter(Boolean) : [];
+    chain.push(peer); // peer is this hop's real socket — the most trustworthy entry
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const ip = chain[i].startsWith('::ffff:') ? chain[i].slice(7) : chain[i];
+      if (!this._isTrusted(ip)) return ip;
+    }
+    // Whole chain is trusted (e.g. the real client is itself inside a trusted
+    // range): fall back to the leftmost claimed address.
+    const first = chain[0];
+    return first.startsWith('::ffff:') ? first.slice(7) : first;
+  }
+
+  // The immediate TCP peer (this hop's client socket) — NEVER a header value, so
+  // it can't be spoofed. This is the IP we append to X-Forwarded-For at each hop.
+  // Distinct from getClientIp(), which reports the ORIGINAL client (leftmost XFF)
+  // for allowlist / telemetry / webhook use.
+  getPeerIp(req) {
     const addr = req.socket && req.socket.remoteAddress;
     // Strip IPv6-mapped IPv4 prefix (::ffff:1.2.3.4 -> 1.2.3.4)
     if (addr && addr.startsWith('::ffff:')) return addr.slice(7);
     return addr;
+  }
+
+  // Append this hop's real socket peer to X-Forwarded-For on req.headers so every
+  // downstream forward path (all of which copy from req.headers) carries the same
+  // chain. Preserves any inbound XFF (prior hops) and appends the true peer, so a
+  // chain user -> jsproxy1 -> jsproxy2 -> backend yields "user, jsproxy1-peer" at
+  // the backend with the original client always leftmost. Call exactly once per
+  // request, before any forward path / retry loop.
+  _appendForwardedFor(req) {
+    const peerIp = this.getPeerIp(req);
+    if (!peerIp) return;
+    const existing = req.headers['x-forwarded-for'];
+    req.headers['x-forwarded-for'] = existing ? `${existing}, ${peerIp}` : peerIp;
   }
 
   isIpAllowed(clientIp, allowedIps) {
@@ -1683,6 +1753,47 @@ class ProxyServer {
 
   _ipToInt(ip) {
     return ip.split('.').reduce((acc, octet) => (acc * 256) + parseInt(octet, 10), 0) >>> 0;
+  }
+
+  // Compile TRUSTED_PROXIES into a list of (ip)->bool predicates. Accepts IPv4
+  // CIDRs / literal IPs and the keywords `loopback`, `private`, `all`.
+  _parseTrustedProxies(spec) {
+    const preds = [];
+    const cidr  = (c) => (ip) => this._ipInCidr(ip, c);
+    const exact = (a) => (ip) => ip === a;
+    const ula   = () => (ip) => /^f[cd]/i.test(ip);          // IPv6 unique-local fc00::/7
+    const loopback = [cidr('127.0.0.0/8'), exact('::1')];
+    for (const raw of spec.split(',').map(s => s.trim()).filter(Boolean)) {
+      switch (raw.toLowerCase()) {
+        case 'all':      preds.push(() => true); break;
+        case 'loopback': preds.push(...loopback); break;
+        case 'private':  preds.push(...loopback,
+                           cidr('10.0.0.0/8'), cidr('172.16.0.0/12'),
+                           cidr('192.168.0.0/16'), ula()); break;
+        default:         preds.push(raw.includes('/') ? cidr(raw) : exact(raw));
+      }
+    }
+    return preds;
+  }
+
+  // True when `ip` belongs to a configured trusted proxy. Always false when the
+  // trusted set is empty (edge posture) — the safe default.
+  _isTrusted(ip) {
+    if (!ip || !this.trustedProxies || this.trustedProxies.length === 0) return false;
+    const norm = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+    return this.trustedProxies.some(pred => pred(norm));
+  }
+
+  // Whether the ORIGINAL client reached us over HTTPS. Believes inbound
+  // X-Forwarded-Proto / -Ssl / Front-End-Https ONLY when the immediate peer is a
+  // trusted proxy; otherwise derives purely from this hop's own TLS socket, so a
+  // plaintext client can't claim https by sending a forwarded header.
+  isClientHttps(req) {
+    if (req.connection && req.connection.encrypted) return true;
+    if (!this._isTrusted(this.getPeerIp(req))) return false;
+    return req.headers['x-forwarded-proto'] === 'https'
+        || req.headers['x-forwarded-ssl']   === 'on'
+        || req.headers['front-end-https']   === 'on';
   }
 
   // ── Webhook interceptor ───────────────────────────────────────────────────
