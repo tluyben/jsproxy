@@ -108,6 +108,12 @@ WEBHOOK_SECRET=<secret>            # HMAC-SHA256 signing secret for X-Webhook-Si
 # Plugin system
 PLUGIN=localhost:3001,localhost:3002  # Plugin endpoints (optional, see Plugin System)
 PLUGIN_TIMEOUT=5000                # Per-plugin HTTP call timeout in ms (default: 5000)
+
+# Preflight header rewrite
+PREFLIGHT_SCRIPT=/path/to/preflight.js  # Script that rewrites/inspects request
+                                   #   headers before routing (see Preflight
+                                   #   Header Rewrite). Also settable via the
+                                   #   --preflight-script=/path/to/preflight.js CLI flag.
 ```
 
 ## Configuration
@@ -353,6 +359,75 @@ Each entry in the `auth_credentials` JSON array supports these fields:
 | `uses` | managed automatically | Running use count (do not set manually) |
 
 Changes are active immediately — no proxy restart needed.
+
+## Preflight Header Rewrite
+
+The proxy can run a **user-supplied script** against every request's headers
+*before* routing happens. Because it runs before the domain is resolved and the
+mapping is looked up, the script can change the `Host` header (and any other
+header) to influence which backend the request is routed to — useful, for
+example, when a CDN fronts your traffic and the real target hostname arrives in
+a forwarded header rather than in `Host`.
+
+The script is **loaded once at startup** and called synchronously per request.
+
+### Enabling it
+
+Point at a script via an environment variable or a CLI flag (env var wins if both are set):
+
+```bash
+# Environment variable
+PREFLIGHT_SCRIPT=/etc/jsproxy/preflight.js
+
+# …or CLI flag
+node index.js --preflight-script=/etc/jsproxy/preflight.js
+```
+
+If the path is unset, the script fails to load, or it doesn't export a function,
+the proxy simply runs without a preflight step (it logs the reason and continues).
+
+### Writing the script
+
+The module must export **either a function directly or an object with a `main`
+function**. The function receives the request's headers object and returns one
+of three things:
+
+| Return value | Effect |
+|--------------|--------|
+| An object | Replaces `req.headers` with the returned object; request continues to routing |
+| `null` | Declines the request — the client receives `403 Forbidden` |
+| Anything else (e.g. `undefined`) | Headers left unchanged; request continues |
+
+If the script **throws**, the proxy **fails open**: the error is logged and the
+request continues with its original headers, so a bug in the script can't
+blackhole traffic. The health check and ACME (`/.well-known/acme-challenge/`)
+endpoints are intentionally exempt and never run the preflight script.
+
+```js
+// /etc/jsproxy/preflight.js
+
+// Export a function directly…
+module.exports = function (headers) {
+  // Route CDN-fronted traffic by the hostname the CDN forwarded to us.
+  const forwarded = headers['x-forwarded-host'];
+  if (forwarded) {
+    headers['host'] = forwarded;
+  }
+
+  // Decline requests missing a required header.
+  if (!headers['x-tenant-id']) {
+    return null; // → 403 Forbidden
+  }
+
+  return headers; // apply the rewritten headers
+};
+
+// …or export an object with a `main` function:
+// module.exports = { main(headers) { /* … */ return headers; } };
+```
+
+The rewrite runs **first** in the request pipeline, so any `Host` change it makes
+is what IP allowlisting, auth, the webhook, and plugins all see.
 
 ## Webhook Interceptor
 
@@ -781,18 +856,19 @@ Master Process
 ### Request Flow
 
 1. **Request Reception**: Worker receives HTTP/HTTPS request
-2. **Domain Resolution**: Extract domain from Host header
-3. **Database Query**: Find matching mapping by domain + URI
-4. **IP Check**: If `allowed_ips` is set, verify client IP — return `403` if not allowed
-5. **Parallel work** (runs concurrently):
+2. **Preflight rewrite** (if `PREFLIGHT_SCRIPT` set): run the user script against the request headers — may rewrite them (e.g. change `Host`), decline the request (`403`), or leave them unchanged (fails open on error)
+3. **Domain Resolution**: Extract domain from Host header
+4. **Database Query**: Find matching mapping by domain + URI
+5. **IP Check**: If `allowed_ips` is set, verify client IP — return `403` if not allowed
+6. **Parallel work** (runs concurrently):
    - **SSL Handling**: Ensure certificate exists for HTTPS requests
    - **Webhook** (if `WEBHOOK_URL` set): POST request metadata, await decision
-6. **Webhook gate**: Redirect or block based on webhook response; continue on `200`
-7. **Plugin `/valid`** (if `PLUGIN` set): fan-out to all plugins in parallel — each opts in or out; if none opt in, step 8–10 are skipped entirely
-8. **Plugin `/before`**: interested plugins called in order; can rewrite, cancel, or ignore the request
-9. **Proxy Forward**: Forward request to backend service (with any rewrites applied)
-10. **Plugin `/after`**: interested plugins called in order; can rewrite or cancel the response
-11. **Response Return**: Send response to client
+7. **Webhook gate**: Redirect or block based on webhook response; continue on `200`
+8. **Plugin `/valid`** (if `PLUGIN` set): fan-out to all plugins in parallel — each opts in or out; if none opt in, step 9–11 are skipped entirely
+9. **Plugin `/before`**: interested plugins called in order; can rewrite, cancel, or ignore the request
+10. **Proxy Forward**: Forward request to backend service (with any rewrites applied)
+11. **Plugin `/after`**: interested plugins called in order; can rewrite or cancel the response
+12. **Response Return**: Send response to client
 
 ### Error Handling
 

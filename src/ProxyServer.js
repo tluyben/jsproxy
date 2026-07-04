@@ -30,6 +30,13 @@ class ProxyServer {
     // `loopback` / `private` / `all` so the real client is resolved from the chain.
     this.trustedProxies = this._parseTrustedProxies(process.env.TRUSTED_PROXIES || '');
 
+    // Optional preflight header rewrite. A user-supplied script, loaded once,
+    // gets each request's headers BEFORE mapping/routing and returns either a
+    // replacement header object or null to decline the request. Enables e.g.
+    // routing CDN-fronted traffic by a forwarded hostname header. Configure with
+    // PREFLIGHT_SCRIPT=/path/to/script.js or --preflight-script=/path/to/script.js
+    this.preflight = this._loadPreflight();
+
     // proxyTimeout is the outbound (proxy → backend) socket idle timeout used
     // by the streamed HA / SSE path. Default 30s, override via the same env
     // var the buffered HA path consults so both paths agree on how long a
@@ -472,6 +479,30 @@ class ProxyServer {
     return otelContext.with(trace.setSpan(parentCtx, span), () => this._handleRequest(req, res, isHttps));
   }
 
+  // Load the optional preflight header-rewrite script. Accepts a module that
+  // exports a function directly, or an object with a `main` function. Returns
+  // the function (called as fn(headers)) or null when not configured/loadable.
+  _loadPreflight() {
+    const argv = process.argv.find(a => a.startsWith('--preflight-script='));
+    const scriptPath = process.env.PREFLIGHT_SCRIPT || (argv ? argv.split('=').slice(1).join('=') : '');
+    if (!scriptPath) return null;
+    try {
+      const path = require('path');
+      const resolved = path.resolve(scriptPath);
+      const mod = require(resolved);
+      const fn = typeof mod === 'function' ? mod : (mod && typeof mod.main === 'function' ? mod.main : null);
+      if (typeof fn !== 'function') {
+        this.logger.error(`Preflight script ${resolved} must export a function or { main }`);
+        return null;
+      }
+      this.logger.info(`Preflight header script loaded: ${resolved}`);
+      return fn;
+    } catch (err) {
+      this.logger.error(`Failed to load preflight script: ${err.message}`);
+      return null;
+    }
+  }
+
   async _handleRequest(req, res, isHttps) {
     try {
       // Health check endpoint
@@ -507,6 +538,27 @@ class ProxyServer {
           res.end('Challenge not found');
         }
         return;
+      }
+
+      // Preflight header rewrite (runs before routing so it can change the Host
+      // used for mapping — e.g. adopt a CDN's forwarded hostname). Returning null
+      // declines the request; a returned object replaces req.headers. A thrown
+      // error fails open (headers left unchanged) so a script bug can't blackhole
+      // traffic. ACME/health above are intentionally exempt.
+      if (this.preflight) {
+        let rewritten;
+        try {
+          rewritten = this.preflight(req.headers);
+        } catch (err) {
+          this.logger.warn(`preflight script error (fail-open): ${err.message}`);
+          rewritten = req.headers;
+        }
+        if (rewritten === null) {
+          res.writeHead(403, { 'Content-Type': 'text/plain' });
+          res.end('Forbidden');
+          return;
+        }
+        if (rewritten && typeof rewritten === 'object') req.headers = rewritten;
       }
 
       // Redirect HTTP to HTTPS if FORCE_HTTPS is enabled. The forwarded scheme
