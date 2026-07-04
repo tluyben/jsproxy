@@ -27,6 +27,7 @@
     "docker:dev": "docker-compose --profile dev up jsproxy-dev",
     "docker:prod": "docker-compose up jsproxy",
     "docker:tools": "docker-compose --profile tools up",
+    "build:caxa": "node scripts/build-caxa.js",
     "build:linux-x86": "pkg . --target node20-linux-x64 --output dist/jsproxy-linux-x86",
     "build:linux-arm": "pkg . --target node20-linux-arm64 --output dist/jsproxy-linux-arm",
     "build:macosx-arm": "pkg . --target node20-macos-arm64 --output dist/jsproxy-macosx-arm",
@@ -70,6 +71,7 @@
   },
   "devDependencies": {
     "@yao-pkg/pkg": "^5.12.0",
+    "caxa": "^3.0.1",
     "eslint": "^8.57.0",
     "eslint-config-standard": "^17.1.0",
     "eslint-plugin-import": "^2.29.1",
