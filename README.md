@@ -127,9 +127,11 @@ CREATE TABLE mappings (
   id TEXT PRIMARY KEY,           -- UUID
   domain TEXT NOT NULL,          -- Frontend domain (e.g., "api.example.com")
   front_uri TEXT NOT NULL,       -- Frontend URI path (e.g., "v1/users")
-  back_port TEXT NOT NULL,       -- Backend port (e.g., 3000); comma-separated for HA (e.g., "3000,3001,3002")
+  back_port TEXT NOT NULL,       -- Backend port (e.g., 3000); comma-separated for multi-port HA (e.g., "3000,3001,3002")
   back_uri TEXT NOT NULL,        -- Backend URI path (e.g., "api/v1/users")
-  backend TEXT DEFAULT NULL,     -- Backend server URL (e.g., "https://api.example.com", defaults to "http://localhost")
+  backend TEXT DEFAULT NULL,     -- Backend server URL (e.g., "https://api.example.com", defaults to "http://localhost");
+                                 --   comma-separated list of URLs for multi-host HA (see High Availability)
+  back_host TEXT DEFAULT NULL,   -- Overrides the Host header sent upstream (all backends); NULL = forward the front Host
   allowed_ips TEXT DEFAULT NULL,       -- IP allowlist: comma-separated IPs/CIDRs; NULL or empty = allow all
   auth_type TEXT DEFAULT NULL,         -- Auth mode: 'basic', 'bearer', 'password', or NULL (no auth)
   auth_credentials TEXT DEFAULT NULL,  -- JSON array of credential objects (see Auth Protection section)
@@ -619,25 +621,73 @@ See [`docs/plugins.md`](docs/plugins.md) for the full API reference, plugin auth
 
 ## High Availability / Load Balancing
 
-Set `back_port` to a comma-separated list of ports to enable HA mode for a mapping.
+HA mode balances/fails a mapping over a set of interchangeable backends. There are
+**two ways** to describe that set — pick whichever matches your topology:
+
+| Mode | Trigger | The set is… |
+|------|---------|-------------|
+| **Multi-port** | a comma in **`back_port`** | multiple ports on the **one** `backend` host |
+| **Multi-host** | a comma in **`backend`** | multiple **distinct backend URLs** (different hosts, each with its own scheme/port) |
+
+Both use the **same** score-based failover engine; the only difference is the unit
+that fails over (a port vs. a whole host).
 
 **Behaviour per request:**
 
-1. Ports are ranked by a **score** (0–100, default 100). A successful response boosts the port to 100; a connection failure drops it to 0.
-2. Ports are tried **best-score-first** (round-robin as a tie-breaker). The first port that responds at any HTTP status code wins immediately.
-3. On a connection failure, the port is penalized (score → 0), a **background TCP probe** starts (retries every 5 s with a 3 s socket timeout), and the next port is tried.
-4. When the probe succeeds, the port's score is restored to 50 so it gets one real-request trial before being fully trusted again.
-5. If **all** ports fail, returns `502 Bad Gateway` and logs `error: all backends unavailable` with the domain and port list.
+1. Backends are ranked by a **score** (0–100, default 100). A successful response boosts it to 100; a connection failure drops it to 0.
+2. Backends are tried **best-score-first** (round-robin as a tie-breaker). The first one that responds at any HTTP status code wins immediately.
+3. On a connection failure, that backend is penalized (score → 0), a **background TCP probe** starts (retries every 5 s with a 3 s socket timeout), and the next backend is tried.
+4. When the probe succeeds, the backend's score is restored to 50 so it gets one real-request trial before being fully trusted again.
+5. If **all** backends fail, returns `502 Bad Gateway` and logs `error: all backends unavailable` with the domain and backend list.
 
-Each individual backend attempt has a **10 s timeout**. SSE and other streaming requests (`Accept: text/event-stream`) skip the buffered failover path and stream directly via one round-robin selected port.
+Each individual backend attempt has a **10 s timeout**. SSE and other streaming requests (`Accept: text/event-stream`) skip the buffered failover path and stream directly via one round-robin selected backend (connect-phase failover only).
+
+### Multi-port (one host, many ports)
 
 ```sql
--- HA mapping: domain.com balanced across three local ports
+-- domain.com balanced across three ports on the default backend host (localhost)
 INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
-VALUES ('550e8400-e29b-41d4-a716-446655440003', 'ha.example.com', '', '3000,3001,3002', '', NULL);
+VALUES ('…-0003', 'ha.example.com', '', '3000,3001,3002', '', NULL);
 ```
 
-> **WebSocket**: always uses a single port (the first ranked port). HA applies to HTTP/HTTPS only.
+### Multi-host (many distinct backends)
+
+Put a **comma-separated list of full backend URLs** in `backend`. Each URL carries
+its own scheme and (optional) port:
+
+- Port precedence per entry: **explicit port in the URL** → else a single numeric `back_port` as a shared fallback → else the scheme default (`443`/`80`).
+- Failover state is tracked **per `host:port`**, so each distinct backend is probed and scored independently.
+
+```sql
+-- api.example.com fails over across two separate upstream hosts
+INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend)
+VALUES ('…-0004', 'api.example.com', '', '', '',
+        'https://server1.internal:8443,https://server2.internal:8443');
+```
+
+#### The Host header sent upstream (important)
+
+The `Host` header forwarded to the backends is **independent** of which backend is
+chosen — it is the **same for every backend**:
+
+- **Default (`back_host` unset)** — the **original front Host** (the client's `Host`, e.g. `api.example.com`) is forwarded to every backend. The backend's own hostname is used **only** as the TCP connect address, never as the `Host` header.
+- **`back_host` set** — that value **replaces** the Host sent upstream, so the **front URL never reaches the backends** — only the rewrite does. Use this when your backends route on a different internal hostname (or when you don't want the public hostname to leak inward).
+
+```sql
+-- Rewrite Host to an internal name for BOTH backends; the public host never leaks.
+UPDATE mappings SET back_host = 'internal-app.svc' WHERE domain = 'api.example.com';
+```
+
+```
+                                     Host: internal-app.svc   ┌─ server1.internal:8443
+client ──▶ api.example.com ──▶ jsproxy ──────────────────────┤   (failover)
+              (front URL)      back_host='internal-app.svc'   └─ server2.internal:8443
+                              front URL never reaches either backend
+```
+
+> **Backward compatibility:** multi-host mode only activates when `backend` contains a comma — a shape no single-URL config ever produced — so existing mappings and the multi-port mode are completely unchanged.
+
+> **WebSocket**: always uses a single backend (the first ranked one). HA applies to HTTP/HTTPS only.
 
 ## Raw TCP Proxying
 

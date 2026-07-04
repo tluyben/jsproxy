@@ -633,7 +633,7 @@ class ProxyServer {
       // Null/absent (the default for every mapping) → forward the original Host
       // unchanged, i.e. exactly today's behavior.
       req._proxyBackHost = mapping.back_host || null;
-      req._proxyIsHA = String(mapping.back_port).includes(',');
+      req._proxyIsHA = this._isHA(mapping);
       if (req._span) {
         req._span.setAttribute('proxy.mapping_id',   String(mapping.id));
         req._span.setAttribute('proxy.backend_port', String(mapping.back_port));
@@ -704,8 +704,9 @@ class ProxyServer {
       }
       // ─────────────────────────────────────────────────────────────────────
 
-      // HA round-robin across multiple ports
-      if (String(mapping.back_port).includes(',')) {
+      // HA round-robin across multiple backends (multiple ports on one host, or
+      // multiple distinct backend URLs — see _isHA / _backendTargets).
+      if (this._isHA(mapping)) {
         await this.haRequest(mapping, req, res);
         return;
       }
@@ -775,7 +776,7 @@ class ProxyServer {
         return;
       }
 
-      req._proxyIsHA = String(mapping.back_port).includes(',');
+      req._proxyIsHA = this._isHA(mapping);
 
       if (!this.isIpAllowed(this.getClientIp(req), mapping.allowed_ips)) {
         socket.write('HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nForbidden');
@@ -817,8 +818,15 @@ class ProxyServer {
       req.headers['x-forwarded-proto'] = this.isClientHttps(req) ? 'https' : 'http';
       if (!req.headers['x-forwarded-host']) req.headers['x-forwarded-host'] = req.headers.host || '';
 
-      const backend = mapping.backend || 'http://localhost';
-      const target = `${backend}:${mapping.back_port}`;
+      // WebSocket uses a single backend (no mid-stream failover): pick the
+      // best-scored target. This resolves both a port list and a multi-host
+      // backend list to one concrete host:port.
+      const targets = this._backendTargets(mapping);
+      const chosen  = targets.length > 1 ? this.rankedTargets(mapping.id, targets)[0] : targets[0];
+      const scheme  = chosen && chosen.isHttps ? 'https' : 'http';
+      const target  = chosen
+        ? `${scheme}://${chosen.hostname}:${chosen.port}`
+        : `${mapping.backend || 'http://localhost'}:${mapping.back_port}`;
       this.proxy.ws(req, socket, head, {
         target,
         secure: false,
@@ -874,7 +882,63 @@ class ProxyServer {
 
   // ── HA helpers ────────────────────────────────────────────────────────────
 
+  // True when a mapping should use the failover engine: either multiple ports on
+  // one backend (`back_port='3000,3001'`) OR multiple distinct backend URLs
+  // (`backend='https://a.example,https://b.example'`). Both are comma-triggered.
+  _isHA(mapping) {
+    return String(mapping.back_port).includes(',') ||
+           String(mapping.backend || '').includes(',');
+  }
+
+  // Expand a mapping into an ordered list of candidate backend targets. The unit
+  // of failover is a target `{ hostname, port, isHttps, key }` — the `key` is what
+  // the score map is keyed on, so failover state is tracked per distinct backend.
+  //
+  // Two modes, chosen by where the comma is:
+  //   1. Multi-host  — `backend` is a comma list of URLs. Each URL contributes one
+  //      target; its port comes from the URL, else a single numeric `back_port`
+  //      fallback, else the scheme default (443/80). key = `host:port` so each
+  //      distinct backend scores independently.
+  //   2. Port-list / single — one `backend` host, `back_port` is one or more ports.
+  //      This is the legacy path; key = the bare port string, so existing in-memory
+  //      scores and the public getPortScore(id, port) API are byte-for-byte unchanged.
+  //
+  // The Host header sent upstream is NOT derived from these targets — every path
+  // forwards `back_host || original client Host`, so the front URL (or the rewrite)
+  // reaches all backends identically; the target hostname is only a connect address.
+  _backendTargets(mapping) {
+    const backendField = String(mapping.backend || 'http://localhost');
+    const portField    = String(mapping.back_port ?? '');
+
+    if (backendField.includes(',')) {
+      const trimmed  = portField.trim();
+      const fallback = /^\d+$/.test(trimmed) ? parseInt(trimmed, 10) : null;
+      return backendField
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(entry => {
+          const url     = new URL(entry.startsWith('http') ? entry : `http://${entry}`);
+          const isHttps = url.protocol === 'https:';
+          const port    = url.port ? parseInt(url.port, 10)
+                        : (fallback ?? (isHttps ? 443 : 80));
+          return { hostname: url.hostname, port, isHttps, key: `${url.hostname}:${port}` };
+        });
+    }
+
+    const url     = new URL(backendField.startsWith('http') ? backendField : `http://${backendField}`);
+    const isHttps = url.protocol === 'https:';
+    return portField
+      .split(',')
+      .map(p => parseInt(p.trim(), 10))
+      .filter(p => !isNaN(p))
+      .map(port => ({ hostname: url.hostname, port, isHttps, key: String(port) }));
+  }
+
   // ── Port scoring ─────────────────────────────────────────────────────────────
+  // NOTE: the "port" argument throughout is really a score KEY — a bare port
+  // number in legacy mode, or a "host:port" string in multi-host mode. The map is
+  // string-keyed either way, so these work unchanged for both.
 
   _portKey(mappingId, port) { return `${mappingId}:${port}`; }
 
@@ -902,16 +966,41 @@ class ProxyServer {
     );
   }
 
+  // Same ranking as rankedPorts, but over target objects (scored by target.key).
+  // Used by every failover path so multi-host and port-list modes share one engine.
+  rankedTargets(mappingId, targets) {
+    const n = targets.length;
+    if (n === 0) return [];
+    const i = (this.rrCounters.get(mappingId) || 0);
+    this.rrCounters.set(mappingId, i + 1);
+    const off = i % n;
+    const rotated = [...targets.slice(off), ...targets.slice(0, off)];
+    return rotated.slice().sort((a, b) =>
+      this.getPortScore(mappingId, b.key) - this.getPortScore(mappingId, a.key)
+    );
+  }
+
   // TCP-probe a port in the background until it responds, then set score to 50
-  // so the next real request gives it a try.
+  // so the next real request gives it a try. Legacy signature (fixed backend host,
+  // port key) — delegates to the target-based probe below.
   startBackgroundCheck(mapping, port) {
-    const key = this._portKey(mapping.id, port);
+    const backend = mapping.backend || 'http://localhost';
+    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
+    return this.startBackgroundCheckTarget(mapping, {
+      hostname: backendUrl.hostname, port, key: String(port),
+    });
+  }
+
+  // TCP-probe a single target `{ hostname, port, key }` until it accepts a
+  // connection, then restore its score to 50. Keyed on target.key so multi-host
+  // backends each get their own independent probe.
+  startBackgroundCheckTarget(mapping, target) {
+    const key = this._portKey(mapping.id, target.key);
     if (this.bgChecks.has(key)) return;
     this.bgChecks.add(key);
 
-    const backend = mapping.backend || 'http://localhost';
-    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
-    const host = backendUrl.hostname;
+    const host = target.hostname;
+    const port = target.port;
 
     const probe = () => {
       const sock = new net.Socket();
@@ -921,7 +1010,7 @@ class ProxyServer {
         this.bgChecks.delete(key);
         this.portScores.set(key, 50);
         this.portLastSeen.set(key, Date.now());
-        this.logger.info(`HA: port ${port} back up (score→50) for mapping ${mapping.id}`);
+        this.logger.info(`HA: backend ${host}:${port} back up (score→50) for mapping ${mapping.id}`);
       });
       const retry = () => {
         sock.destroy();
@@ -936,7 +1025,7 @@ class ProxyServer {
 
     const t = setTimeout(probe, 2000);
     if (t.unref) t.unref();
-    this.logger.warn(`HA: port ${port} scored 0, background probe started`);
+    this.logger.warn(`HA: backend ${host}:${port} scored 0, background probe started`);
   }
 
   // Kept for backward compat with any remaining call sites
@@ -962,22 +1051,37 @@ class ProxyServer {
     return this._tryPort(mapping, port, req.url, req.method, req.headers, body);
   }
 
-  // Core single-backend request. Used by both the HA path and the plugin path.
+  // Legacy signature (fixed backend host + port) kept for the plugin/single path.
+  // Builds a target from mapping.backend + port and delegates to _tryTarget.
+  _tryPort(mapping, port, uri, method, reqHeaders, body) {
+    const backend = mapping.backend || 'http://localhost';
+    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
+    const target = {
+      hostname: backendUrl.hostname,
+      port,
+      isHttps: backendUrl.protocol === 'https:',
+      key: String(port),
+    };
+    return this._tryTarget(mapping, target, uri, method, reqHeaders, body);
+  }
+
+  // Core single-backend request against one target `{ hostname, port, isHttps, key }`.
+  // Used by both the HA path and the plugin/single path.
   //
   // Timeouts are phased: a short window while the TCP connect is in progress
-  // (so a genuinely-dead port fails fast for HA failover), then a longer window
+  // (so a genuinely-dead backend fails fast for HA failover), then a longer window
   // once we've connected and are waiting for the response. Rejections are
   // tagged with `err.phase` so _requestHA can distinguish:
   //   - phase === 'connect'  → backend unreachable; safe to penalize + failover.
   //   - phase === 'response' → connection succeeded, request may already be in
   //     flight on the backend; failing over would risk duplicating non-idempotent
-  //     operations and the port is provably up. Surface to client as-is.
-  _tryPort(mapping, port, uri, method, reqHeaders, body) {
+  //     operations and the backend is provably up. Surface to client as-is.
+  _tryTarget(mapping, target, uri, method, reqHeaders, body) {
     return new Promise((resolve, reject) => {
-      const backend = mapping.backend || 'http://localhost';
-      const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
-      const isHttpsBackend = backendUrl.protocol === 'https:';
+      const backendUrl = { hostname: target.hostname };
+      const isHttpsBackend = target.isHttps;
       const lib = isHttpsBackend ? https : http;
+      const port = target.port;
 
       const targetPath = (!mapping.front_uri && !mapping.back_uri)
         ? uri
@@ -1023,6 +1127,7 @@ class ProxyServer {
         proxyRes.on('data', chunk => chunks.push(chunk));
         proxyRes.on('end', () => resolve({
           port,
+          key: target.key,
           statusCode: proxyRes.statusCode,
           headers: proxyRes.headers,
           body: Buffer.concat(chunks),
@@ -1088,45 +1193,43 @@ class ProxyServer {
     }
   }
 
-  // Multi-port HA request. Tries ports best-score-first; short-circuits on the
-  // first port that actually responds (any status code). Connection-level
-  // failures (no response at all) penalize the port and move to the next one.
+  // HA request across multiple backends. A "backend" is a distinct target — either
+  // another port on the same host (`back_port` list) or a whole other host
+  // (`backend` URL list). Tries them best-score-first; short-circuits on the first
+  // that actually responds (any status code). Connection-level failures (no
+  // response at all) penalize that target and move to the next one.
   async _requestHA(mapping, uri, method, headers, body, span = null) {
-    const ports = String(mapping.back_port)
-      .split(',')
-      .map(p => parseInt(p.trim(), 10))
-      .filter(p => !isNaN(p));
+    const ordered = this.rankedTargets(mapping.id, this._backendTargets(mapping));
 
-    const ordered = this.rankedPorts(mapping.id, ports);
-
-    // Idempotent (safe) methods can be retried on another port without risk of
+    // Idempotent (safe) methods can be retried on another backend without risk of
     // duplicating side effects, because the HA path fully buffers the response
     // and only flushes it to the client in sendHAResponse *after* success — so
     // nothing is ever committed to the client on a failed attempt.
     const idempotent = ProxyServer.SAFE_METHODS.has(String(method).toUpperCase());
 
-    for (const port of ordered) {
+    for (const target of ordered) {
+      const where = `${target.hostname}:${target.port}`;
       try {
-        const result = await this._tryPort(mapping, port, uri, method, headers, body);
-        this.boostPort(mapping.id, port);
+        const result = await this._tryTarget(mapping, target, uri, method, headers, body);
+        this.boostPort(mapping.id, target.key);
         return result;
       } catch (err) {
         // A post-connect failure ('no-response' or 'response') means the backend
         // accepted the TCP connection but never completed a response — e.g. a
         // container that has started listening during a blue/green deploy but is
-        // not yet ready to serve. Such a port is NOT healthy: penalize it so the
+        // not yet ready to serve. Such a target is NOT healthy: penalize it so the
         // ranking sheds it (and a background probe restores it once it recovers).
         const postConnect = err.phase === 'response' || err.phase === 'no-response';
 
         if (postConnect && !idempotent) {
           // Non-idempotent request (POST/PATCH/…): it may already have been
           // processed by the backend, so retrying could duplicate work. Surface a
-          // 504 — but still penalize so subsequent requests avoid this port.
-          this.penalizePort(mapping.id, port);
-          this.startBackgroundCheck(mapping, port);
+          // 504 — but still penalize so subsequent requests avoid this target.
+          this.penalizePort(mapping.id, target.key);
+          this.startBackgroundCheckTarget(mapping, target);
           this.logger.error('HA backend failed post-connect on non-idempotent request (not failing over)', {
             domain:     mapping.domain,
-            port,
+            backend:    where,
             uri,
             method,
             phase:      err.phase,
@@ -1134,9 +1237,9 @@ class ProxyServer {
             error_code: err.code,
           });
           if (span) {
-            span.setAttribute('ha.response_phase_error', true);
-            span.setAttribute('ha.response_phase_port',  String(port));
-            span.setAttribute('ha.response_phase',        err.phase);
+            span.setAttribute('ha.response_phase_error',   true);
+            span.setAttribute('ha.response_phase_backend', where);
+            span.setAttribute('ha.response_phase',         err.phase);
           }
           return {
             statusCode: 504,
@@ -1147,10 +1250,10 @@ class ProxyServer {
 
         // connect-phase failure (any method) OR post-connect on an idempotent
         // request: penalize, probe in the background, and fail over to the next
-        // ranked port.
+        // ranked backend.
         this.logger.warn('HA backend failed, trying next', {
           domain:           mapping.domain,
-          port,
+          backend:          where,
           uri,
           method,
           phase:            err.phase,
@@ -1159,32 +1262,28 @@ class ProxyServer {
           error_code:       err.code,
           address:          err.address,
         });
-        this.penalizePort(mapping.id, port);
-        this.startBackgroundCheck(mapping, port);
+        this.penalizePort(mapping.id, target.key);
+        this.startBackgroundCheckTarget(mapping, target);
       }
     }
 
-    const portDetails = ordered.map(port => {
-      const lastSeen = this.portLastSeen.get(this._portKey(mapping.id, port));
+    const backendDetails = ordered.map(target => {
+      const lastSeen = this.portLastSeen.get(this._portKey(mapping.id, target.key));
       return {
-        port,
-        score:     this.getPortScore(mapping.id, port),
+        backend:   `${target.hostname}:${target.port}`,
+        score:     this.getPortScore(mapping.id, target.key),
         last_seen: lastSeen ? new Date(lastSeen).toISOString() : 'never',
         last_seen_ms_ago: lastSeen ? Date.now() - lastSeen : null,
       };
     });
     this.logger.error('all backends unavailable', {
-      domain:       mapping.domain,
-      mapping_id:   mapping.id,
-      port_details: portDetails,
+      domain:          mapping.domain,
+      mapping_id:      mapping.id,
+      backend_details: backendDetails,
     });
     if (span) {
       span.setAttribute('ha.all_backends_down', true);
-      span.setAttribute('ha.failed_ports', ordered.join(','));
-      for (const d of portDetails) {
-        span.setAttribute(`ha.port.${d.port}.last_seen`,        d.last_seen);
-        span.setAttribute(`ha.port.${d.port}.last_seen_ms_ago`, d.last_seen_ms_ago ?? -1);
-      }
+      span.setAttribute('ha.failed_backends', ordered.map(t => `${t.hostname}:${t.port}`).join(','));
     }
     return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway: all backends unavailable') };
   }
@@ -1223,7 +1322,7 @@ class ProxyServer {
     }
 
     // ── backend request ──────────────────────────────────────────────────────
-    const backendResult = String(mapping.back_port).includes(',')
+    const backendResult = this._isHA(mapping)
       ? await this._requestHA(mapping, uri, method, headers, body, req._span)
       : await this._requestSingle(mapping, uri, method, headers, body);
 
@@ -1296,27 +1395,26 @@ class ProxyServer {
       delete headers['transfer-encoding'];
     }
 
-    const ports = String(mapping.back_port)
-      .split(',')
-      .map(p => parseInt(p.trim(), 10))
-      .filter(p => !isNaN(p));
-    const port = ports.length > 1 ? this.rankedPorts(mapping.id, ports)[0] : ports[0];
-    const backend = mapping.backend || 'http://localhost';
-    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
-    const lib = backendUrl.protocol === 'https:' ? https : http;
+    // Plugin streaming has no mid-stream failover: pick the single best target.
+    const targets = this._backendTargets(mapping);
+    const target  = targets.length > 1 ? this.rankedTargets(mapping.id, targets)[0] : targets[0];
+    const port    = target.port;
+    const lib     = target.isHttps ? https : http;
 
     const targetPath = (!mapping.front_uri && !mapping.back_uri)
       ? uri
       : this.buildTargetPath(mapping, uri);
 
     headers['x-forwarded-host'] = headers['host'] || '';
-    headers['host'] = `${backendUrl.hostname}:${port}`;
+    // Honor a back_host rewrite when set; otherwise keep this path's historical
+    // behavior of addressing the backend by its own host:port.
+    headers['host'] = mapping.back_host || `${target.hostname}:${port}`;
 
     const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
 
     return new Promise((resolve) => {
       const proxyReq = lib.request(
-        { hostname: backendUrl.hostname, port, path: targetPath, method, headers },
+        { hostname: target.hostname, port, path: targetPath, method, headers },
         async (proxyRes) => {
           try {
             if (!skipAfter) {
@@ -1403,15 +1501,10 @@ class ProxyServer {
   }
 
   async haRequest(mapping, req, res) {
-    const ports = String(mapping.back_port)
-      .split(',')
-      .map(p => parseInt(p.trim(), 10))
-      .filter(p => !isNaN(p));
-
     // Stream directly (never buffer) when the body is large, of unknown size, or
     // an open-ended response stream — buffering these into memory would OOM and,
     // for an "infinite" upload, can never complete. _streamHA fails over across
-    // ports on a connect-phase failure (no body bytes sent yet, so retrying is
+    // backends on a connect-phase failure (no body bytes sent yet, so retrying is
     // safe); once the connection is established the body flows and a mid-stream
     // failure surfaces to the client.
     if (this._isStreamingRequest(req)) {
@@ -1454,16 +1547,10 @@ class ProxyServer {
   //     is already in flight; retrying could duplicate a non-idempotent upload
   //     and the original bytes are gone. Surface to the client, which retries.
   _streamHA(mapping, req, res) {
-    const ports = String(mapping.back_port)
-      .split(',')
-      .map(p => parseInt(p.trim(), 10))
-      .filter(p => !isNaN(p));
-    const ordered = this.rankedPorts(mapping.id, ports);
-
-    const backend = mapping.backend || 'http://localhost';
-    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
-    const isHttpsBackend = backendUrl.protocol === 'https:';
-    const lib = isHttpsBackend ? https : http;
+    // Ordered failover candidates — either ports on one host or distinct backend
+    // URLs. Each attempt reads its host/port/scheme from the target; the Host
+    // header is the same for all (back_host || original), set once below.
+    const ordered = this.rankedTargets(mapping.id, this._backendTargets(mapping));
 
     const targetPath = (!mapping.front_uri && !mapping.back_uri)
       ? req.url
@@ -1488,7 +1575,7 @@ class ProxyServer {
       if (!hopByHop.has(k.toLowerCase())) headers[k] = v;
     }
     if (!headers['x-forwarded-host']) headers['x-forwarded-host'] = req.headers['host'] || '';
-    headers['host'] = mapping.back_host || req.headers['host'] || `${backendUrl.hostname}`;
+    headers['host'] = mapping.back_host || req.headers['host'] || (ordered[0] && ordered[0].hostname) || '';
     headers['x-forwarded-proto'] = this.isClientHttps(req) ? 'https' : 'http';
     // X-Forwarded-For is already correct here: the header-copy loop above carried
     // it over from req.headers, where _handleRequest appended this hop's peer at
@@ -1559,12 +1646,13 @@ class ProxyServer {
     const attempt = (idx) => {
       if (idx >= ordered.length) {
         clearIdle();
+        const list = ordered.map(t => `${t.hostname}:${t.port}`).join(',');
         this.logger.error('all backends unavailable (stream)', {
-          domain: mapping.domain, mapping_id: mapping.id, ports: ordered.join(','),
+          domain: mapping.domain, mapping_id: mapping.id, backends: list,
         });
         if (span) {
           span.setAttribute('ha.all_backends_down', true);
-          span.setAttribute('ha.failed_ports', ordered.join(','));
+          span.setAttribute('ha.failed_backends', list);
         }
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'text/plain' });
@@ -1573,20 +1661,23 @@ class ProxyServer {
         return;
       }
 
-      const port = ordered[idx];
+      const target = ordered[idx];
+      const port   = target.port;
+      const where  = `${target.hostname}:${target.port}`;
+      const lib    = target.isHttps ? https : http;
       let committed = false; // true once TCP connect succeeds and the body starts flowing
 
       const proxyReq = lib.request({
-        hostname: backendUrl.hostname,
+        hostname: target.hostname,
         port,
         path: targetPath,
         method: req.method,
         headers,
-        ...(isHttpsBackend ? { rejectUnauthorized: false } : {}),
+        ...(target.isHttps ? { rejectUnauthorized: false } : {}),
       }, (proxyRes) => {
         // Response received → backend is healthy. Stream it straight back, resetting
         // the idle deadline on every response chunk so a long download stays alive.
-        this.boostPort(mapping.id, port);
+        this.boostPort(mapping.id, target.key);
         if (span) span.setAttribute('proxy.backend_status', proxyRes.statusCode);
         const fwd = {};
         for (const [k, v] of Object.entries(proxyRes.headers)) {
@@ -1631,17 +1722,17 @@ class ProxyServer {
       proxyReq.on('error', (err) => {
         if (!committed) {
           // Connect-phase failure: no body sent yet → penalize and fail over.
-          this.penalizePort(mapping.id, port);
-          this.startBackgroundCheck(mapping, port);
+          this.penalizePort(mapping.id, target.key);
+          this.startBackgroundCheckTarget(mapping, target);
           this.logger.warn('HA stream connect failed, trying next backend', {
-            domain: mapping.domain, port, url: req.url, error: err.message, error_code: err.code,
+            domain: mapping.domain, backend: where, url: req.url, error: err.message, error_code: err.code,
           });
           attempt(idx + 1);
         } else {
           // Post-connect failure: body already in flight, cannot fail over.
           clearIdle();
           this.logger.warn('HA stream backend failed mid-request (no failover)', {
-            domain: mapping.domain, port, url: req.url, error: err.message, error_code: err.code,
+            domain: mapping.domain, backend: where, url: req.url, error: err.message, error_code: err.code,
           });
           req.unpipe(proxyReq);
           if (!res.headersSent) {
