@@ -1,9 +1,8 @@
 const acme = require('acme-client');
 const forge = require('node-forge');
-const fs = require('fs').promises;
-const path = require('path');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
+const { createCertStore } = require('./CertStore');
 
 const TRUSTED_UPGRADE_INTERVAL_MS = 60_000;
 
@@ -26,7 +25,12 @@ class CertificateManager {
     // entries: { cert, key, type: 'trusted' | 'selfsigned' }
     this.certificates = new Map();
     this.challenges = new Map();
-    this.certsDir = './certs';
+    this.certsDir = process.env.CERTS_DIR || './certs';
+    // Storage backend for all cert material. Default 'disk' is byte-for-byte the
+    // original behaviour; 'db' keeps everything in the same SQLite DB as mappings.
+    // getDir is a live closure so tests can repoint this.certsDir after construction.
+    this.storageMode = String(options.storage || process.env.CERT_STORAGE || 'disk').toLowerCase();
+    this.store = createCertStore(this.storageMode, logger, dbManager, () => this.certsDir);
     this.acmeClient = null;
     this.accountKey = null;
     this.processingDomains = new Set();
@@ -52,31 +56,20 @@ class CertificateManager {
   }
 
   async initialize() {
-    await this.ensureCertsDirectory();
+    await this.store.init();
     await this.initializeAcmeClient();
     await this.loadExistingCertificates();
   }
 
-  async ensureCertsDirectory() {
-    try {
-      await fs.access(this.certsDir);
-    } catch (error) {
-      await fs.mkdir(this.certsDir, { recursive: true });
-      this.logger.info(`Created certificates directory: ${this.certsDir}`);
-    }
-  }
-
   async initializeAcmeClient() {
     try {
-      const accountKeyPath = path.join(this.certsDir, 'account-key.pem');
-
-      try {
-        const accountKeyPem = await fs.readFile(accountKeyPath);
+      const accountKeyPem = await this.store.read('account-key.pem');
+      if (accountKeyPem) {
         this.accountKey = accountKeyPem;
-      } catch (error) {
+      } else {
         this.logger.info('Generating new ACME account key');
         this.accountKey = await acme.forge.createPrivateKey();
-        await fs.writeFile(accountKeyPath, this.accountKey);
+        await this.store.write('account-key.pem', this.accountKey);
       }
 
       const directoryUrl = acme.directory.letsencrypt.production;
@@ -99,7 +92,7 @@ class CertificateManager {
 
   async loadExistingCertificates() {
     try {
-      const files = await fs.readdir(this.certsDir);
+      const files = await this.store.list();
 
       // Load trusted certs (.trusted.crt), migrating bare .crt files on the fly
       const trustedFiles = files.filter(f => f.endsWith('.trusted.crt') && !f.startsWith('wildcard.'));
@@ -115,11 +108,11 @@ class CertificateManager {
         const isTrustedExt = certFile.endsWith('.trusted.crt');
         const domain = certFile.replace('.trusted.crt', '').replace('.crt', '');
         if (this.certificates.has(domain)) continue; // already loaded via .trusted.crt
-        const certPath = path.join(this.certsDir, certFile);
-        const keyPath  = path.join(this.certsDir, isTrustedExt ? `${domain}.trusted.key` : `${domain}.key`);
+        const keyName = isTrustedExt ? `${domain}.trusted.key` : `${domain}.key`;
         try {
-          const cert = await fs.readFile(certPath);
-          const key  = await fs.readFile(keyPath);
+          const cert = await this.store.read(certFile);
+          const key  = await this.store.read(keyName);
+          if (!cert || !key) throw new Error('missing cert or key');
           if (!await this.isCertificateValid(cert)) {
             this.logger.warn(`Certificate for ${domain} is expired or invalid`);
             continue;
@@ -128,10 +121,8 @@ class CertificateManager {
           if (isReal) {
             if (!isTrustedExt) {
               // Migrate bare .crt/.key → .trusted.crt/.trusted.key
-              const tCertPath = path.join(this.certsDir, `${domain}.trusted.crt`);
-              const tKeyPath  = path.join(this.certsDir, `${domain}.trusted.key`);
-              await fs.rename(certPath, tCertPath).catch(() => {});
-              await fs.rename(keyPath,  tKeyPath).catch(() => {});
+              await this.store.rename(certFile, `${domain}.trusted.crt`).catch(() => {});
+              await this.store.rename(keyName,  `${domain}.trusted.key`).catch(() => {});
               this.logger.info(`Migrated trusted certificate for: ${domain}`);
             } else {
               this.logger.info(`Loaded trusted certificate for: ${domain}`);
@@ -139,10 +130,8 @@ class CertificateManager {
             this.certificates.set(domain, { cert, key, type: 'trusted' });
           } else {
             // Old self-signed .crt — migrate to .selfsigned.*
-            const ssCertPath = path.join(this.certsDir, `${domain}.selfsigned.crt`);
-            const ssKeyPath  = path.join(this.certsDir, `${domain}.selfsigned.key`);
-            await fs.rename(certPath, ssCertPath).catch(() => {});
-            await fs.rename(keyPath,  ssKeyPath).catch(() => {});
+            await this.store.rename(certFile, `${domain}.selfsigned.crt`).catch(() => {});
+            await this.store.rename(keyName,  `${domain}.selfsigned.key`).catch(() => {});
             this.certificates.set(domain, { cert, key, type: 'selfsigned' });
             this.logger.info(`Migrated self-signed certificate for: ${domain}`);
           }
@@ -156,11 +145,10 @@ class CertificateManager {
       for (const certFile of ssFiles) {
         const domain = certFile.replace('.selfsigned.crt', '');
         if (this.certificates.has(domain)) continue;
-        const certPath = path.join(this.certsDir, certFile);
-        const keyPath = path.join(this.certsDir, `${domain}.selfsigned.key`);
         try {
-          const cert = await fs.readFile(certPath);
-          const key = await fs.readFile(keyPath);
+          const cert = await this.store.read(certFile);
+          const key = await this.store.read(`${domain}.selfsigned.key`);
+          if (!cert || !key) throw new Error('missing cert or key');
           if (!await this.isCertificateValid(cert)) {
             this.logger.warn(`Self-signed certificate for ${domain} is expired or invalid`);
             continue;
@@ -227,20 +215,15 @@ class CertificateManager {
   }
 
   async getDefaultCertificate() {
-    const defaultCertPath = path.join(this.certsDir, 'default.crt');
-    const defaultKeyPath = path.join(this.certsDir, 'default.key');
+    const cert = await this.store.read('default.crt');
+    const key = await this.store.read('default.key');
+    if (cert && key) return { cert, key };
 
-    try {
-      const cert = await fs.readFile(defaultCertPath);
-      const key = await fs.readFile(defaultKeyPath);
-      return { cert, key };
-    } catch (error) {
-      this.logger.info('Generating self-signed default certificate');
-      const { cert, key } = await this.generateSelfSignedCertificate('localhost');
-      await fs.writeFile(defaultCertPath, cert);
-      await fs.writeFile(defaultKeyPath, key);
-      return { cert, key };
-    }
+    this.logger.info('Generating self-signed default certificate');
+    const generated = await this.generateSelfSignedCertificate('localhost');
+    await this.store.write('default.crt', generated.cert);
+    await this.store.write('default.key', generated.key);
+    return generated;
   }
 
   async generateSelfSignedCertificate(commonName) {
@@ -344,12 +327,10 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
   }
 
-  // Write a self-signed cert pair to disk under the .selfsigned.* filenames
+  // Persist a self-signed cert pair under the .selfsigned.* keys
   async _writeSelfSigned(domain, cert, key) {
-    const certPath = path.join(this.certsDir, `${domain}.selfsigned.crt`);
-    const keyPath = path.join(this.certsDir, `${domain}.selfsigned.key`);
-    await fs.writeFile(certPath, cert);
-    await fs.writeFile(keyPath, key);
+    await this.store.write(`${domain}.selfsigned.crt`, cert);
+    await this.store.write(`${domain}.selfsigned.key`, key);
   }
 
   // Generate, persist, and cache a self-signed cert; schedule upgrade check for public domains
@@ -371,34 +352,33 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     setTimeout(async () => {
       this.upgradingDomains.delete(domain);
       try {
-        const certPath = path.join(this.certsDir, `${domain}.trusted.crt`);
-        const keyPath = path.join(this.certsDir, `${domain}.trusted.key`);
-        const cert = await fs.readFile(certPath);
-        const key = await fs.readFile(keyPath);
-        if (await this.isCertificateValid(cert)) {
+        const cert = await this.store.read(`${domain}.trusted.crt`);
+        const key = await this.store.read(`${domain}.trusted.key`);
+        if (cert && key && await this.isCertificateValid(cert)) {
           this.certificates.set(domain, { cert, key, type: 'trusted' });
           this.logger.info(`Upgraded ${domain} from self-signed to trusted cert`);
         }
         // If not valid yet, next request with selfsigned in cache will re-arm the check
       } catch (_) {
-        // No trusted cert on disk yet — next request re-arms
+        // No trusted cert stored yet — next request re-arms
       }
     }, TRUSTED_UPGRADE_INTERVAL_MS);
   }
 
   // --- Persistent ACME state helpers ---
 
-  _acmeStatePath(domain) {
-    return path.join(this.certsDir, `${domain}.acme-state.json`);
+  _acmeStateKey(domain) {
+    return `${domain}.acme-state.json`;
   }
 
-  _acmeLockPath(domain) {
-    return path.join(this.certsDir, `${domain}.acme-lock.json`);
+  _acmeLockKey(domain) {
+    return `${domain}.acme-lock.json`;
   }
 
   async _loadAcmeState(domain) {
     try {
-      const data = await fs.readFile(this._acmeStatePath(domain), 'utf8');
+      const data = await this.store.readText(this._acmeStateKey(domain));
+      if (data == null) throw new Error('no state');
       return JSON.parse(data);
     } catch {
       return { attempts: 0, lastAttemptAt: 0, nextRetryAt: 0, gaveUp: false, lastError: null };
@@ -406,44 +386,44 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   }
 
   async _saveAcmeState(domain, state) {
-    const p = this._acmeStatePath(domain);
-    const tmp = p + '.tmp';
-    await fs.writeFile(tmp, JSON.stringify(state, null, 2));
-    await fs.rename(tmp, p);
+    // store.write is atomic on the disk backend (temp-file + rename)
+    await this.store.write(this._acmeStateKey(domain), JSON.stringify(state, null, 2));
   }
 
   async _clearAcmeState(domain) {
-    await fs.unlink(this._acmeStatePath(domain)).catch(() => {});
+    await this.store.delete(this._acmeStateKey(domain));
   }
 
   // Returns true if this worker acquired the lock, false if another holds it.
   async _acquireLock(domain) {
-    const lockPath = this._acmeLockPath(domain);
+    const lockKey = this._acmeLockKey(domain);
     const now = Date.now();
     try {
-      const data = await fs.readFile(lockPath, 'utf8');
-      const lock = JSON.parse(data);
-      if (lock.workerId !== this.workerId && now - lock.acquiredAt < this.acmeConfig.lockTtlMs) {
-        return false;
+      const data = await this.store.readText(lockKey);
+      if (data != null) {
+        const lock = JSON.parse(data);
+        if (lock.workerId !== this.workerId && now - lock.acquiredAt < this.acmeConfig.lockTtlMs) {
+          return false;
+        }
       }
     } catch {
-      // No lock file — proceed to write
+      // No/invalid lock — proceed to write
     }
-    await fs.writeFile(lockPath, JSON.stringify({ workerId: this.workerId, acquiredAt: now }));
+    await this.store.write(lockKey, JSON.stringify({ workerId: this.workerId, acquiredAt: now }));
     // Read back to detect a simultaneous write from another worker
     try {
-      const data = await fs.readFile(lockPath, 'utf8');
-      return JSON.parse(data).workerId === this.workerId;
+      const data = await this.store.readText(lockKey);
+      return data != null && JSON.parse(data).workerId === this.workerId;
     } catch {
       return false;
     }
   }
 
   async _releaseLock(domain) {
-    const lockPath = this._acmeLockPath(domain);
+    const lockKey = this._acmeLockKey(domain);
     try {
-      const data = await fs.readFile(lockPath, 'utf8');
-      if (JSON.parse(data).workerId === this.workerId) await fs.unlink(lockPath);
+      const data = await this.store.readText(lockKey);
+      if (data != null && JSON.parse(data).workerId === this.workerId) await this.store.delete(lockKey);
     } catch {
       // Already gone
     }
@@ -584,31 +564,27 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       }
     }
 
-    // Disk: trusted first (.trusted.crt / .trusted.key)
-    const certPath = path.join(this.certsDir, `${domain}.trusted.crt`);
-    const keyPath = path.join(this.certsDir, `${domain}.trusted.key`);
+    // Store: trusted first (.trusted.crt / .trusted.key)
     try {
-      const cert = await fs.readFile(certPath);
-      const key = await fs.readFile(keyPath);
-      if (await this.isCertificateValid(cert)) {
+      const cert = await this.store.read(`${domain}.trusted.crt`);
+      const key = await this.store.read(`${domain}.trusted.key`);
+      if (cert && key && await this.isCertificateValid(cert)) {
         const entry = { cert, key, type: 'trusted' };
         this.certificates.set(domain, entry);
         return entry;
       }
     } catch (_) {}
 
-    // Disk: self-signed (.selfsigned.crt / .selfsigned.key)
-    const ssCertPath = path.join(this.certsDir, `${domain}.selfsigned.crt`);
-    const ssKeyPath = path.join(this.certsDir, `${domain}.selfsigned.key`);
+    // Store: self-signed (.selfsigned.crt / .selfsigned.key)
     try {
-      const cert = await fs.readFile(ssCertPath);
-      const key = await fs.readFile(ssKeyPath);
-      if (await this.isCertificateValid(cert)) {
+      const cert = await this.store.read(`${domain}.selfsigned.crt`);
+      const key = await this.store.read(`${domain}.selfsigned.key`);
+      if (cert && key && await this.isCertificateValid(cert)) {
         const entry = { cert, key, type: 'selfsigned' };
         this.certificates.set(domain, entry);
         if (this.isPublicDomain(domain)) this._checkForTrustedUpgrade(domain);
         // Validated public domains also get a live ACME attempt in the background;
-        // _checkForTrustedUpgrade picks up the result from disk when it lands.
+        // _checkForTrustedUpgrade picks up the result when it lands.
         if (isDomainValidated && this.isPublicDomain(domain)) this._startAcmeBackground(domain);
         return entry;
       }
@@ -665,12 +641,10 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
 
     try {
-      const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
-      const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
-      const cert = await fs.readFile(certPath);
-      const key = await fs.readFile(keyPath);
+      const cert = await this.store.read(`wildcard.${mainDomain}.crt`);
+      const key = await this.store.read(`wildcard.${mainDomain}.key`);
 
-      if (await this.isCertificateValid(cert)) {
+      if (cert && key && await this.isCertificateValid(cert)) {
         const certificate = { cert, key };
         this.wildcardCerts.set(mainDomain, certificate);
         this.logger.info(`Using cached wildcard certificate for ${wildcardDomain}`);
@@ -698,16 +672,17 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return await this.generateSelfSignedCertificate(wildcardDomain);
     }
 
-    const pendingFile = path.join(this.certsDir, `wildcard.${mainDomain}.pending.json`);
+    const pendingKey = `wildcard.${mainDomain}.pending.json`;
     let pending = null;
 
     try {
-      const data = await fs.readFile(pendingFile, 'utf8');
+      const data = await this.store.readText(pendingKey);
+      if (data == null) throw new Error('no pending order');
       pending = JSON.parse(data);
       if (new Date(pending.expiresAt) < new Date()) {
         this.logger.info(`Pending wildcard order for ${wildcardDomain} expired, creating new one`);
         pending = null;
-        await fs.unlink(pendingFile).catch(() => {});
+        await this.store.delete(pendingKey);
       }
     } catch (e) {
     }
@@ -720,7 +695,7 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       this.processingDomains.add(wildcardDomain);
       try {
         pending = await this.createWildcardOrder(mainDomain);
-        await fs.writeFile(pendingFile, JSON.stringify(pending, null, 2));
+        await this.store.write(pendingKey, JSON.stringify(pending, null, 2));
       } catch (e) {
         this.logger.error(`Failed to create wildcard ACME order for ${wildcardDomain}:`, e);
         return await this.generateSelfSignedCertificate(wildcardDomain);
@@ -748,11 +723,11 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     try {
       const certificate = await this.completePendingWildcardOrder(mainDomain, pending);
       this.wildcardCerts.set(mainDomain, certificate);
-      await fs.unlink(pendingFile).catch(() => {});
+      await this.store.delete(pendingKey);
       return certificate;
     } catch (e) {
       this.logger.error(`Failed to complete wildcard order for ${wildcardDomain}:`, e);
-      await fs.unlink(pendingFile).catch(() => {});
+      await this.store.delete(pendingKey);
       return await this.generateSelfSignedCertificate(wildcardDomain);
     } finally {
       this.processingDomains.delete(wildcardDomain);
@@ -807,15 +782,13 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
 
     try {
-      const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
-      const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
-      const cert = await fs.readFile(certPath);
-      const key = await fs.readFile(keyPath);
+      const cert = await this.store.read(`wildcard.${mainDomain}.crt`);
+      const key = await this.store.read(`wildcard.${mainDomain}.key`);
 
-      if (await this.isCertificateValid(cert)) {
+      if (cert && key && await this.isCertificateValid(cert)) {
         const certificate = { cert, key };
         this.wildcardCerts.set(mainDomain, certificate);
-        this.logger.info(`Loaded wildcard certificate from disk for *.${mainDomain}`);
+        this.logger.info(`Loaded wildcard certificate for *.${mainDomain}`);
         return certificate;
       }
     } catch (error) {
@@ -931,11 +904,8 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
         challengeRemoveFn: this.challengeRemoveFn.bind(this)
       });
 
-      const certPath = path.join(this.certsDir, `${domain}.trusted.crt`);
-      const keyPath = path.join(this.certsDir, `${domain}.trusted.key`);
-
-      await fs.writeFile(certPath, cert);
-      await fs.writeFile(keyPath, key);
+      await this.store.write(`${domain}.trusted.crt`, cert);
+      await this.store.write(`${domain}.trusted.key`, key);
 
       this.logger.info(`Certificate obtained and saved for: ${domain}`);
 
@@ -999,13 +969,15 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     const finalizedOrder = await this.acmeClient.finalizeOrder(pending.order, csr);
     const cert = await this.acmeClient.getCertificate(finalizedOrder);
 
-    const certPath = path.join(this.certsDir, `wildcard.${mainDomain}.crt`);
-    const keyPath = path.join(this.certsDir, `wildcard.${mainDomain}.key`);
-    await fs.writeFile(certPath, cert);
-    await fs.writeFile(keyPath, key);
+    await this.store.write(`wildcard.${mainDomain}.crt`, cert);
+    await this.store.write(`wildcard.${mainDomain}.key`, key);
 
     this.logger.info(`Wildcard certificate obtained and saved for *.${mainDomain}`);
     return { cert: Buffer.from(cert), key: Buffer.from(key) };
+  }
+
+  _challengeKey(token) {
+    return `.well-known/acme-challenge/${token}`;
   }
 
   async getChallenge(token) {
@@ -1013,13 +985,7 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return this.challenges.get(token);
     }
 
-    const challengeFile = path.join(this.certsDir, '.well-known', 'acme-challenge', token);
-    try {
-      const challenge = await fs.readFile(challengeFile, 'utf8');
-      return challenge;
-    } catch (error) {
-      return null;
-    }
+    return await this.store.readText(this._challengeKey(token));
   }
 
   async challengeCreateFn(authz, challenge, keyAuthorization) {
@@ -1027,13 +993,7 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
 
     if (challenge.type === 'http-01') {
       this.challenges.set(challenge.token, keyAuthorization);
-
-      const challengePath = path.join(this.certsDir, '.well-known', 'acme-challenge');
-      await fs.mkdir(challengePath, { recursive: true });
-
-      const challengeFile = path.join(challengePath, challenge.token);
-      await fs.writeFile(challengeFile, keyAuthorization);
-
+      await this.store.write(this._challengeKey(challenge.token), keyAuthorization);
       this.logger.info(`HTTP challenge created: token=${challenge.token}`);
     }
   }
@@ -1043,14 +1003,8 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
 
     if (challenge.type === 'http-01') {
       this.challenges.delete(challenge.token);
-
-      const challengeFile = path.join(this.certsDir, '.well-known', 'acme-challenge', challenge.token);
-      try {
-        await fs.unlink(challengeFile);
-        this.logger.info(`HTTP challenge removed: token=${challenge.token}`);
-      } catch (error) {
-        this.logger.warn(`Failed to remove challenge file:`, error);
-      }
+      await this.store.delete(this._challengeKey(challenge.token));
+      this.logger.info(`HTTP challenge removed: token=${challenge.token}`);
     }
   }
 

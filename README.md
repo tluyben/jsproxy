@@ -86,6 +86,11 @@ TRUSTED_PROXIES=private            # Proxies whose X-Forwarded-* headers to trus
                                    #   `loopback` / `private` / `all`.
 DB_PATH=./data/current.db          # Path to SQLite database file
 
+# Certificates
+CERTS_DIR=./certs                  # Directory for cert files (default: ./certs)
+CERT_STORAGE=disk|db               # Where certs live: disk files or the DB
+                                   #   (default: disk, see SSL Certificates)
+
 # Logging
 LOG_LEVEL=debug|info|warn|error    # Log verbosity (default: info)
 LOG_FORMAT=text|json               # Output format (default: text, see Logging section)
@@ -847,6 +852,38 @@ Place custom certificates in the `./certs/` directory:
 ./certs/example.com.key
 ```
 
+### Certificate Storage: disk or database
+
+By default all certificate material — trusted (Let's Encrypt) and self-signed
+cert pairs, wildcard certs, the ACME account key, and internal ACME state — is
+stored as files under `CERTS_DIR` (`./certs`). Set `CERT_STORAGE=db` to store it
+all in a `cert_store` table inside the **same SQLite database as your mappings**
+(`DB_PATH`) instead. This is handy when you want a single file to back up, or a
+read-only / ephemeral filesystem with only the database on a persistent volume.
+
+| `CERT_STORAGE` | Where certs live                              |
+| -------------- | --------------------------------------------- |
+| `disk` (default) | Files under `CERTS_DIR` (`./certs`)         |
+| `db`           | `cert_store` table in `DB_PATH`               |
+
+The storage format and cert naming are identical either way; only the location
+changes. `disk` is the default so existing deployments are unaffected.
+
+**Switching backends.** Two migration commands copy every stored cert/key/blob
+from one backend to the other. They overwrite same-named entries at the
+destination and leave the source untouched, so you can migrate, flip
+`CERT_STORAGE`, and verify before deleting the old copy:
+
+```bash
+# Move existing certs/ files into the database (then set CERT_STORAGE=db)
+npm run cert-migrate-disk-db
+
+# Export certs from the database back to certs/ files (then set CERT_STORAGE=disk)
+npm run cert-migrate-db-disk
+```
+
+Both respect `CERTS_DIR` and `DB_PATH`.
+
 ## Development
 
 ### Running Tests
@@ -1227,7 +1264,7 @@ A: Yes, the system will detect TLD patterns and request wildcard certificates wh
 A: Certificates are renewed automatically 30 days before expiration with zero downtime.
 
 **Q: Can I run multiple instances?**
-A: Yes, but each instance needs its own certificate storage or shared storage with proper locking.
+A: Yes, but each instance needs its own certificate storage or shared storage with proper locking. Setting `CERT_STORAGE=db` gives you shared storage out of the box — all instances point at the same SQLite database, and the ACME retry-state / lock records live there too, so cert issuance is coordinated across workers.
 
 **Q: Does it support HTTP/2?**
 A: Yes, HTTP/2 is supported automatically with HTTPS connections.
