@@ -429,6 +429,37 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
   }
 
+  _sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+  // How long a TLS handshake may block waiting for a real cert before falling
+  // back to self-signed (the ACME order keeps running in the background).
+  _handshakeWaitMs() {
+    const v = parseInt(process.env.ACME_HANDSHAKE_WAIT_MS || '', 10);
+    return Number.isFinite(v) && v > 0 ? v : 20000;
+  }
+
+  // Poll the SHARED store for a trusted cert another worker is obtaining, so we
+  // block-and-wait (on-demand TLS) instead of serving self-signed. Returns the
+  // cert entry once it lands, or null on timeout / if that worker gave up.
+  async _waitForTrustedCert(domain, maxWaitMs) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+      await this._sleep(300);
+      try {
+        const cert = await this.store.read(`${domain}.trusted.crt`);
+        const key = await this.store.read(`${domain}.trusted.key`);
+        if (cert && key && await this.isCertificateValid(cert)) {
+          const entry = { cert, key, type: 'trusted' };
+          this.certificates.set(domain, entry);
+          return entry;
+        }
+      } catch (_) {}
+      const st = await this._loadAcmeState(domain);
+      if (st.gaveUp) return null;
+    }
+    return null;
+  }
+
   // Core ACME attempt with persistent state + cross-worker locking.
   // Returns a trusted cert entry on success, null otherwise.
   async _attemptAcme(domain) {
@@ -441,7 +472,12 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     if (now < state.nextRetryAt) return null;
 
     const locked = await this._acquireLock(domain);
-    if (!locked) return null;
+    if (!locked) {
+      // Another worker is already obtaining this cert. Wait for the trusted cert
+      // to appear in the shared store (blocking on-demand TLS) instead of serving
+      // self-signed. Bounded by the handshake wait window.
+      return await this._waitForTrustedCert(domain, this._handshakeWaitMs());
+    }
 
     // Re-read after acquiring — another worker may have just finished
     const fresh = await this._loadAcmeState(domain);
@@ -451,9 +487,11 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     }
 
     try {
-      const capable = await this.testAcmeCapability(domain);
-      if (!capable) return null; // Probe failed — don't count as an attempt
-
+      // Obtain directly — no cheap self-probe. That probe used a per-worker
+      // in-memory token (testChallenges) that is unreliable under a cluster +
+      // container/NAT hairpin, and it is redundant with the backoff state below.
+      // The real HTTP-01 challenge IS shared across workers via the store, so ACME
+      // validation works cluster-wide.
       const certificate = await this.obtainCertificate(domain);
       await this._clearAcmeState(domain);
       const entry = { ...certificate, type: 'trusted' };
@@ -610,22 +648,27 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       return entry;
     }
 
-    // Join in-flight ACME request if one is already running (e.g. from background worker)
+    const waitMs = this._handshakeWaitMs();
+
+    // Join an in-flight request already running on THIS worker.
     if (this.pendingCerts.has(domain)) {
       this.logger.info(`Joining in-flight certificate request for ${domain}`);
-      const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(null), 30000));
-      const cert = await Promise.race([this.pendingCerts.get(domain), timeoutPromise]);
+      const cert = await Promise.race([this.pendingCerts.get(domain), this._sleep(waitMs).then(() => null)]);
       if (cert) return cert;
-      this.logger.warn(`ACME stuck for ${domain} after 30s, falling back to self-signed`);
-      this.pendingCerts.delete(domain);
+      this.logger.warn(`ACME not ready for ${domain} within ${Math.round(waitMs / 1000)}s — self-signed for now (order continues in background)`);
       return await this._generateAndCacheSelfSigned(domain);
     }
 
-    // Attempt ACME synchronously (state + locking handled inside)
+    // Blocking on-demand TLS: obtain the REAL cert and HOLD the handshake for up
+    // to waitMs. If it lands, the client gets the trusted cert with NO self-signed.
+    // If ACME is slower, serve self-signed for THIS handshake while the order keeps
+    // running in the background; later handshakes pick up the trusted cert.
+    // (Non-signable and backoff/gaveUp domains were already handled above.)
     const certPromise = this._attemptAcme(domain).finally(() => this.pendingCerts.delete(domain));
     this.pendingCerts.set(domain, certPromise);
-    const trusted = await certPromise;
+    const trusted = await Promise.race([certPromise, this._sleep(waitMs).then(() => null)]);
     if (trusted) return trusted;
+    this.logger.warn(`ACME not ready for ${domain} within ${Math.round(waitMs / 1000)}s — self-signed for now (order continues in background)`);
     return await this._generateAndCacheSelfSigned(domain);
   }
 
