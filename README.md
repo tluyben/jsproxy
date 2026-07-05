@@ -79,7 +79,10 @@ HTTP_PORT=8080                     # HTTP port (default: 8080 dev, 80 prod)
 HTTPS_PORT=8443                    # HTTPS port (default: 8443 dev, 443 prod)
 HTTP_HOST=0.0.0.0                  # Bind address (default: 0.0.0.0)
 ENABLE_HTTPS=true|false            # Enable HTTPS (default: false dev, true prod)
-FORCE_HTTPS=true                   # Redirect all HTTP → HTTPS (default: false)
+FORCE_HTTPS=true                   # Redirect ALL HTTP → HTTPS unconditionally (default: false)
+AUTO_HTTPS_REDIRECT=false          # Disable the automatic per-domain HTTP → HTTPS
+                                   #   redirect (default: enabled whenever HTTPS is
+                                   #   served). See "Automatic HTTPS redirect" below.
 TRUSTED_PROXIES=private            # Proxies whose X-Forwarded-* headers to trust
                                    #   (default: empty = trust none / edge posture).
                                    #   Comma list of CIDRs/IPs, or keywords
@@ -276,6 +279,40 @@ UPDATE mappings SET allowed_ips = NULL WHERE domain = 'admin.example.com';
 ```
 
 WebSocket connections respect the same allowlist — blocked connections receive `403 Forbidden` before the upgrade is completed.
+
+## Automatic HTTPS redirect
+
+When HTTPS is being served, jsproxy sends plain-HTTP requests a permanent
+`301` redirect to the `https://` URL **as soon as it can terminate TLS for that
+domain** — i.e. once a certificate exists for it (a trusted/ACME cert where
+possible, or a self-signed one otherwise, or a covering wildcard). This lets you
+drop the HTTP-only fronting layer (nginx/caddy) whose only job was doing the
+redirect: point HTTP and HTTPS straight at jsproxy and it handles both.
+
+- **On by default** whenever the HTTPS listener is actually bound. Set
+  `AUTO_HTTPS_REDIRECT=false` to turn it off (e.g. if some domains must stay
+  HTTP-only).
+- **Per-domain, cert-gated.** A domain is only redirected once it has a cert, so
+  clients are never bounced to a TLS endpoint that can't serve them. The first
+  request to a brand-new domain that has only ever seen HTTP is proxied over HTTP
+  and its certificate is materialised in the background — the *next* request
+  redirects. Nothing is blackholed waiting for a first HTTPS hit.
+- **ACME challenges are exempt.** `/.well-known/acme-challenge/…` (and the health
+  check) short-circuit before the redirect, so Let's Encrypt's HTTP-01 validation
+  keeps working.
+- **Runs before auth/IP checks**, so credentials are never sent over plain HTTP.
+
+Relationship to `FORCE_HTTPS`:
+
+| Setting | Behaviour |
+| --- | --- |
+| `FORCE_HTTPS=true` | Redirect **all** HTTP → HTTPS unconditionally, regardless of cert or mapping. Takes precedence; the automatic redirect is skipped. |
+| `AUTO_HTTPS_REDIRECT` unset/`true` (default) | Redirect **only served domains that have a certificate**. |
+| `AUTO_HTTPS_REDIRECT=false` | No automatic redirect (HTTP is proxied as-is). |
+
+The forwarded-scheme headers (`X-Forwarded-Proto` / `-Ssl` / `Front-End-Https`)
+are honoured when the peer is a trusted proxy (see `TRUSTED_PROXIES`), so a
+request already secure at the edge is not redirected again.
 
 ## Auth Protection
 

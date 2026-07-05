@@ -66,6 +66,11 @@ class ProxyServer {
     
     this.httpServer = null;
     this.httpsServer = null;
+    // Set true once the HTTPS listener is actually bound (see start()); the
+    // auto HTTP→HTTPS redirect only fires when TLS is genuinely being served.
+    this.httpsEnabled = false;
+    this.resolvedHttpsPort = null;  // numeric/string HTTPS port used in redirect URLs
+    this._certWarming = new Set();  // domains with an in-flight background cert warm
     this.tcpServers = new Map();  // listen_port -> net.Server (raw TCP proxy, opt-in)
     this.setupProxyErrorHandling();
   }
@@ -232,6 +237,7 @@ class ProxyServer {
     const isProduction = process.env.NODE_ENV === 'production';
     const httpPort = process.env.HTTP_PORT || (isProduction ? 80 : 8080);
     const httpsPort = process.env.HTTPS_PORT || (isProduction ? 443 : 8443);
+    this.resolvedHttpsPort = httpsPort;
     const httpHost = process.env.HTTP_HOST || '0.0.0.0';
     const enableHttps = process.env.ENABLE_HTTPS !== 'false' && (isProduction || process.env.ENABLE_HTTPS === 'true');
 
@@ -294,6 +300,7 @@ class ProxyServer {
         
         await new Promise((resolve) => {
           this.httpsServer.listen(httpsPort, httpHost, () => {
+            this.httpsEnabled = true;
             this.logger.info(`HTTPS server listening on ${httpHost}:${httpsPort}`);
             resolve();
           });
@@ -625,6 +632,34 @@ class ProxyServer {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
         return;
+      }
+
+      // Automatic HTTP → HTTPS redirect. Once we can serve this served domain
+      // over TLS — a trusted/ACME cert, a self-signed cert, or a covering
+      // wildcard, whichever exists — send plain-HTTP clients a permanent 301 so
+      // the proxy terminates TLS itself with no HTTP-only fronting layer (e.g.
+      // nginx) needed. Runs before auth/IP so credentials never travel over
+      // HTTP. Skipped when the request is already secure, HTTPS isn't actually
+      // being served, the blanket FORCE_HTTPS path above already handled it, or
+      // the operator opted out with AUTO_HTTPS_REDIRECT=false. A domain with no
+      // cert yet is proxied over HTTP this once and its cert is warmed in the
+      // background, so the NEXT request redirects — a brand-new domain that has
+      // only ever seen HTTP is never blackholed waiting for a first TLS hit.
+      if (!isSecure
+          && this.httpsEnabled
+          && process.env.FORCE_HTTPS !== 'true'
+          && process.env.AUTO_HTTPS_REDIRECT !== 'false') {
+        const certDomain = mapping.domain && mapping.domain.startsWith('*.')
+          ? mapping.domain
+          : domain;
+        if (await this.certManager.hasCertificateFor(domain)) {
+          const httpsPort = this.resolvedHttpsPort;
+          const portSuffix = (httpsPort === 443 || httpsPort === '443') ? '' : `:${httpsPort}`;
+          res.writeHead(301, { 'Location': `https://${domain}${portSuffix}${req.url}` });
+          res.end();
+          return;
+        }
+        this._warmCertificate(certDomain);
       }
 
       // Store mapping context for error handlers.
@@ -1931,6 +1966,22 @@ class ProxyServer {
   // X-Forwarded-Proto / -Ssl / Front-End-Https ONLY when the immediate peer is a
   // trusted proxy; otherwise derives purely from this hop's own TLS socket, so a
   // plaintext client can't claim https by sending a forwarded header.
+  // Fire-and-forget certificate materialization for a served domain that has
+  // only ever seen HTTP traffic (so no cert was lazily generated on a TLS SNI
+  // handshake yet). Produces a self-signed cert immediately and, for public
+  // domains, upgrades to ACME/trusted in the background. Deduped per domain so
+  // repeated HTTP hits during warming don't spawn concurrent generations. Once
+  // the cert lands, hasCertificateFor() flips true and the domain starts
+  // redirecting to HTTPS on its own — no operator action needed.
+  _warmCertificate(domain) {
+    if (!domain || this._certWarming.has(domain)) return;
+    this._certWarming.add(domain);
+    Promise.resolve()
+      .then(() => this.certManager.ensureCertificate(domain, true))
+      .catch((err) => this.logger.warn(`cert warm failed for ${domain}: ${err.message || err}`))
+      .finally(() => this._certWarming.delete(domain));
+  }
+
   isClientHttps(req) {
     if (req.connection && req.connection.encrypted) return true;
     if (!this._isTrusted(this.getPeerIp(req))) return false;

@@ -797,6 +797,40 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     return null;
   }
 
+  /**
+   * Does this domain already have a usable certificate we can serve over TLS,
+   * WITHOUT generating, ordering, or upgrading anything? Used by the proxy to
+   * decide whether a plain-HTTP request may be permanently redirected to HTTPS.
+   *
+   * Checks the cheap in-memory caches first (exact domain, then a covering
+   * wildcard for subdomains), then the persistent store (trusted → self-signed
+   * → wildcard). Any store error resolves to false rather than throwing, so a
+   * storage hiccup can never turn into a redirect loop — the request just stays
+   * on HTTP. Existence is enough here; even a soon-to-expire cert still serves,
+   * and validity/renewal is handled on the actual TLS path.
+   */
+  async hasCertificateFor(domain) {
+    if (!domain) return false;
+
+    // In-memory: exact domain, or (for a subdomain) a cached covering wildcard.
+    if (this.certificates.has(domain)) return true;
+    const mainDomain = this.getMainDomain(domain);
+    const isSubdomain = domain !== mainDomain;
+    if (isSubdomain && this.wildcardCerts.has(mainDomain)) return true;
+
+    // Persistent store: trusted, then self-signed, then a covering wildcard.
+    const keys = [`${domain}.trusted.crt`, `${domain}.selfsigned.crt`];
+    if (isSubdomain) keys.push(`wildcard.${mainDomain}.crt`);
+    try {
+      for (const key of keys) {
+        const cert = await this.store.read(key);
+        if (cert) return true;
+      }
+    } catch (_) { /* fall through → false */ }
+
+    return false;
+  }
+
   getTestChallenge(token) {
     return this.testChallenges.get(token) || null;
   }
