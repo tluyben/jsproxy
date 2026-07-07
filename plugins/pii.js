@@ -269,6 +269,12 @@ function scrubObject(obj, path, detectedFields) {
 function scrubBody(payload, label) {
   if (!payload || payload.length === 0) return { buffer: null, fields: [] };
 
+  // NOTE: `payload` is the RAW body — still Content-Encoding'd if the origin
+  // compressed it (gzip/br/zstd). toString('utf8') on compressed bytes yields
+  // UTF-8-mangled garbage; JSON.parse then fails and we pass through (safe here,
+  // because this scrubber only touches valid JSON). A body-REWRITING plugin must
+  // instead decode per content-encoding first and fail open on codecs it can't
+  // decode — see the CONTENT-ENCODING CONTRACT in _protocol.js.
   const text = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload);
 
   let parsed;

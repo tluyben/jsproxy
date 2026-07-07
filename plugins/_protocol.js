@@ -13,6 +13,20 @@
  * Reply with the same shape: the decision verb goes in `x-plugin-result`,
  * verb-specific fields (statusCode, uri, method, headers) in `x-plugin-meta`,
  * and any rewritten payload as the raw response body.
+ *
+ * CONTENT-ENCODING CONTRACT (important):
+ *   The /after payload is the ORIGIN response body VERBATIM — still compressed if
+ *   the origin sent `Content-Encoding: gzip|br|deflate|zstd`. jsproxy core does NOT
+ *   decode it. A plugin that INSPECTS or REWRITES the body MUST therefore:
+ *     1. decode per the `content-encoding` header before treating it as text, and
+ *     2. FAIL OPEN — return CONTINUE with the ORIGINAL bytes — for any encoding it
+ *        cannot decode (e.g. `zstd` on Node <22.15). Never `.toString()` a raw,
+ *        still-compressed body: the bytes become UTF-8-mangled garbage that then
+ *        gets served to clients (observed with Cloudflare-fronted origins emitting
+ *        zstd). When you skip a body for this reason, LOG it — a silently skipped
+ *        codec is a bug that resurfaces later.
+ *   NOTE: the bundled `pii.js` example does `payload.toString('utf8')` directly and
+ *   is subject to this pitfall for compressed responses.
  */
 
 // Buffer + JSON-parse the small metadata body sent to /valid.
