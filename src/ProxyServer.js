@@ -619,6 +619,15 @@ class ProxyServer {
       // once per request (never in a per-port retry), so failover can't duplicate.
       this._appendForwardedFor(req);
 
+      // Set X-Forwarded-Proto at the SAME chokepoint (like XFF above) so proxy.web,
+      // the buffered/streaming HA paths, and the plugin paths all forward one
+      // identical scheme. The plugin BUFFERED path (_tryTarget) never set it, so a
+      // TLS client's backend saw NO X-Forwarded-Proto and assumed http — breaking
+      // secure cookies / OAuth redirect_uri / https-URL building on proxied apps.
+      // isClientHttps() derives from this hop's own TLS socket (or a trusted proxy's
+      // forwarded header), so a plaintext client still can't claim https.
+      req.headers['x-forwarded-proto'] = this.isClientHttps(req) ? 'https' : 'http';
+
       if (process.env.LOG_LEVEL === 'debug') {
         this.logger.debug('incoming request', {
           domain, method: req.method, url: req.url,
