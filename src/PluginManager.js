@@ -228,7 +228,14 @@ class PluginManager {
             return { type: 'IGNORE' };
           case 'CANCEL':
             this.cleanup(requestId);
-            return { type: 'CANCEL', statusCode: res.meta.statusCode || 400 };
+            // A plugin may serve its OWN response body + headers on a block (e.g. a
+            // WAF block page or a proof-of-work challenge), not just a bare status.
+            return {
+              type: 'CANCEL',
+              statusCode: res.meta.statusCode || 400,
+              headers: res.meta.headers ?? null,
+              body: res.body && res.body.length > 0 ? res.body : null,
+            };
           case 'REWRITE_REQUEST':
             // Don't clean up — runAfter will still be called. payload is the raw
             // response body (a Buffer); zero-length means "keep original body".

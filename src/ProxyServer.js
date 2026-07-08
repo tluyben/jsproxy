@@ -1347,8 +1347,10 @@ class ProxyServer {
     );
 
     if (beforeResult.type === 'CANCEL') {
-      res.writeHead(beforeResult.statusCode, { 'content-type': 'text/plain' });
-      return res.end();
+      // The plugin may supply its own headers + body (block page / PoW challenge);
+      // fall back to a bare status with an empty text body.
+      res.writeHead(beforeResult.statusCode, beforeResult.headers || { 'content-type': 'text/plain' });
+      return res.end(beforeResult.body || undefined);
     }
 
     // Apply REWRITE_REQUEST (null fields keep the original value)
@@ -1407,8 +1409,10 @@ class ProxyServer {
     );
 
     if (beforeResult.type === 'CANCEL') {
-      res.writeHead(beforeResult.statusCode, { 'content-type': 'text/plain' });
-      return res.end();
+      // The plugin may supply its own headers + body (block page / PoW challenge);
+      // fall back to a bare status with an empty text body.
+      res.writeHead(beforeResult.statusCode, beforeResult.headers || { 'content-type': 'text/plain' });
+      return res.end(beforeResult.body || undefined);
     }
 
     let uri     = req.url;
