@@ -13,6 +13,7 @@ const noop = {
   async runValid() { return { interested: [], needsBody: true }; },
   async runBefore() { return { type: 'CONTINUE' }; },
   async runAfter() { return { type: 'CONTINUE' }; },
+  async runError() { return null; },
 };
 
 class PluginManager {
@@ -300,6 +301,45 @@ class PluginManager {
 
     this.cleanup(requestId); // always clean up — this is the last call
     return result;
+  }
+
+  /**
+   * POST /error to each plugin when jsproxy is about to emit one of its OWN
+   * synthetic gateway responses (a 502/504 it generated because the backend was
+   * unreachable / timed out — NOT an error the backend itself returned). This is a
+   * best-effort, metadata-only hook: it lets a plugin substitute a branded, per-
+   * host error page (looked up from its own store) for the plain-text default, and
+   * observe the failure for stats. Unlike /before and /after it is NOT gated by
+   * /valid interest — gateway failures happen independently of per-request plugin
+   * engagement — so it is offered to EVERY plugin on every synthetic gateway error.
+   *
+   * `meta` carries { domain, inPort, statusCode, reason, uri, method, headers }.
+   * The request body is empty; the plugin's RESPONSE body is the replacement page.
+   * First plugin to answer ERROR_PAGE (with a non-empty body) wins; any error or
+   * timeout is swallowed (fail-open) so a broken plugin never blocks the fallback.
+   *
+   * Returns { statusCode, headers, body } to serve, or null to keep the default.
+   */
+  async runError(meta) {
+    if (!this.hasPlugins) return null;
+
+    for (const plugin of this.plugins) {
+      try {
+        const res = await this._postRaw(plugin, '/error', meta, null);
+        if (res.result === 'ERROR_PAGE' && res.body && res.body.length > 0) {
+          return {
+            statusCode: res.meta.statusCode || meta.statusCode,
+            headers: res.meta.headers ?? null,
+            body: res.body,
+          };
+        }
+        // 'CONTINUE' / anything else: this plugin declined — try the next one.
+      } catch (err) {
+        this.logger.warn(`Plugin ${plugin.host}:${plugin.port} /error error: ${err.message} (fail-open)`);
+      }
+    }
+
+    return null;
   }
 }
 

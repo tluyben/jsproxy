@@ -200,8 +200,7 @@ class ProxyServer {
         syscall:    err.syscall,
       });
       if (res && !res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end('Bad Gateway');
+        this._sendGatewayError(req, res, 502, 'Bad Gateway', `proxy-error:${err.code || 'unknown'}`);
       }
     });
 
@@ -217,8 +216,7 @@ class ProxyServer {
         error_code: err.code,
       });
       if (res && !res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end('Bad Gateway');
+        this._sendGatewayError(req, res, 502, 'Bad Gateway', `proxy-req-error:${err.code || 'unknown'}`);
       }
     });
   }
@@ -1233,7 +1231,7 @@ class ProxyServer {
         error_code: err.code,
         address:    err.address,
       });
-      return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway') };
+      return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway'), _gatewayError: true, _gatewayReason: `backend-error:${err.code || 'unknown'}` };
     }
   }
 
@@ -1289,6 +1287,8 @@ class ProxyServer {
             statusCode: 504,
             headers: { 'content-type': 'text/plain' },
             body: Buffer.from('Gateway Timeout'),
+            _gatewayError: true,
+            _gatewayReason: 'post-connect-timeout',
           };
         }
 
@@ -1329,7 +1329,7 @@ class ProxyServer {
       span.setAttribute('ha.all_backends_down', true);
       span.setAttribute('ha.failed_backends', ordered.map(t => `${t.hostname}:${t.port}`).join(','));
     }
-    return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway: all backends unavailable') };
+    return { statusCode: 502, headers: { 'content-type': 'text/plain' }, body: Buffer.from('Bad Gateway: all backends unavailable'), _gatewayError: true, _gatewayReason: 'all-backends-unavailable' };
   }
 
   // Full request/response pipeline used when ≥1 plugin expressed interest.
@@ -1375,7 +1375,7 @@ class ProxyServer {
     // ── after() ──────────────────────────────────────────────────────────────
     // Skipped when before() returned IGNORE (cleanup already done)
     if (skipAfter) {
-      return this.sendHAResponse(res, backendResult);
+      return this.sendHAResponse(req, res, backendResult);
     }
 
     const afterResult = await this.pluginManager.runAfter(
@@ -1398,7 +1398,7 @@ class ProxyServer {
     }
 
     // CONTINUE — send the backend response as-is
-    this.sendHAResponse(res, backendResult);
+    await this.sendHAResponse(req, res, backendResult);
   }
 
   // Streaming plugin path: run before()/after() with null body, pipe request and
@@ -1512,8 +1512,7 @@ class ProxyServer {
           } catch (err) {
             this.logger.error('plugin streaming after() error', { domain, error: err.message });
             if (!res.headersSent) {
-              res.writeHead(502, { 'content-type': 'text/plain' });
-              res.end('Bad Gateway');
+              await this._sendGatewayError(req, res, 502, 'Bad Gateway', 'plugin-stream-after-error');
             }
             resolve();
           }
@@ -1523,8 +1522,7 @@ class ProxyServer {
       proxyReq.on('error', (err) => {
         this.logger.error('plugin streaming backend error', { domain, port, error: err.message });
         if (!res.headersSent) {
-          res.writeHead(502, { 'content-type': 'text/plain' });
-          res.end('Bad Gateway');
+          this._sendGatewayError(req, res, 502, 'Bad Gateway', `plugin-stream-backend-error:${err.code || 'unknown'}`);
         }
         resolve();
       });
@@ -1538,7 +1536,13 @@ class ProxyServer {
     });
   }
 
-  sendHAResponse(res, result) {
+  async sendHAResponse(req, res, result) {
+    // A result jsproxy synthesised because it could not reach the backend (marked
+    // _gatewayError) is routed through the error hook so a plugin can brand it —
+    // NOT the plain header-copy path used for a genuine backend response.
+    if (result._gatewayError) {
+      return this._sendGatewayError(req, res, result.statusCode, result.body, result._gatewayReason);
+    }
     const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
     const headers = {};
     for (const [k, v] of Object.entries(result.headers)) {
@@ -1546,6 +1550,47 @@ class ProxyServer {
     }
     res.writeHead(result.statusCode, headers);
     res.end(result.body);
+  }
+
+  // Serve one of jsproxy's OWN synthetic gateway errors (a 502/504 it generated
+  // because the backend was unreachable / timed out). Before falling back to the
+  // plain-text body, offer a plugin the chance to supply a branded, per-host error
+  // page via the /error hook (see PluginManager.runError). Fail-open in every
+  // direction: no plugins, a plugin error/timeout, or an already-started response
+  // all leave the plain-text default untouched, so this can never make a gateway
+  // error worse. `reason` is a short machine tag (e.g. 'all-backends-unavailable')
+  // passed through for the plugin's diagnostics/stats.
+  async _sendGatewayError(req, res, statusCode, fallback, reason) {
+    if (res.headersSent) return;
+    if (this.pluginManager.hasPlugins) {
+      try {
+        const domain = req._proxyDomain
+          || (req.headers && req.headers.host ? req.headers.host.split(':')[0] : '')
+          || 'unknown';
+        const inPort = (req.socket && req.socket.encrypted)
+          ? parseInt(process.env.HTTPS_PORT || (process.env.NODE_ENV === 'production' ? '443' : '8443'), 10)
+          : parseInt(process.env.HTTP_PORT || (process.env.NODE_ENV === 'production' ? '80' : '8080'), 10);
+        const page = await this.pluginManager.runError({
+          domain, inPort, statusCode,
+          reason: reason || null,
+          uri: req.url, method: req.method,
+          headers: req.headers,
+        });
+        if (page && page.body && page.body.length > 0 && !res.headersSent) {
+          const headers = (page.headers && typeof page.headers === 'object')
+            ? page.headers
+            : { 'content-type': 'text/html; charset=utf-8' };
+          res.writeHead(page.statusCode || statusCode, headers);
+          return res.end(page.body);
+        }
+      } catch (err) {
+        this.logger.warn(`gateway error page hook failed (fail-open): ${err.message}`);
+      }
+    }
+    if (!res.headersSent) {
+      res.writeHead(statusCode, { 'Content-Type': 'text/plain' });
+      res.end(fallback);
+    }
   }
 
   async haRequest(mapping, req, res) {
@@ -1563,7 +1608,7 @@ class ProxyServer {
     // (including post-connect failures, which the streaming path cannot retry).
     const body = await this.bufferBody(req);
     const result = await this._requestHA(mapping, req.url, req.method, req.headers, body, req._span);
-    this.sendHAResponse(res, result);
+    await this.sendHAResponse(req, res, result);
   }
 
   // A request must be streamed (never buffered) when its body is large, of unknown
@@ -1661,7 +1706,7 @@ class ProxyServer {
         domain: mapping.domain, url: req.url, idle_ms: idleMs,
       });
       if (currentProxyReq) currentProxyReq.destroy(new Error('Idle timeout'));
-      if (!res.headersSent) { res.writeHead(504, { 'Content-Type': 'text/plain' }); res.end('Gateway Timeout'); }
+      if (!res.headersSent) this._sendGatewayError(req, res, 504, 'Gateway Timeout', 'stream-idle-timeout');
       else if (!res.writableEnded) res.destroy();
     };
     const clearIdle = () => { if (idleTimer) { clearInterval(idleTimer); idleTimer = null; } };
@@ -1703,8 +1748,7 @@ class ProxyServer {
           span.setAttribute('ha.failed_backends', list);
         }
         if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'text/plain' });
-          res.end('Bad Gateway: all backends unavailable');
+          this._sendGatewayError(req, res, 502, 'Bad Gateway: all backends unavailable', 'stream-all-backends-unavailable');
         }
         return;
       }
@@ -1784,8 +1828,7 @@ class ProxyServer {
           });
           req.unpipe(proxyReq);
           if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'text/plain' });
-            res.end('Bad Gateway');
+            this._sendGatewayError(req, res, 502, 'Bad Gateway', `stream-post-connect-error:${err.code || 'unknown'}`);
           } else if (!res.writableEnded) {
             res.destroy();
           }

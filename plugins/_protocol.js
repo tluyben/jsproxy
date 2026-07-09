@@ -9,6 +9,17 @@
  *                     the payload as the RAW request/response body. No base64:
  *                     bodies stream through untouched, so a 100 MB upload costs
  *                     100 MB, not ~1 GB.
+ *   /error          — metadata in `x-plugin-meta` ({ domain, inPort, statusCode,
+ *                     reason, uri, method, headers }), EMPTY request body. Called
+ *                     only when jsproxy is about to emit one of its OWN synthetic
+ *                     gateway responses (a 502/504 it generated because the backend
+ *                     was unreachable/timed out — NOT a backend-returned error). It
+ *                     is NOT gated by /valid interest: every plugin is asked on
+ *                     every synthetic gateway error. Reply `ERROR_PAGE` with the
+ *                     replacement page as the raw response body (and optional
+ *                     `statusCode`/`headers` in x-plugin-meta) to serve a branded,
+ *                     per-host error page; reply `CONTINUE` (or error/time out) to
+ *                     keep jsproxy's plain-text default. See PluginManager.runError.
  *
  * Reply with the same shape: the decision verb goes in `x-plugin-result`,
  * verb-specific fields (statusCode, uri, method, headers) in `x-plugin-meta`,
