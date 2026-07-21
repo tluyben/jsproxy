@@ -199,8 +199,17 @@ class ProxyServer {
         errno:      err.errno,
         syscall:    err.syscall,
       });
-      if (res && !res.headersSent) {
-        this._sendGatewayError(req, res, 502, 'Bad Gateway', `proxy-error:${err.code || 'unknown'}`);
+      if (res && typeof res.writeHead === 'function') {
+        if (!res.headersSent) {
+          this._sendGatewayError(req, res, 502, 'Bad Gateway', `proxy-error:${err.code || 'unknown'}`);
+        }
+      } else if (res && typeof res.destroy === 'function') {
+        // WebSocket upgrade: `res` is the raw client socket — there are no
+        // response headers to send. Calling _sendGatewayError on it threw
+        // `res.writeHead is not a function` as an UNHANDLED REJECTION, which
+        // under Node's default policy kills the whole proxy process — one WS
+        // client hitting a dead backend took every domain down. Just drop it.
+        res.destroy();
       }
     });
 
@@ -215,8 +224,12 @@ class ProxyServer {
         error:      err.message,
         error_code: err.code,
       });
-      if (res && !res.headersSent) {
-        this._sendGatewayError(req, res, 502, 'Bad Gateway', `proxy-req-error:${err.code || 'unknown'}`);
+      if (res && typeof res.writeHead === 'function') {
+        if (!res.headersSent) {
+          this._sendGatewayError(req, res, 502, 'Bad Gateway', `proxy-req-error:${err.code || 'unknown'}`);
+        }
+      } else if (res && typeof res.destroy === 'function') {
+        res.destroy();
       }
     });
   }
@@ -860,11 +873,27 @@ class ProxyServer {
       req.headers['x-forwarded-proto'] = this.isClientHttps(req) ? 'https' : 'http';
       if (!req.headers['x-forwarded-host']) req.headers['x-forwarded-host'] = req.headers.host || '';
 
-      // WebSocket uses a single backend (no mid-stream failover): pick the
-      // best-scored target. This resolves both a port list and a multi-host
-      // backend list to one concrete host:port.
+      // WebSocket has no mid-upgrade failover (http-proxy ends the client
+      // socket on a backend error), so an HA mapping must pick a LIVE target
+      // BEFORE the upgrade: TCP-probe candidates in ranked order, penalizing
+      // dead ones as they're found so plain-HTTP requests shed them too. This
+      // resolves both a port list and a multi-host backend list.
       const targets = this._backendTargets(mapping);
-      const chosen  = targets.length > 1 ? this.rankedTargets(mapping.id, targets)[0] : targets[0];
+      let chosen;
+      if (targets.length > 1) {
+        chosen = await this._probeLiveTarget(mapping, targets);
+        if (!chosen) {
+          this.logger.error('all backends unavailable (websocket)', {
+            domain, mapping_id: mapping.id,
+            backends: targets.map(t => `${t.hostname}:${t.port}`).join(','),
+          });
+          socket.write('HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nBad Gateway: all backends unavailable');
+          socket.destroy();
+          return;
+        }
+      } else {
+        chosen = targets[0];
+      }
       const scheme  = chosen && chosen.isHttps ? 'https' : 'http';
       const target  = chosen
         ? `${scheme}://${chosen.hostname}:${chosen.port}`
@@ -873,6 +902,19 @@ class ProxyServer {
         target,
         secure: false,
         changeOrigin: true
+      }, (err) => {
+        // Error callback (used INSTEAD of the global 'error' handler, which
+        // expects a ServerResponse it can writeHead on — here there is only the
+        // raw client socket). Penalize the target on an HA mapping so the next
+        // upgrade avoids it; http-proxy has already ended the client socket.
+        if (chosen && targets.length > 1) {
+          this.penalizePort(mapping.id, chosen.key);
+          this.startBackgroundCheckTarget(mapping, chosen);
+        }
+        this.logger.warn('websocket proxy error', {
+          domain, target, url: req.url, error: err.message, error_code: err.code,
+        });
+        socket.destroy();
       });
 
     } catch (error) {
@@ -1068,6 +1110,33 @@ class ProxyServer {
     const t = setTimeout(probe, 2000);
     if (t.unref) t.unref();
     this.logger.warn(`HA: backend ${host}:${port} scored 0, background probe started`);
+  }
+
+  // TCP-probe targets in ranked order and return the first that accepts a
+  // connection; penalize (and background-probe) each dead one on the way.
+  // Returns null when every target is down. Used by paths that cannot fail
+  // over once the upgrade/stream has started (WebSocket).
+  async _probeLiveTarget(mapping, targets) {
+    const ordered   = this.rankedTargets(mapping.id, targets);
+    const timeoutMs = parseInt(process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
+    for (const target of ordered) {
+      const alive = await new Promise((resolve) => {
+        const sock = new net.Socket();
+        sock.setTimeout(timeoutMs);
+        const done = (ok) => { sock.destroy(); resolve(ok); };
+        sock.once('connect', () => done(true));
+        sock.once('error',   () => done(false));
+        sock.once('timeout', () => done(false));
+        sock.connect(target.port, target.hostname);
+      });
+      if (alive) return target;
+      this.penalizePort(mapping.id, target.key);
+      this.startBackgroundCheckTarget(mapping, target);
+      this.logger.warn('HA probe: backend down, trying next', {
+        mapping_id: mapping.id, backend: `${target.hostname}:${target.port}`,
+      });
+    }
+    return null;
   }
 
   // Kept for backward compat with any remaining call sites
@@ -1443,27 +1512,54 @@ class ProxyServer {
       delete headers['transfer-encoding'];
     }
 
-    // Plugin streaming has no mid-stream failover: pick the single best target.
+    // Plugin streaming has no MID-STREAM failover, but a connect-phase failure
+    // (TCP never established → nothing sent to the backend) fails over across
+    // ranked targets exactly like _streamHA: penalize the dead target, start a
+    // background probe, try the next. Previously this path picked one target
+    // and 502'd on a dead port with no penalty — so on an HA mapping the dead
+    // backend kept being picked (rotation) and every other request failed.
     const targets = this._backendTargets(mapping);
-    const target  = targets.length > 1 ? this.rankedTargets(mapping.id, targets)[0] : targets[0];
-    const port    = target.port;
-    const lib     = target.isHttps ? https : http;
+    const ordered = targets.length > 1 ? this.rankedTargets(mapping.id, targets) : targets;
 
     const targetPath = (!mapping.front_uri && !mapping.back_uri)
       ? uri
       : this.buildTargetPath(mapping, uri);
 
     headers['x-forwarded-host'] = headers['host'] || '';
-    // Honor a back_host rewrite when set; otherwise keep this path's historical
-    // behavior of addressing the backend by its own host:port.
-    headers['host'] = mapping.back_host || `${target.hostname}:${port}`;
 
     const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
+    const connectTimeoutMs = parseInt(process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
+
+    // Hold the client body until a backend connection is committed, so a
+    // connect-phase failover never loses body bytes. (A plugin-supplied rewrite
+    // body is resendable from memory and doesn't need this.)
+    if (!rewriteReqBody) req.pause();
 
     return new Promise((resolve) => {
+      const attempt = (idx) => {
+      if (idx >= ordered.length) {
+        const list = ordered.map(t => `${t.hostname}:${t.port}`).join(',');
+        this.logger.error('all backends unavailable (plugin stream)', {
+          domain, mapping_id: mapping.id, backends: list,
+        });
+        this._sendGatewayError(req, res, 502, 'Bad Gateway: all backends unavailable', 'plugin-stream-all-backends-unavailable');
+        return resolve();
+      }
+      const target = ordered[idx];
+      const port   = target.port;
+      const lib    = target.isHttps ? https : http;
+      let committed = false; // true once TCP connect succeeds and the body starts flowing
+
+      // Honor a back_host rewrite when set; otherwise keep this path's historical
+      // behavior of addressing the backend by its own host:port.
+      const attemptHeaders = { ...headers };
+      attemptHeaders['host'] = mapping.back_host || `${target.hostname}:${port}`;
+
       const proxyReq = lib.request(
-        { hostname: target.hostname, port, path: targetPath, method, headers },
+        { hostname: target.hostname, port, path: targetPath, method, headers: attemptHeaders,
+          ...(target.isHttps ? { rejectUnauthorized: false } : {}) },
         async (proxyRes) => {
+          this.boostPort(mapping.id, target.key);
           try {
             if (!skipAfter) {
               const afterResult = await this.pluginManager.runAfter(
@@ -1519,20 +1615,50 @@ class ProxyServer {
         }
       );
 
+      proxyReq.on('socket', (socket) => {
+        const onConnect = () => {
+          committed = true;
+          socket.setTimeout(0);
+          if (rewriteReqBody) {
+            req.resume();             // drain & discard the original client body
+            proxyReq.end(rewriteReqBody);
+          } else {
+            req.pipe(proxyReq);
+          }
+        };
+        if (socket.connecting) {
+          socket.setTimeout(connectTimeoutMs);
+          socket.once('connect', onConnect);
+        } else {
+          // Pooled / keepalive socket — already connected.
+          onConnect();
+        }
+      });
+
+      proxyReq.on('timeout', () => {
+        // Only the pre-connect socket deadline can fire (post-connect we set 0).
+        proxyReq.destroy(new Error('Connect timeout'));
+      });
+
       proxyReq.on('error', (err) => {
+        if (!committed) {
+          // Connect-phase failure: nothing sent yet → penalize and fail over.
+          this.penalizePort(mapping.id, target.key);
+          this.startBackgroundCheckTarget(mapping, target);
+          this.logger.warn('plugin stream connect failed, trying next backend', {
+            domain, backend: `${target.hostname}:${port}`, url: req.url,
+            error: err.message, error_code: err.code,
+          });
+          return attempt(idx + 1);
+        }
         this.logger.error('plugin streaming backend error', { domain, port, error: err.message });
         if (!res.headersSent) {
           this._sendGatewayError(req, res, 502, 'Bad Gateway', `plugin-stream-backend-error:${err.code || 'unknown'}`);
         }
         resolve();
       });
-
-      if (rewriteReqBody) {
-        req.resume();                 // drain & discard the original client body
-        proxyReq.end(rewriteReqBody);
-      } else {
-        req.pipe(proxyReq);
-      }
+      };
+      attempt(0);
     });
   }
 
@@ -1561,6 +1687,13 @@ class ProxyServer {
   // error worse. `reason` is a short machine tag (e.g. 'all-backends-unavailable')
   // passed through for the plugin's diagnostics/stats.
   async _sendGatewayError(req, res, statusCode, fallback, reason) {
+    // Defensive: some error paths (WS upgrades) carry a raw socket instead of a
+    // ServerResponse. Never throw out of here — this runs inside error handlers
+    // where an exception becomes an unhandled rejection.
+    if (!res || typeof res.writeHead !== 'function') {
+      if (res && typeof res.destroy === 'function') res.destroy();
+      return;
+    }
     if (res.headersSent) return;
     if (this.pluginManager.hasPlugins) {
       try {

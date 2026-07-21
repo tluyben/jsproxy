@@ -729,7 +729,7 @@ client ──▶ api.example.com ──▶ jsproxy ─────────�
 
 > **Backward compatibility:** multi-host mode only activates when `backend` contains a comma — a shape no single-URL config ever produced — so existing mappings and the multi-port mode are completely unchanged.
 
-> **WebSocket**: always uses a single backend (the first ranked one). HA applies to HTTP/HTTPS only.
+> **WebSocket**: a connection uses a single backend (no mid-upgrade failover), but on an HA mapping the target is chosen by TCP-probing candidates in ranked order — dead backends are penalized and skipped, so upgrades land on a live backend even when the first-ranked port/host is down.
 
 ## Raw TCP Proxying
 
