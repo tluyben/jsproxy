@@ -1304,11 +1304,14 @@ class ProxyServer {
     }
   }
 
-  // HA request across multiple backends. A "backend" is a distinct target — either
-  // another port on the same host (`back_port` list) or a whole other host
-  // (`backend` URL list). Tries them best-score-first; short-circuits on the first
-  // that actually responds (any status code). Connection-level failures (no
-  // response at all) penalize that target and move to the next one.
+  // HA request across multiple backends, fully buffering the RESPONSE. Only the
+  // plugin path uses this (plugins need the complete body to inspect/modify);
+  // plain HA traffic streams the response via _streamResponseHA instead. A
+  // "backend" is a distinct target — either another port on the same host
+  // (`back_port` list) or a whole other host (`backend` URL list). Tries them
+  // best-score-first; short-circuits on the first that actually responds (any
+  // status code). Connection-level failures (no response at all) penalize that
+  // target and move to the next one.
   async _requestHA(mapping, uri, method, headers, body, span = null) {
     const ordered = this.rankedTargets(mapping.id, this._backendTargets(mapping));
 
@@ -1727,21 +1730,203 @@ class ProxyServer {
   }
 
   async haRequest(mapping, req, res) {
-    // Stream directly (never buffer) when the body is large, of unknown size, or
-    // an open-ended response stream — buffering these into memory would OOM and,
-    // for an "infinite" upload, can never complete. _streamHA fails over across
-    // backends on a connect-phase failure (no body bytes sent yet, so retrying is
-    // safe); once the connection is established the body flows and a mid-stream
-    // failure surfaces to the client.
+    // Large / unknown-size / open-ended REQUEST bodies: full streaming both ways
+    // (_streamHA) — buffering these into memory would OOM and, for an "infinite"
+    // upload, can never complete. Failover is connect-phase only, since piped
+    // request bytes are gone and cannot be replayed to another backend.
     if (this._isStreamingRequest(req)) {
       return this._streamHA(mapping, req, res);
     }
 
-    // Small / known-size body: buffer and retry across ports for true failover
-    // (including post-connect failures, which the streaming path cannot retry).
+    // Small / known-size request body: buffer it so every backend can be retried
+    // with an identical request (true failover, including accepted-but-silent
+    // backends) — but STREAM the response. The response size is unknowable here
+    // (a plain GET can pull gigabytes), so it is never held in memory.
     const body = await this.bufferBody(req);
-    const result = await this._requestHA(mapping, req.url, req.method, req.headers, body, req._span);
-    await this.sendHAResponse(req, res, result);
+    return this._streamResponseHA(mapping, req, res, body);
+  }
+
+  // HA forward path for buffered-request / streamed-response traffic — the shape
+  // a plain GET download takes (_isStreamingRequest only classifies the REQUEST
+  // side, so it says nothing about how big the response will be). The request
+  // body is small and already buffered, so every backend can be retried with an
+  // identical request; the RESPONSE is piped straight to the client and never
+  // held in memory — a 300 MB download costs socket buffers, not 300 MB of RAM.
+  //
+  // Failover window: everything up to the arrival of response HEADERS.
+  //   - connect-phase failure (any method) → penalize + next target.
+  //   - accepted-but-silent / pre-header failure:
+  //       idempotent (GET/HEAD/OPTIONS) → penalize + next target (safe: the
+  //         buffered request body is re-sent verbatim);
+  //       non-idempotent → penalize + 504, no retry (the backend may already be
+  //         processing it) — same semantics as _requestHA.
+  // Once headers arrive we commit: the status line is flushed to the client and
+  // the body streams under the byte-movement idle watch (STREAM_IDLE_TIMEOUT_MS),
+  // so a slow-but-moving download is never torn down. HA_RESPONSE_TIMEOUT_MS
+  // bounds only the wait for FIRST response bytes — exactly the window in which
+  // failing over is still possible.
+  _streamResponseHA(mapping, req, res, body) {
+    const ordered = this.rankedTargets(mapping.id, this._backendTargets(mapping));
+    const span = req._span;
+    const uri = req.url;
+    const method = req.method;
+    const idempotent = ProxyServer.SAFE_METHODS.has(String(method).toUpperCase());
+
+    const targetPath = (!mapping.front_uri && !mapping.back_uri)
+      ? uri
+      : this.buildTargetPath(mapping, uri);
+
+    // Outbound headers: same shaping as the buffered path (_tryTarget) — keep
+    // the client Host (or back_host) upstream, and since we send a buffered body
+    // with an explicit Content-Length, any inbound Transfer-Encoding / Expect no
+    // longer applies.
+    const headers = Object.assign({}, req.headers);
+    if (!headers['x-forwarded-host']) headers['x-forwarded-host'] = headers['host'];
+    headers['host'] = mapping.back_host || headers['host'];
+    delete headers['transfer-encoding'];
+    delete headers['expect'];
+    if (body && body.length > 0) headers['content-length'] = body.length;
+    else delete headers['content-length'];
+
+    const connectTimeoutMs  = parseInt(process.env.HA_CONNECT_TIMEOUT_MS  || '3000',  10);
+    const responseTimeoutMs = parseInt(process.env.HA_RESPONSE_TIMEOUT_MS || '30000', 10);
+    const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
+
+    let currentProxyReq = null;
+    const watch = this._makeIdleWatch(req, () => currentProxyReq && currentProxyReq.socket, () => {
+      this.logger.warn('HA response-stream idle timeout — no bytes moved in either direction', {
+        domain: mapping.domain, url: uri, idle_ms: watch.idleMs,
+      });
+      if (currentProxyReq) currentProxyReq.destroy(new Error('Idle timeout'));
+      if (!res.headersSent) this._sendGatewayError(req, res, 504, 'Gateway Timeout', 'stream-idle-timeout');
+      else if (!res.writableEnded) res.destroy();
+    });
+    // Client gone: stop watching and, if the response never completed, tear down
+    // the live backend request so it doesn't keep pulling a dead download.
+    res.on('close', () => {
+      watch.clear();
+      if (!res.writableEnded && currentProxyReq && !currentProxyReq.destroyed) {
+        currentProxyReq.destroy();
+      }
+    });
+
+    const attempt = (idx) => {
+      if (res.destroyed) return; // client already gone — nothing to serve
+      if (idx >= ordered.length) {
+        const backendDetails = ordered.map(target => {
+          const lastSeen = this.portLastSeen.get(this._portKey(mapping.id, target.key));
+          return {
+            backend:   `${target.hostname}:${target.port}`,
+            score:     this.getPortScore(mapping.id, target.key),
+            last_seen: lastSeen ? new Date(lastSeen).toISOString() : 'never',
+            last_seen_ms_ago: lastSeen ? Date.now() - lastSeen : null,
+          };
+        });
+        this.logger.error('all backends unavailable', {
+          domain:          mapping.domain,
+          mapping_id:      mapping.id,
+          backend_details: backendDetails,
+        });
+        if (span) {
+          span.setAttribute('ha.all_backends_down', true);
+          span.setAttribute('ha.failed_backends', ordered.map(t => `${t.hostname}:${t.port}`).join(','));
+        }
+        this._sendGatewayError(req, res, 502, 'Bad Gateway: all backends unavailable', 'all-backends-unavailable');
+        return;
+      }
+
+      const target = ordered[idx];
+      const where  = `${target.hostname}:${target.port}`;
+      const lib    = target.isHttps ? https : http;
+      let connected = false;
+      let committed = false; // response headers received → streaming to client
+
+      const proxyReq = lib.request({
+        hostname: target.hostname,
+        port: target.port,
+        path: targetPath,
+        method,
+        headers,
+        ...(target.isHttps ? { rejectUnauthorized: false } : {}),
+      }, (proxyRes) => {
+        committed = true;
+        this.boostPort(mapping.id, target.key);
+        if (span) span.setAttribute('proxy.backend_status', proxyRes.statusCode);
+        const fwd = {};
+        for (const [k, v] of Object.entries(proxyRes.headers)) {
+          if (!skip.has(k.toLowerCase())) fwd[k] = v;
+        }
+        res.writeHead(proxyRes.statusCode, fwd);
+        // Body phase: swap the header-wait deadline for the byte-movement idle
+        // watch, so a long active download is never torn down.
+        if (proxyReq.socket) proxyReq.socket.setTimeout(0);
+        watch.start();
+        proxyRes.on('end', watch.clear);
+        proxyRes.pipe(res);
+        proxyRes.on('error', () => { watch.clear(); if (!res.writableEnded) res.destroy(); });
+      });
+
+      currentProxyReq = proxyReq;
+
+      proxyReq.on('socket', (socket) => {
+        if (socket.connecting) {
+          socket.setTimeout(connectTimeoutMs);
+          socket.once('connect', () => {
+            connected = true;
+            socket.setTimeout(responseTimeoutMs); // header-wait deadline
+          });
+        } else {
+          // Pooled / keepalive socket — already connected.
+          connected = true;
+          socket.setTimeout(responseTimeoutMs);
+        }
+      });
+
+      proxyReq.on('timeout', () => {
+        // Fires only pre-headers (the deadline is cleared once headers arrive).
+        proxyReq.destroy(new Error(connected ? 'No response timeout' : 'Connect timeout'));
+      });
+
+      proxyReq.on('error', (err) => {
+        if (committed) {
+          // Headers already flushed to the client — cannot fail over.
+          watch.clear();
+          this.logger.warn('HA response stream failed mid-body (no failover)', {
+            domain: mapping.domain, backend: where, uri, method,
+            error: err.message, error_code: err.code,
+          });
+          if (!res.writableEnded) res.destroy();
+          return;
+        }
+        if (res.destroyed) { watch.clear(); return; } // teardown from client abort, not a backend verdict
+        const phase = connected ? 'no-response' : 'connect';
+        this.penalizePort(mapping.id, target.key);
+        this.startBackgroundCheckTarget(mapping, target);
+        if (phase === 'no-response' && !idempotent) {
+          this.logger.error('HA backend failed post-connect on non-idempotent request (not failing over)', {
+            domain: mapping.domain, backend: where, uri, method, phase,
+            error: err.message, error_code: err.code,
+          });
+          if (span) {
+            span.setAttribute('ha.response_phase_error',   true);
+            span.setAttribute('ha.response_phase_backend', where);
+            span.setAttribute('ha.response_phase',         phase);
+          }
+          this._sendGatewayError(req, res, 504, 'Gateway Timeout', 'post-connect-timeout');
+          return;
+        }
+        this.logger.warn('HA backend failed, trying next', {
+          domain: mapping.domain, backend: where, uri, method, phase,
+          error: err.message, error_code: err.code, address: err.address,
+        });
+        attempt(idx + 1);
+      });
+
+      if (body && body.length > 0) proxyReq.write(body);
+      proxyReq.end();
+    };
+
+    attempt(0);
   }
 
   // A request must be streamed (never buffered) when its body is large, of unknown
@@ -1772,6 +1957,46 @@ class ProxyServer {
   //   - post-connect failure (backend accepted, then reset/timed out) → the body
   //     is already in flight; retrying could duplicate a non-idempotent upload
   //     and the original bytes are gone. Surface to the client, which retries.
+  // Byte-counter idle watch shared by the streaming forward paths. It is the
+  // ONLY deadline once a backend connection is live: "idle" is measured from
+  // real byte movement on BOTH legs of the proxied connection — the client
+  // socket (req) and the current backend socket. As long as either counter
+  // advances the stream is active and never torn down: a multi-GB upload, a
+  // slow-but-steady download, a long-lived SSE feed all keep it alive. onIdle
+  // fires only when NOTHING has moved either way for STREAM_IDLE_TIMEOUT_MS
+  // (default 5 min) — a genuinely stalled connection.
+  //
+  // Why poll the socket counters instead of listening to 'data' events: under
+  // backpressure, pipe() PAUSES the source, so 'data' goes silent for long
+  // stretches even though bytes are still draining — the counters keep
+  // advancing and see the real activity. socket.setTimeout is no good either:
+  // its idle clock is only nudged by inbound bytes, so it would wrongly kill a
+  // long upload that sends but never receives until the very end.
+  _makeIdleWatch(req, getBackendSocket, onIdle) {
+    const idleMs = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '300000', 10);
+    const pollMs = Math.max(250, Math.min(Math.floor(idleMs / 4), 15000));
+    let timer = null;
+    let lastBytes = -1;
+    let elapsed = 0;
+    const clear = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const start = () => {
+      clear();
+      lastBytes = -1;
+      elapsed = 0;
+      timer = setInterval(() => {
+        const inSock  = req.socket;
+        const outSock = getBackendSocket();
+        const cur = (inSock  ? inSock.bytesRead  + inSock.bytesWritten  : 0)
+                  + (outSock ? outSock.bytesRead + outSock.bytesWritten : 0);
+        if (cur !== lastBytes) { lastBytes = cur; elapsed = 0; return; } // active
+        elapsed += pollMs;
+        if (elapsed >= idleMs) { clear(); onIdle(); }
+      }, pollMs);
+      if (timer.unref) timer.unref();
+    };
+    return { start, clear, idleMs };
+  }
+
   _streamHA(mapping, req, res) {
     // Ordered failover candidates — either ports on one host or distinct backend
     // URLs. Each attempt reads its host/port/scheme from the target; the Host
@@ -1808,21 +2033,6 @@ class ProxyServer {
     // the single chokepoint. Re-appending would duplicate the peer entry.
 
     const connectTimeoutMs = parseInt(process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
-    // Idle timeout: the ONLY deadline once a backend is connected. "Idle" is
-    // measured directly from real byte movement on the backend socket —
-    // bytesWritten (upload progress, client→backend) PLUS bytesRead (download
-    // progress, backend→client). As long as either counter advances, the stream
-    // is active and is never torn down: a multi-GB upload, a slow-but-steady
-    // download, a long-lived SSE feed all keep it alive. It fires only when
-    // NOTHING has moved either way for idleMs — a genuinely stalled connection.
-    //
-    // Why poll the socket counters instead of listening to 'data' events: under
-    // backpressure (a slow backend), pipe() PAUSES the client request, so
-    // req.on('data') goes silent for long stretches even though bytes are pouring
-    // out to the backend. The socket's bytesWritten still advances, so polling it
-    // sees the real activity that 'data' events miss.
-    const idleMs = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '300000', 10);
-    const pollMs = Math.max(250, Math.min(Math.floor(idleMs / 4), 15000));
     const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'upgrade', 'trailer']);
 
     // Hold the body until a backend connection is committed. Nothing is read from
@@ -1831,39 +2041,16 @@ class ProxyServer {
 
     const span = req._span;
     let currentProxyReq = null;
-    let idleTimer = null;
-    let lastBytes = -1;
-    let idleElapsed = 0;
-    const onIdle = () => {
+    const watch = this._makeIdleWatch(req, () => currentProxyReq && currentProxyReq.socket, () => {
       this.logger.warn('HA stream idle timeout — no bytes moved in either direction', {
-        domain: mapping.domain, url: req.url, idle_ms: idleMs,
+        domain: mapping.domain, url: req.url, idle_ms: watch.idleMs,
       });
       if (currentProxyReq) currentProxyReq.destroy(new Error('Idle timeout'));
       if (!res.headersSent) this._sendGatewayError(req, res, 504, 'Gateway Timeout', 'stream-idle-timeout');
       else if (!res.writableEnded) res.destroy();
-    };
-    const clearIdle = () => { if (idleTimer) { clearInterval(idleTimer); idleTimer = null; } };
-    const startIdleMonitor = () => {
-      clearIdle();
-      lastBytes = -1;
-      idleElapsed = 0;
-      idleTimer = setInterval(() => {
-        // Sum byte movement on BOTH legs of the proxied connection: the client
-        // socket (req) and the backend socket (proxyReq). The connection is active
-        // if EITHER is moving — e.g. the client is still uploading into us while
-        // the backend leg is briefly backpressured, or the backend is responding
-        // while the client side is quiet. Watching only the backend socket would
-        // wrongly call a still-uploading request idle.
-        const inSock  = req.socket;
-        const outSock = currentProxyReq && currentProxyReq.socket;
-        const cur = (inSock  ? inSock.bytesRead  + inSock.bytesWritten  : 0)
-                  + (outSock ? outSock.bytesRead + outSock.bytesWritten : 0);
-        if (cur !== lastBytes) { lastBytes = cur; idleElapsed = 0; return; } // active
-        idleElapsed += pollMs;
-        if (idleElapsed >= idleMs) { clearIdle(); onIdle(); }
-      }, pollMs);
-      if (idleTimer.unref) idleTimer.unref();
-    };
+    });
+    const clearIdle = watch.clear;
+    const startIdleMonitor = watch.start;
 
     // If the client aborts the upload, tear down whichever backend request is live.
     req.on('error', () => { clearIdle(); if (currentProxyReq) currentProxyReq.destroy(); });

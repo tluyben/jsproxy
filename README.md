@@ -682,7 +682,11 @@ that fails over (a port vs. a whole host).
 4. When the probe succeeds, the backend's score is restored to 50 so it gets one real-request trial before being fully trusted again.
 5. If **all** backends fail, returns `502 Bad Gateway` and logs `error: all backends unavailable` with the domain and backend list.
 
-Each individual backend attempt has a **10 s timeout**. SSE and other streaming requests (`Accept: text/event-stream`) skip the buffered failover path and stream directly via one round-robin selected backend (connect-phase failover only).
+Each individual backend attempt has a **3 s connect timeout** (`HA_CONNECT_TIMEOUT_MS`) and a **30 s first-response deadline** (`HA_RESPONSE_TIMEOUT_MS`) — the deadline bounds only the wait for response **headers**, which is exactly the window in which failing over to another backend is still possible.
+
+Response bodies are **always streamed** to the client, never buffered in memory — a multi-GB download costs socket buffers, not RAM. Once headers arrive the proxy commits to that backend and the body pipes through under a byte-movement idle watch (`STREAM_IDLE_TIMEOUT_MS`, default 5 min) that only fires when *nothing* has moved in either direction — a slow-but-steady download of any size is never torn down.
+
+Large, chunked, or SSE **request** bodies (`Accept: text/event-stream`, bodies over 512 KB, chunked uploads) skip the buffered-request path entirely and stream both ways (connect-phase failover only, since piped request bytes can't be replayed).
 
 ### Multi-port (one host, many ports)
 

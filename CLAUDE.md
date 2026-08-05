@@ -104,6 +104,18 @@ ordered list of `{ hostname, port, isHttps, key }`. Everything downstream
 targets from it. Scoring/probe helpers are keyed on `target.key`:
 `boostPort`/`penalizePort`/`getPortScore`/`startBackgroundCheckTarget`.
 
+**Responses are NEVER buffered in memory.** Plain HA traffic (e.g. a GET
+download) goes through `_streamResponseHA`: the small *request* body is buffered
+(so any backend can be retried with an identical request), but the *response*
+pipes straight to the client. Failover window = until response HEADERS arrive
+(`HA_RESPONSE_TIMEOUT_MS`, default 30 s, bounds only that wait); after headers
+the body streams under the shared byte-movement idle watch (`_makeIdleWatch`,
+`STREAM_IDLE_TIMEOUT_MS` default 5 min), so an active download of any size or
+duration is never torn down. `_isStreamingRequest` classifies only the REQUEST
+side — that's why the response must stream unconditionally. The fully-buffered
+`_requestHA`/`_tryTarget` pair remains ONLY for the plugin path (plugins need
+the whole body). Regression tests: `__tests__/HA-response-stream.test.js`.
+
 **Every forward path must fail over.** Buffered and streaming HTTP retry the next
 ranked target on a connect-phase failure. The plugin streaming path
 (`_streamWithPlugins`) does the same connect-phase failover (it once picked a
