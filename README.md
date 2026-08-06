@@ -6,6 +6,7 @@ A high-performance, resilient proxy server that forwards HTTP/HTTPS traffic incl
 
 - **Multi-protocol Support**: HTTP, HTTPS, and WebSocket proxying
 - **Raw TCP Proxying**: Optional, opt-in per-port TCP forwarding with TLS passthrough and the same score-based HA failover (zero impact on the HTTP path when unused)
+- **Raw UDP Proxying**: Opt-in per-port UDP forwarding with flow tracking and protocol-aware health probes (`dns://` backends are health-checked with real DNS queries — over UDP for UDP routes, over TCP for TCP routes)
 - **Automatic SSL**: Let's Encrypt integration for automatic certificate generation
 - **High Availability**: Cluster-based architecture with worker process management; multi-port score-based load balancing with automatic dead-port detection and background recovery probes
 - **Zero Downtime**: Hot database replacement without service interruption
@@ -795,6 +796,10 @@ they cannot affect domain-based HTTP routing.
   (best-score-first, penalize-and-probe, background recovery). TCP failover happens
   strictly at the connect phase — before any client bytes are forwarded — so it is
   always safe. If all backends are down, the client connection is closed.
+  A comma-separated **backend URL list** also works (multi-host, e.g.
+  `tcp://a.internal:5432,tcp://b.internal:5432`), and backends marked with a probe
+  scheme such as `dns://` additionally get periodic protocol-aware health checks over
+  TCP — see *Protocol-aware health probes* under Raw UDP Proxying.
 - **TLS**: pure passthrough — bytes are forwarded untouched and the **backend
   terminates TLS**. jsproxy does not decrypt, and no certificate is needed on this path.
 - **Not applied to TCP**: auth, webhooks, and plugins are HTTP-layer features and do
@@ -854,6 +859,77 @@ or two DB replicas).
 > the real client address is still visible. (PROXY-protocol header injection, which
 > would carry the original IP across hops, is intentionally out of scope for the raw
 > passthrough path.)
+
+## Raw UDP Proxying
+
+jsproxy can also forward **UDP datagrams** (DNS, syslog, game traffic, …). Like raw
+TCP, it is **fully opt-in** (`protocol='udp'` rows, keyed by `listen_port`) and has
+zero effect on the HTTP(S) path. A UDP route may share its `listen_port` number with a
+TCP route — they are different protocol spaces (e.g. DNS on `53/tcp` **and** `53/udp`).
+
+```bash
+# Forward UDP :5353 -> localhost:5353
+node scripts/add-udp-route.js 5353 localhost 5353
+
+# HA DNS across two resolvers, health-checked with REAL DNS queries over UDP
+node scripts/add-udp-route.js 53 dns://10.0.0.2:5353,dns://10.0.0.3:5353
+
+# Probe with a specific query name; restrict sources to a CIDR
+node scripts/add-udp-route.js 53 dns://10.0.0.2,dns://10.0.0.3 53 10.0.0.0/8 --name=health.internal
+
+node scripts/add-udp-route.js --list
+node scripts/add-udp-route.js 53 --delete
+```
+
+**Flow model.** Each client `addr:port` gets one connected upstream socket, so replies
+route back to the right client and a client's datagrams stick to one backend. Flows
+expire after `UDP_SESSION_TIMEOUT_MS` (default 30 s) of silence.
+
+### Protocol-aware health probes (`dns://` backends)
+
+UDP has **no handshake** — a datagram sent to a dead backend just vanishes, so the
+connect-phase failover that TCP/HTTP use cannot exist. Reliable UDP failover therefore
+**requires a protocol-aware probe**: mark the backends with a probe scheme and jsproxy
+periodically performs a *real protocol exchange* against each one, feeding the same
+score engine every other path uses (probe fails → score 0, backend ranked out; probe
+succeeds again → restored).
+
+Probes are **hardcoded plugins** in `src/ProtocolProbes.js`, selected by the backend
+URL's scheme. Currently:
+
+| Scheme | Probe | Default port |
+|---|---|---|
+| `dns://` | A real DNS query (default name `example.com`; any well-formed answer — even NXDOMAIN — counts as alive) | 53 |
+
+Each probe exists in **both transports**, matching the route's own protocol: a **UDP
+route probes over UDP**, a **TCP route probes over TCP**. So the same
+`dns://a:53,dns://b:53` backend pair can back a `53/tcp` route and a `53/udp` route
+simultaneously, each health-checked on its own transport. For **TCP** routes the probe
+is optional — normal handshake/timeout failover still applies, the probe just adds
+"is the service actually answering" on top. For **UDP** routes with multiple backends
+the probe is what makes failover work; without one, jsproxy falls back to best-effort
+detection (ICMP port-unreachable surfacing as a socket error — which also triggers an
+immediate replay of the unanswered datagram against the next backend — plus an
+optimistic score revival after `UDP_REVIVE_MS` so a recovered backend is not
+blackholed), and logs a warning at startup.
+
+The DNS probe's query name is, in order: the route's `domain` column (set via
+`--name=`), the `DNS_PROBE_NAME` env var, else `example.com`.
+
+**Tuning** (optional env vars):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PROTOCOL_PROBE_INTERVAL_MS` | `10000` | How often each probed backend is health-checked |
+| `PROTOCOL_PROBE_TIMEOUT_MS` | `3000` | Per-probe answer timeout |
+| `DNS_PROBE_NAME` | `example.com` | Default DNS query name for `dns://` probes |
+| `UDP_SESSION_TIMEOUT_MS` | `30000` | Idle expiry for client flows |
+| `UDP_REVIVE_MS` | `30000` | Optimistic score revival for *unprobed* penalized UDP backends |
+| `UDP_MAX_FLOWS` | `10000` | Flow-table cap per listener (spoofed-flood protection) |
+
+As with TCP: auth, webhooks, and plugins do **not** apply — only the IP allowlist does
+(a disallowed source is silently dropped; UDP has no connection to reject). UDP routes
+are read once at startup — restart jsproxy after changing them.
 
 ## Hot Database Replacement
 

@@ -240,6 +240,45 @@ class DatabaseManager {
     });
   }
 
+  // Raw-UDP routes: same storage model as TCP (protocol='udp', keyed by
+  // listen_port, invisible to getMapping). `domain` optionally carries the DNS
+  // name the health probe queries (see ProtocolProbes) — it can never collide
+  // with HTTP routing because getMapping filters on protocol.
+  async getUdpRoutes() {
+    const sql = "SELECT * FROM mappings WHERE protocol = 'udp' ORDER BY listen_port";
+    return new Promise((resolve, reject) => {
+      this.db.all(sql, [], (err, rows) => {
+        if (err) { this.logger.error('Error getting UDP routes:', err); reject(err); }
+        else resolve(rows || []);
+      });
+    });
+  }
+
+  async addUdpRoute(listenPort, backend, backPort, allowedIps = null, probeName = '') {
+    const id = uuidv4();
+    const sql = `
+      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port)
+      VALUES (?, ?, '', ?, '', ?, ?, 'udp', ?)
+    `;
+    const port = parseInt(listenPort, 10);
+    return new Promise((resolve, reject) => {
+      this.db.run(sql, [id, probeName || '', String(backPort ?? ''), backend, allowedIps, port], function (err) {
+        if (err) reject(err);
+        else resolve({ id, protocol: 'udp', listen_port: port, back_port: String(backPort ?? ''), backend, allowed_ips: allowedIps, domain: probeName || '' });
+      });
+    });
+  }
+
+  async removeUdpRoute(listenPort) {
+    const port = parseInt(listenPort, 10);
+    return new Promise((resolve, reject) => {
+      this.db.run("DELETE FROM mappings WHERE protocol = 'udp' AND listen_port = ?", [port], function (err) {
+        if (err) reject(err);
+        else resolve(this.changes);
+      });
+    });
+  }
+
   async recordAuthUse(mappingId, credentialIndex) {
     return new Promise((resolve) => {
       this.db.get('SELECT auth_credentials FROM mappings WHERE id = ?', [mappingId], (err, row) => {

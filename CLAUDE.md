@@ -141,6 +141,39 @@ mode, and the public `getPortScore(id, port)` API are byte-for-byte unchanged.
 Tests: `__tests__/HA.test.js` — parsing unit tests plus network tests for routing,
 Host default/rewrite, host failover, all-down 502, and the streaming path.
 
+## Raw TCP/UDP proxying + protocol probes
+
+Opt-in, presence-based: rows with `protocol='tcp'` / `protocol='udp'` in the same
+`mappings` table, keyed by `listen_port` (raw sockets have no Host to route on;
+`getMapping` filters them out of HTTP routing). A TCP and a UDP route may share a
+`listen_port` (different protocol space, e.g. DNS 53/tcp + 53/udp). CLI:
+`scripts/add-tcp-route.js` / `scripts/add-udp-route.js`. Routes are read once at
+startup. Only the IP allowlist applies — no auth/webhook/plugins.
+
+- **Targets** come from `_rawTargets(route)`: legacy shape (single bare/http host +
+  comma `back_port`) keeps bare-port score keys byte-for-byte; scheme'd or comma
+  backend lists (`tcp://a:5432,tcp://b:5432`, `dns://10.0.0.2:5353,…`) get one
+  target per entry keyed `host:port`. Both feed the shared score engine.
+- **TCP** (`handleTcpConnection`): connect-phase-only failover (handshake/timeout,
+  before any client byte is forwarded), then bidirectional pipe, TLS passthrough.
+- **UDP** (`startUdpListeners`/`_handleUdpDatagram`): per-client-flow connected
+  dgram sockets (reply routing + backend stickiness), idle expiry
+  (`UDP_SESSION_TIMEOUT_MS`), flow cap (`UDP_MAX_FLOWS`). A pre-reply socket error
+  (ICMP unreachable) penalizes the target and replays the datagram on the next one.
+- **Protocol probes** (`src/ProtocolProbes.js`) are hardcoded per-scheme health
+  checks — `dns://` sends a real DNS query and any well-formed answer (id echo +
+  QR bit, NXDOMAIN included) counts as alive. `_startProtocolProbes` runs them
+  periodically (`PROTOCOL_PROBE_INTERVAL_MS`) over the route's own transport —
+  UDP routes probe over UDP, TCP routes over TCP — driving scores in both
+  directions (fail→0, success→100). For UDP HA probes are the only reliable
+  failure signal (mandatory in practice); unprobed UDP targets get best-effort
+  ICMP detection plus timed revival (`UDP_REVIVE_MS`). Probe query name:
+  route's `domain` column → `DNS_PROBE_NAME` → `example.com`.
+
+Tests: `__tests__/TCP.test.js`, `__tests__/UDP.test.js` (forwarding, stickiness,
+dns:// probe failover, ICMP replay, allowlist, tcp+udp same-port coexistence,
+HTTP regression), `__tests__/ProtocolProbes.test.js` (probe units).
+
 ## Preflight header rewrite
 
 A user-supplied script that runs against every request's headers **before

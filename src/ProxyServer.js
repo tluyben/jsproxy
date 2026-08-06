@@ -1,7 +1,9 @@
 const http = require('http');
 const https = require('https');
 const net = require('net');
+const dgram = require('dgram');
 const crypto = require('crypto');
+const { getProbe } = require('./ProtocolProbes');
 const httpProxy = require('http-proxy');
 const DatabaseManager = require('./DatabaseManager');
 const CertificateManager = require('./CertificateManager');
@@ -72,6 +74,8 @@ class ProxyServer {
     this.resolvedHttpsPort = null;  // numeric/string HTTPS port used in redirect URLs
     this._certWarming = new Set();  // domains with an in-flight background cert warm
     this.tcpServers = new Map();  // listen_port -> net.Server (raw TCP proxy, opt-in)
+    this.udpServers = new Map();  // listen_port -> { server, flows } (raw UDP proxy, opt-in)
+    this.probeTimers = [];        // periodic protocol-probe intervals (dns:// etc.)
     this.setupProxyErrorHandling();
   }
 
@@ -325,10 +329,11 @@ class ProxyServer {
       this.logger.info(`HTTPS disabled (set ENABLE_HTTPS=true to enable in ${isProduction ? 'production' : 'development'})`);
     }
 
-    // Raw TCP proxying is entirely opt-in: a listener exists only because a
-    // protocol='tcp' row exists. With no such rows this is a no-op and the
-    // proxy behaves exactly as it did before TCP support existed.
+    // Raw TCP/UDP proxying is entirely opt-in: a listener exists only because a
+    // protocol='tcp' (or 'udp') row exists. With no such rows these are no-ops
+    // and the proxy behaves exactly as it did before raw-socket support existed.
     await this.startTcpListeners(httpPort, httpsPort, httpHost);
+    await this.startUdpListeners(httpHost);
   }
 
   // ── Raw TCP proxy ─────────────────────────────────────────────────────────
@@ -378,7 +383,12 @@ class ProxyServer {
           resolve(true);
         });
       });
-      if (bound) this.tcpServers.set(port, server);
+      if (bound) {
+        this.tcpServers.set(port, server);
+        // Backends with a probe scheme (dns://…) get periodic protocol-aware
+        // health checks over TCP on top of the normal handshake failover.
+        this._startProtocolProbes(route, this._rawTargets(route), 'tcp');
+      }
     }
   }
 
@@ -395,29 +405,22 @@ class ProxyServer {
       return;
     }
 
-    const ports = String(route.back_port)
-      .split(',')
-      .map((p) => parseInt(p.trim(), 10))
-      .filter((p) => !isNaN(p));
-
-    if (ports.length === 0) {
-      this.logger.error(`TCP route ${route.id} has no valid back_port; dropping connection`);
+    const targets = this._rawTargets(route);
+    if (targets.length === 0) {
+      this.logger.error(`TCP route ${route.id} has no valid backend targets; dropping connection`);
       clientSocket.destroy();
       return;
     }
 
-    const backend = route.backend || 'http://localhost';
-    const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
-    const host = backendUrl.hostname;
     const connectTimeoutMs = parseInt(
       process.env.TCP_CONNECT_TIMEOUT_MS || process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
     const idleTimeoutMs = parseInt(process.env.TCP_IDLE_TIMEOUT_MS || '0', 10);
 
-    const ordered = this.rankedPorts(route.id, ports);
+    const ordered = this.rankedTargets(route.id, targets);
 
-    // Try ranked ports until one connects. Failover here is always safe: no client
-    // bytes have been forwarded yet (the client socket is paused), so there is no
-    // duplication risk regardless of protocol.
+    // Try ranked targets until one connects. Failover here is always safe: no
+    // client bytes have been forwarded yet (the client socket is paused), so
+    // there is no duplication risk regardless of protocol.
     const tryNext = (idx) => {
       if (clientSocket.destroyed) return;
       if (idx >= ordered.length) {
@@ -425,7 +428,7 @@ class ProxyServer {
         clientSocket.destroy();
         return;
       }
-      const port = ordered[idx];
+      const target = ordered[idx];
       const upstream = new net.Socket();
       let settled = false;
 
@@ -433,20 +436,22 @@ class ProxyServer {
         if (settled) return;
         settled = true;
         upstream.destroy();
-        this.penalizePort(route.id, port);
-        this.startBackgroundCheck(route, port);
+        this.penalizePort(route.id, target.key);
+        // Probed targets are revived (and penalized) by their periodic protocol
+        // probe; plain targets keep the original background TCP re-check.
+        if (!target.probe) this.startBackgroundCheckTarget(route, target);
         tryNext(idx + 1);
       };
 
       upstream.setTimeout(connectTimeoutMs, fail);
       upstream.once('error', fail);
 
-      upstream.connect(port, host, () => {
+      upstream.connect(target.port, target.hostname, () => {
         if (settled) { upstream.destroy(); return; }
         settled = true;
         upstream.setTimeout(0);              // clear the connect timeout
         upstream.removeListener('error', fail);
-        this.boostPort(route.id, port);
+        this.boostPort(route.id, target.key);
 
         if (idleTimeoutMs > 0) {
           clientSocket.setTimeout(idleTimeoutMs, () => clientSocket.destroy());
@@ -463,12 +468,270 @@ class ProxyServer {
         clientSocket.resume();
 
         if (process.env.LOG_LEVEL === 'debug') {
-          this.logger.debug(`TCP: ${clientIp} -> ${host}:${port} (route ${route.id})`);
+          this.logger.debug(`TCP: ${clientIp} -> ${target.hostname}:${target.port} (route ${route.id})`);
         }
       });
     };
 
     tryNext(0);
+  }
+
+  // ── Raw route targets (TCP/UDP) ───────────────────────────────────────────
+  //
+  // Like _backendTargets, but for protocol='tcp'/'udp' routes, whose backend
+  // entries may carry a scheme. Two shapes:
+  //
+  //   1. Legacy — single bare or http(s) host + comma back_port list
+  //      (`backend='db.internal'`, `back_port='5432,5433'`). key = the bare
+  //      port string, preserving the pre-existing TCP score keys and the
+  //      public getPortScore(id, port) shape byte-for-byte.
+  //   2. Scheme'd / multi-entry — `backend='dns://10.0.0.2:5353,dns://10.0.0.3:5353'`
+  //      (or udp://, tcp://). One target per entry, key = `host:port`; the port
+  //      comes from the URL → else a single numeric back_port fallback → else
+  //      the probe scheme's default (dns → 53).
+  //
+  // `probe` is set to the scheme name when it names a hardcoded protocol probe
+  // (see ProtocolProbes), else null. HTTP mappings never come through here, so
+  // the HTTP path is untouched by any of this.
+  _rawTargets(route) {
+    const backendField = String(route.backend || 'localhost').trim();
+    const portField = String(route.back_port ?? '').trim();
+    const schemeRe = /^([a-z][a-z0-9+.-]*):\/\//i;
+    const entries = backendField.split(',').map(s => s.trim()).filter(Boolean);
+
+    const firstMatch = entries.length ? entries[0].match(schemeRe) : null;
+    const firstScheme = firstMatch ? firstMatch[1].toLowerCase() : null;
+    if (entries.length === 1 && (!firstScheme || firstScheme === 'http' || firstScheme === 'https')) {
+      const url = new URL(firstScheme ? entries[0] : `http://${entries[0]}`);
+      return portField.split(',')
+        .map(p => parseInt(p.trim(), 10))
+        .filter(p => !isNaN(p))
+        .map(port => ({ hostname: url.hostname, port, key: String(port), probe: null }));
+    }
+
+    const fallback = /^\d+$/.test(portField) ? parseInt(portField, 10) : null;
+    return entries.map(entry => {
+      const m = entry.match(schemeRe);
+      const scheme = m ? m[1].toLowerCase() : null;
+      const probeDef = getProbe(scheme);
+      let url;
+      try { url = new URL(m ? entry : `tcp://${entry}`); }
+      catch (_) {
+        this.logger.warn(`Raw route ${route.id}: unparseable backend entry "${entry}"; skipped`);
+        return null;
+      }
+      const port = url.port ? parseInt(url.port, 10)
+                 : (fallback ?? (probeDef ? probeDef.defaultPort : null));
+      if (!port) {
+        this.logger.warn(`Raw route ${route.id}: backend entry "${entry}" has no port (and no numeric back_port fallback); skipped`);
+        return null;
+      }
+      return { hostname: url.hostname, port, key: `${url.hostname}:${port}`, probe: probeDef ? scheme : null };
+    }).filter(Boolean);
+  }
+
+  // Periodic protocol-aware health probes for raw-route targets whose backend
+  // scheme names a hardcoded probe (dns:// → a real DNS query, not just a
+  // handshake). `transport` matches the route's own protocol — 'udp' routes
+  // probe over UDP, 'tcp' routes over TCP — so the same backend pair can back
+  // a TCP and a UDP route simultaneously, each health-checked on its own
+  // transport. For UDP routes this is the ONLY reliable health signal (a
+  // datagram to a dead host fails silently); for TCP it complements the
+  // connect-phase handshake failover. Success restores the score to 100,
+  // failure pins it to 0; transitions are logged once, not every tick.
+  _startProtocolProbes(route, targets, transport) {
+    const probed = targets.filter(t => t.probe);
+    if (probed.length === 0) return;
+    const intervalMs = parseInt(process.env.PROTOCOL_PROBE_INTERVAL_MS || '10000', 10);
+    const timeoutMs  = parseInt(process.env.PROTOCOL_PROBE_TIMEOUT_MS || '3000', 10);
+    // What the DNS probe queries: the route's domain column when set, else a
+    // global default. Any well-formed answer (even NXDOMAIN) counts as alive.
+    const name = (route.domain && String(route.domain).trim()) || process.env.DNS_PROBE_NAME || 'example.com';
+
+    for (const target of probed) {
+      const probeFn = getProbe(target.probe)[transport];
+      if (typeof probeFn !== 'function') continue;
+      const key = this._portKey(route.id, target.key);
+      const tick = async () => {
+        let ok = false;
+        try { ok = await probeFn({ hostname: target.hostname, port: target.port, name, timeoutMs }); }
+        catch (_) { ok = false; }
+        const prev = this.portScores.get(key) ?? 100;
+        if (ok) {
+          if (prev === 0) this.logger.info(`Probe(${target.probe}/${transport}): ${target.hostname}:${target.port} back up (route ${route.id})`);
+          this.boostPort(route.id, target.key);
+        } else {
+          if (prev !== 0) this.logger.warn(`Probe(${target.probe}/${transport}): ${target.hostname}:${target.port} failed — scored 0 (route ${route.id})`);
+          this.penalizePort(route.id, target.key);
+        }
+      };
+      tick();
+      const t = setInterval(tick, intervalMs);
+      if (t.unref) t.unref();
+      this.probeTimers.push(t);
+    }
+    this.logger.info(`Protocol probes (${transport}) active for route ${route.id}: ${probed.map(t => `${t.probe}://${t.hostname}:${t.port}`).join(', ')} every ${intervalMs}ms`);
+  }
+
+  // ── Raw UDP proxy ─────────────────────────────────────────────────────────
+  //
+  // Each UDP route is a dgram socket on its own listen_port (a listen_port may
+  // be shared with a TCP route — different protocol space, e.g. DNS on
+  // 53/tcp + 53/udp). Datagrams are forwarded per client flow: each client
+  // addr:port gets one connected upstream socket, so replies route back to the
+  // right client and a flow sticks to one backend. HA reuses the same score
+  // engine as TCP/HTTP, but UDP has no handshake to fail — reliable failover
+  // REQUIRES probe-capable backend schemes (dns://). Unprobed targets fall back
+  // to best-effort ICMP detection (ECONNREFUSED on the connected socket) plus a
+  // timed optimistic revival so a recovered backend isn't blackholed forever.
+  // As with TCP: no auth/webhook/plugins here, only the IP allowlist.
+  async startUdpListeners(httpHost) {
+    let routes;
+    try {
+      routes = await this.db.getUdpRoutes();
+    } catch (err) {
+      this.logger.error('Could not load UDP routes (UDP proxying disabled):', err.message || err);
+      return;
+    }
+    if (!routes || routes.length === 0) return;
+
+    for (const route of routes) {
+      const port = parseInt(route.listen_port, 10);
+      if (!Number.isInteger(port) || port <= 0) {
+        this.logger.warn(`UDP route ${route.id} has invalid listen_port (${route.listen_port}); skipping`);
+        continue;
+      }
+      if (this.udpServers.has(port)) {
+        this.logger.warn(`UDP route ${route.id} listen_port ${port} already bound; skipping duplicate`);
+        continue;
+      }
+      const targets = this._rawTargets(route);
+      if (targets.length === 0) {
+        this.logger.warn(`UDP route ${route.id} has no valid backend targets; skipping`);
+        continue;
+      }
+      if (targets.length > 1 && targets.some(t => !t.probe)) {
+        this.logger.warn(
+          `UDP route ${route.id}: reliable HA failover needs probe-capable backends (e.g. dns://host:port); ` +
+          `unprobed targets are detected via best-effort ICMP errors only`);
+      }
+
+      const server = dgram.createSocket(String(httpHost).includes(':') ? 'udp6' : 'udp4');
+      const flows = new Map(); // `${clientAddr}:${clientPort}` -> flow
+      server.on('message', (msg, rinfo) => this._handleUdpDatagram(route, server, flows, targets, msg, rinfo));
+      server.on('error', (err) => this.logger.error(`UDP listener on ${port} error: ${err.message || err}`));
+
+      const bound = await new Promise((resolve) => {
+        server.once('error', () => resolve(false));
+        server.bind(port, httpHost, () => {
+          this.logger.info(`UDP proxy listening on ${httpHost}:${port} -> ${targets.map(t => `${t.hostname}:${t.port}`).join(', ')}`);
+          resolve(true);
+        });
+      });
+      if (!bound) continue;
+      this.udpServers.set(port, { server, flows });
+      this._startProtocolProbes(route, targets, 'udp');
+    }
+  }
+
+  _handleUdpDatagram(route, server, flows, targets, msg, rinfo) {
+    let clientIp = rinfo.address || '';
+    if (clientIp.startsWith('::ffff:')) clientIp = clientIp.slice(7);
+    // UDP has no connection to reject — a disallowed source is silently dropped.
+    if (!this.isIpAllowed(clientIp, route.allowed_ips)) return;
+
+    const flowKey = `${rinfo.address}:${rinfo.port}`;
+    const existing = flows.get(flowKey);
+    if (existing) {
+      existing.touch();
+      // Until the backend has answered once, keep the latest datagram around so
+      // an async socket error can replay it against the next-ranked target.
+      if (!existing.gotReply) existing.pending = msg;
+      if (existing.connected) existing.sock.send(msg);
+      else existing.queue.push(msg);
+      return;
+    }
+
+    // Bound the flow table so a spoofed-source flood can't grow memory unboundedly.
+    const maxFlows = parseInt(process.env.UDP_MAX_FLOWS || '10000', 10);
+    if (flows.size >= maxFlows) {
+      this.logger.warn(`UDP route ${route.id}: flow table full (${maxFlows}); dropping datagram from ${clientIp}`);
+      return;
+    }
+
+    this._openUdpFlow(route, server, flows, targets, flowKey, rinfo, msg, 0);
+  }
+
+  // Open a flow to the best-ranked target and send `msg`. `attempt` counts
+  // failed targets: a pre-reply socket error (ICMP port unreachable surfaces as
+  // ECONNREFUSED on a connected dgram socket) penalizes the target and replays
+  // the same datagram against the next one, so request/response protocols like
+  // DNS fail over transparently within a single client query.
+  _openUdpFlow(route, server, flows, targets, flowKey, rinfo, msg, attempt) {
+    if (attempt >= targets.length) {
+      this.logger.warn(`UDP: all backends failed for route ${route.id} (flow ${flowKey})`);
+      return;
+    }
+    // Penalized targets sort last, so taking the head after a penalty naturally
+    // advances to the next-best backend.
+    const target = this.rankedTargets(route.id, targets)[0];
+    const idleMs = parseInt(process.env.UDP_SESSION_TIMEOUT_MS || '30000', 10);
+    const sock = dgram.createSocket(target.hostname.includes(':') ? 'udp6' : 'udp4');
+    const flow = { sock, target, pending: msg, gotReply: false, connected: false, queue: [msg], timer: null, touch: null };
+
+    const close = () => {
+      if (flows.get(flowKey) === flow) flows.delete(flowKey);
+      clearTimeout(flow.timer);
+      try { sock.close(); } catch (_) {}
+    };
+    flow.touch = () => {
+      clearTimeout(flow.timer);
+      flow.timer = setTimeout(close, idleMs);
+      if (flow.timer.unref) flow.timer.unref();
+    };
+
+    sock.on('message', (resp) => {
+      flow.gotReply = true;
+      flow.pending = null;
+      this.boostPort(route.id, target.key);
+      flow.touch();
+      server.send(resp, rinfo.port, rinfo.address);
+    });
+    sock.on('error', () => {
+      this.penalizePort(route.id, target.key);
+      const retryMsg = flow.gotReply ? null : flow.pending;
+      close();
+      if (!target.probe) this._scheduleUdpRevival(route, target);
+      if (retryMsg) this._openUdpFlow(route, server, flows, targets, flowKey, rinfo, retryMsg, attempt + 1);
+    });
+
+    flows.set(flowKey, flow);
+    flow.touch();
+    // A dgram socket can't send() until connect completes, so datagrams queue on
+    // the flow until then. Connecting pins the peer, which is what makes ICMP
+    // unreachable errors surface on this socket at all.
+    sock.connect(target.port, target.hostname, () => {
+      flow.connected = true;
+      for (const m of flow.queue) sock.send(m);
+      flow.queue = [];
+    });
+
+    if (process.env.LOG_LEVEL === 'debug') {
+      this.logger.debug(`UDP: ${flowKey} -> ${target.hostname}:${target.port} (route ${route.id})`);
+    }
+  }
+
+  // Unprobed UDP targets have no signal that can prove recovery, so a penalty
+  // decays optimistically: after UDP_REVIVE_MS the score returns to 50 and real
+  // traffic re-tests the backend. Probed targets skip this — their periodic
+  // protocol probe owns the score in both directions.
+  _scheduleUdpRevival(route, target) {
+    const reviveMs = parseInt(process.env.UDP_REVIVE_MS || '30000', 10);
+    const key = this._portKey(route.id, target.key);
+    const t = setTimeout(() => {
+      if (this.portScores.get(key) === 0) this.portScores.set(key, 50);
+    }, reviveMs);
+    if (t.unref) t.unref();
   }
 
   async handleRequest(req, res, isHttps) {
@@ -2487,6 +2750,19 @@ class ProxyServer {
       await new Promise((resolve) => server.close(resolve));
     }
     this.tcpServers.clear();
+    for (const { server, flows } of this.udpServers.values()) {
+      for (const flow of flows.values()) {
+        clearTimeout(flow.timer);
+        try { flow.sock.close(); } catch (_) {}
+      }
+      flows.clear();
+      await new Promise((resolve) => {
+        try { server.close(resolve); } catch (_) { resolve(); }
+      });
+    }
+    this.udpServers.clear();
+    for (const t of this.probeTimers) clearInterval(t);
+    this.probeTimers = [];
     await this.db.close();
   }
 }
