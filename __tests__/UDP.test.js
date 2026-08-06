@@ -156,7 +156,7 @@ describe('Raw UDP proxying', () => {
       await sleep(400);
       sock.close();
       expect(replies).toEqual(['sticky:one', 'sticky:two']);
-      const state = proxy.udpServers.get(9511);
+      const state = proxy.udpServers.get('127.0.0.1:9511');
       expect(state.flows.size).toBe(1); // one client → one flow
     } finally {
       backend.close();
@@ -205,6 +205,39 @@ describe('Raw UDP proxying', () => {
       live.close();
     }
   }, 20000);
+
+  test('listen_host: binds only that IP, coexisting with another service on the same port (Linux 127/8)', async () => {
+    // "Local resolver" scenario: something else owns 127.0.0.1:9580; the route
+    // binds 127.0.0.2:9580 and both serve simultaneously.
+    const other = dgram.createSocket('udp4');
+    other.on('message', (m, r) => other.send(Buffer.concat([Buffer.from('other:'), m]), r.port, r.address));
+    await new Promise((r) => other.bind(9580, '127.0.0.1', r));
+    const backend = await makeUdpEcho('mine', 9581);
+    try {
+      await proxy.db.addUdpRoute(9580, '127.0.0.1', '9581', null, '', '127.0.0.2');
+      await refreshUdp();
+      expect(proxy.udpServers.has('127.0.0.2:9580')).toBe(true);
+
+      const viaRoute = await new Promise((resolve) => {
+        const sock = dgram.createSocket('udp4');
+        const t = setTimeout(() => { sock.close(); resolve(null); }, 3000);
+        sock.on('message', (m) => { clearTimeout(t); sock.close(); resolve(m.toString()); });
+        sock.send(Buffer.from('ping'), 9580, '127.0.0.2');
+      });
+      expect(viaRoute).toBe('mine:ping');
+
+      const viaOther = await new Promise((resolve) => {
+        const sock = dgram.createSocket('udp4');
+        const t = setTimeout(() => { sock.close(); resolve(null); }, 3000);
+        sock.on('message', (m) => { clearTimeout(t); sock.close(); resolve(m.toString()); });
+        sock.send(Buffer.from('ping'), 9580, '127.0.0.1');
+      });
+      expect(viaOther).toBe('other:ping');
+    } finally {
+      other.close();
+      backend.close();
+    }
+  }, 15000);
 
   test('IP allowlist: datagram from a disallowed source is silently dropped', async () => {
     const backend = await makeUdpEcho('secret', 9550);

@@ -782,6 +782,10 @@ node scripts/add-tcp-route.js 5432 db.internal 5432,5433
 # Restrict to a CIDR (IP allowlist works on raw sockets too)
 node scripts/add-tcp-route.js 6379 localhost 6379 10.0.0.0/8
 
+# Bind only one local IP (--bind), e.g. the box's public IP, so another
+# service can keep the same port on a different IP
+node scripts/add-tcp-route.js 53 dns://10.0.0.2:5353,dns://10.0.0.3:5353 '' '' --bind=203.0.113.10
+
 node scripts/add-tcp-route.js --list
 node scripts/add-tcp-route.js 5432 --delete
 ```
@@ -804,6 +808,14 @@ they cannot affect domain-based HTTP routing.
   terminates TLS**. jsproxy does not decrypt, and no certificate is needed on this path.
 - **Not applied to TCP**: auth, webhooks, and plugins are HTTP-layer features and do
   **not** run for TCP routes. Only the IP allowlist applies.
+- **Bind IP (`listen_host`, optional)**: by default a raw listener binds `HTTP_HOST`
+  (usually `0.0.0.0`). `--bind=<ip>` stores a per-route `listen_host` so the listener
+  binds **only that IP** — letting jsproxy share a port number with another service
+  that owns the same port on a different IP (the classic case: a local DNS resolver
+  on `127.0.0.53:53` while jsproxy serves `:53` on the public IP). The OS routes each
+  connection to the most specific bind. A route bound to a different IP than
+  `HTTP_HOST` also does **not** trigger the :80/:443 takeover below — it coexists
+  with the HTTP(S) servers instead. Applies to TCP and UDP routes alike.
 - **Lifecycle**: TCP routes are read once at startup. **Restart jsproxy** after adding
   or removing them (unlike HTTP mappings, which are read per request).
 
@@ -892,6 +904,10 @@ node scripts/add-udp-route.js 53 dns://10.0.0.2:5353,dns://10.0.0.3:5353
 
 # Probe with a specific query name; restrict sources to a CIDR
 node scripts/add-udp-route.js 53 dns://10.0.0.2,dns://10.0.0.3 53 10.0.0.0/8 --name=health.internal
+
+# Bind only the public IP — a local resolver keeps 127.0.0.53:53 (see the
+# "Bind IP" note in the Raw TCP section; identical semantics here)
+node scripts/add-udp-route.js 53 dns://10.0.0.2:5353,dns://10.0.0.3:5353 '' '' --bind=203.0.113.10
 
 node scripts/add-udp-route.js --list
 node scripts/add-udp-route.js 53 --delete

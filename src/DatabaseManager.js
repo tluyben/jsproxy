@@ -180,9 +180,11 @@ class DatabaseManager {
     });
   }
 
-  // Adds the columns that back raw-TCP routes. Both default in a way that leaves
-  // every existing (HTTP) row untouched: protocol becomes 'http', listen_port NULL.
-  // Idempotent — same guarded pattern as the auth/allowed_ips migrations above.
+  // Adds the columns that back raw-TCP/UDP routes. All default in a way that
+  // leaves every existing (HTTP) row untouched: protocol becomes 'http',
+  // listen_port/listen_host NULL. listen_host is the optional per-route bind IP
+  // (NULL = bind HTTP_HOST, the wildcard default). Idempotent — same guarded
+  // pattern as the auth/allowed_ips migrations above.
   async addTcpColumnsIfMissing() {
     return new Promise((resolve, reject) => {
       this.db.all('PRAGMA table_info(mappings)', (err, columns) => {
@@ -191,6 +193,7 @@ class DatabaseManager {
         const toAdd = [];
         if (!names.has('protocol')) toAdd.push("ALTER TABLE mappings ADD COLUMN protocol TEXT DEFAULT 'http'");
         if (!names.has('listen_port')) toAdd.push('ALTER TABLE mappings ADD COLUMN listen_port INTEGER DEFAULT NULL');
+        if (!names.has('listen_host')) toAdd.push('ALTER TABLE mappings ADD COLUMN listen_host TEXT DEFAULT NULL');
         if (toAdd.length === 0) { resolve(); return; }
         let i = 0;
         const next = () => {
@@ -215,17 +218,17 @@ class DatabaseManager {
     });
   }
 
-  async addTcpRoute(listenPort, backend, backPort, allowedIps = null) {
+  async addTcpRoute(listenPort, backend, backPort, allowedIps = null, listenHost = null) {
     const id = uuidv4();
     const sql = `
-      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port)
-      VALUES (?, '', '', ?, '', ?, ?, 'tcp', ?)
+      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port, listen_host)
+      VALUES (?, '', '', ?, '', ?, ?, 'tcp', ?, ?)
     `;
     const port = parseInt(listenPort, 10);
     return new Promise((resolve, reject) => {
-      this.db.run(sql, [id, String(backPort), backend, allowedIps, port], function (err) {
+      this.db.run(sql, [id, String(backPort), backend, allowedIps, port, listenHost], function (err) {
         if (err) reject(err);
-        else resolve({ id, protocol: 'tcp', listen_port: port, back_port: String(backPort), backend, allowed_ips: allowedIps });
+        else resolve({ id, protocol: 'tcp', listen_port: port, back_port: String(backPort), backend, allowed_ips: allowedIps, listen_host: listenHost });
       });
     });
   }
@@ -254,17 +257,17 @@ class DatabaseManager {
     });
   }
 
-  async addUdpRoute(listenPort, backend, backPort, allowedIps = null, probeName = '') {
+  async addUdpRoute(listenPort, backend, backPort, allowedIps = null, probeName = '', listenHost = null) {
     const id = uuidv4();
     const sql = `
-      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port)
-      VALUES (?, ?, '', ?, '', ?, ?, 'udp', ?)
+      INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port, listen_host)
+      VALUES (?, ?, '', ?, '', ?, ?, 'udp', ?, ?)
     `;
     const port = parseInt(listenPort, 10);
     return new Promise((resolve, reject) => {
-      this.db.run(sql, [id, probeName || '', String(backPort ?? ''), backend, allowedIps, port], function (err) {
+      this.db.run(sql, [id, probeName || '', String(backPort ?? ''), backend, allowedIps, port, listenHost], function (err) {
         if (err) reject(err);
-        else resolve({ id, protocol: 'udp', listen_port: port, back_port: String(backPort ?? ''), backend, allowed_ips: allowedIps, domain: probeName || '' });
+        else resolve({ id, protocol: 'udp', listen_port: port, back_port: String(backPort ?? ''), backend, allowed_ips: allowedIps, domain: probeName || '', listen_host: listenHost });
       });
     });
   }

@@ -8,7 +8,7 @@ const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'curren
 
 function printUsage() {
   console.log(`
-Usage: node scripts/add-udp-route.js <listen_port> <backend> [back_port] [allowed_ips] [--name=<dns-name>]
+Usage: node scripts/add-udp-route.js <listen_port> <backend> [back_port] [allowed_ips] [--name=<dns-name>] [--bind=<ip>]
 
 Raw UDP proxying. jsproxy listens on <listen_port> and forwards datagrams per
 client flow to a backend. For HA, give a comma-separated backend list using a
@@ -26,6 +26,11 @@ Arguments:
 
 Options:
   --name=<dns-name>  Domain the dns:// health probe queries (default example.com)
+  --bind=<ip>        Bind only this local IP (default: HTTP_HOST / all
+                     interfaces). Lets the route share a port with another
+                     service owning the same port on a different IP (e.g. a
+                     local resolver on 127.0.0.53:53 next to a route on the
+                     box's public IP).
   --delete           Remove the UDP route for <listen_port>
   --list             List all UDP routes
   --help             Show this help
@@ -39,6 +44,9 @@ Examples:
 
   # Same backends but probe with a specific query name, restricted to a CIDR
   node scripts/add-udp-route.js 53 dns://10.0.0.2,dns://10.0.0.3 53 10.0.0.0/8 --name=health.internal
+
+  # Bind only the public IP; the local resolver keeps 127.0.0.53:53
+  node scripts/add-udp-route.js 53 dns://10.0.0.2:5353,dns://10.0.0.3:5353 '' '' --bind=203.0.113.10
 
   # Delete / list
   node scripts/add-udp-route.js 53 --delete
@@ -66,6 +74,7 @@ function ensureColumns(db, cb) {
     const toAdd = [];
     if (!names.has('protocol')) toAdd.push("ALTER TABLE mappings ADD COLUMN protocol TEXT DEFAULT 'http'");
     if (!names.has('listen_port')) toAdd.push('ALTER TABLE mappings ADD COLUMN listen_port INTEGER DEFAULT NULL');
+    if (!names.has('listen_host')) toAdd.push('ALTER TABLE mappings ADD COLUMN listen_host TEXT DEFAULT NULL');
     let i = 0;
     const next = () => {
       if (i >= toAdd.length) return cb();
@@ -78,16 +87,17 @@ function ensureColumns(db, cb) {
 function listRoutes() {
   const db = connectDB();
   ensureColumns(db, () => {
-    db.all("SELECT listen_port, backend, back_port, allowed_ips, domain, created_at FROM mappings WHERE protocol = 'udp' ORDER BY listen_port", (err, rows) => {
+    db.all("SELECT listen_port, listen_host, backend, back_port, allowed_ips, domain, created_at FROM mappings WHERE protocol = 'udp' ORDER BY listen_port", (err, rows) => {
       if (err) { console.error('Error listing UDP routes:', err.message); db.close(); process.exit(1); }
       console.log('\nUDP routes:\n');
-      console.log('Listen'.padEnd(10), 'Backend'.padEnd(44), 'BackPort'.padEnd(12), 'ProbeName'.padEnd(20), 'AllowedIPs');
-      console.log('-'.repeat(110));
+      console.log('Listen'.padEnd(10), 'Bind'.padEnd(16), 'Backend'.padEnd(44), 'BackPort'.padEnd(12), 'ProbeName'.padEnd(20), 'AllowedIPs');
+      console.log('-'.repeat(126));
       if (!rows || rows.length === 0) {
         console.log('No UDP routes found.');
       } else {
         rows.forEach(r => console.log(
           String(r.listen_port).padEnd(10),
+          (r.listen_host || '(all)').padEnd(16),
           (r.backend || 'localhost').padEnd(44),
           String(r.back_port || '').padEnd(12),
           (r.domain || '(default)').padEnd(20),
@@ -112,28 +122,28 @@ function deleteRoute(listenPort) {
   });
 }
 
-function addRoute(listenPort, backend, backPort, allowedIps, probeName) {
+function addRoute(listenPort, backend, backPort, allowedIps, probeName, bindHost) {
   const db = connectDB();
   ensureColumns(db, () => {
     db.get("SELECT id FROM mappings WHERE protocol = 'udp' AND listen_port = ?", [listenPort], (err, row) => {
       if (err) { console.error('Error checking route:', err.message); db.close(); process.exit(1); }
       const done = (verb) => {
-        console.log(`✓ ${verb} UDP route: :${listenPort} -> ${backend}${backPort ? `:${backPort}` : ''}${allowedIps ? `  (allow ${allowedIps})` : ''}${probeName ? `  (probe ${probeName})` : ''}`);
+        console.log(`✓ ${verb} UDP route: ${bindHost || '*'}:${listenPort} -> ${backend}${backPort ? `:${backPort}` : ''}${allowedIps ? `  (allow ${allowedIps})` : ''}${probeName ? `  (probe ${probeName})` : ''}`);
         console.log('\nRestart jsproxy for the change to take effect.');
         db.close();
       };
       if (row) {
         db.run(
-          "UPDATE mappings SET backend = ?, back_port = ?, allowed_ips = ?, domain = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-          [backend, String(backPort || ''), allowedIps || null, probeName || '', row.id],
+          "UPDATE mappings SET backend = ?, back_port = ?, allowed_ips = ?, domain = ?, listen_host = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+          [backend, String(backPort || ''), allowedIps || null, probeName || '', bindHost || null, row.id],
           (e) => { if (e) { console.error('Error updating UDP route:', e.message); db.close(); process.exit(1); } done('Updated'); }
         );
       } else {
         const id = require('crypto').randomUUID();
         db.run(
-          `INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port, created_at, updated_at)
-           VALUES (?, ?, '', ?, '', ?, ?, 'udp', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-          [id, probeName || '', String(backPort || ''), backend, allowedIps || null, listenPort],
+          `INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port, listen_host, created_at, updated_at)
+           VALUES (?, ?, '', ?, '', ?, ?, 'udp', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+          [id, probeName || '', String(backPort || ''), backend, allowedIps || null, listenPort, bindHost || null],
           (e) => { if (e) { console.error('Error adding UDP route:', e.message); db.close(); process.exit(1); } done('Added'); }
         );
       }
@@ -145,7 +155,9 @@ function addRoute(listenPort, backend, backPort, allowedIps, probeName) {
 const rawArgs = process.argv.slice(2);
 const nameArg = rawArgs.find(a => a.startsWith('--name='));
 const probeName = nameArg ? nameArg.slice('--name='.length) : '';
-const args = rawArgs.filter(a => !a.startsWith('--name='));
+const bindArg = rawArgs.find(a => a.startsWith('--bind='));
+const bindHost = bindArg ? bindArg.slice('--bind='.length) : '';
+const args = rawArgs.filter(a => !a.startsWith('--name=') && !a.startsWith('--bind='));
 
 if (args.length === 0 || args.includes('--help')) {
   printUsage();
@@ -169,5 +181,5 @@ if (args.includes('--list')) {
     printUsage();
     process.exit(1);
   }
-  addRoute(listenPort, backend, backPort, allowedIps, probeName);
+  addRoute(listenPort, backend, backPort, allowedIps, probeName, bindHost);
 }

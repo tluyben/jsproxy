@@ -261,9 +261,16 @@ class ProxyServer {
     // corresponding HTTP(S) server is NOT started. Opt-in purely by the
     // route's presence — without such a route both servers bind exactly as
     // before. (UDP routes never contend here: different protocol space.)
+    // Only routes that bind the same host as the HTTP(S) servers can take a
+    // port over; a route with its own listen_host on a different IP coexists
+    // with them instead (most-specific bind wins per the OS).
     let rawTcpPorts = new Set();
     try {
       rawTcpPorts = new Set((await this.db.getTcpRoutes())
+        .filter(r => {
+          const h = (r.listen_host && String(r.listen_host).trim()) || '';
+          return !h || h === httpHost;
+        })
         .map(r => parseInt(r.listen_port, 10))
         .filter(Number.isInteger));
     } catch (_) { /* no raw routes readable — nothing can be taken over */ }
@@ -389,31 +396,38 @@ class ProxyServer {
         this.logger.warn(`TCP route ${route.id} has invalid listen_port (${route.listen_port}); skipping`);
         continue;
       }
-      if (port === parseInt(httpPort, 10) || port === parseInt(httpsPort, 10)) {
+      // Optional per-route bind IP: unset → HTTP_HOST (wildcard default,
+      // unchanged behavior). Set → the listener binds only that IP, so it can
+      // coexist with another service owning the same port on a different IP
+      // (e.g. a local resolver on 127.0.0.53:53 next to a route on the
+      // public IP :53).
+      const bindHost = (route.listen_host && String(route.listen_host).trim()) || httpHost;
+      const bindKey = `${bindHost}:${port}`;
+      if (bindHost === httpHost && (port === parseInt(httpPort, 10) || port === parseInt(httpsPort, 10))) {
         this.logger.warn(`TCP route ${route.id} listen_port ${port} collides with HTTP/HTTPS port; skipping`);
         continue;
       }
-      if (this.tcpServers.has(port)) {
-        this.logger.warn(`TCP route ${route.id} listen_port ${port} already bound; skipping duplicate`);
+      if (this.tcpServers.has(bindKey)) {
+        this.logger.warn(`TCP route ${route.id} ${bindKey} already bound; skipping duplicate`);
         continue;
       }
 
       const server = net.createServer((socket) => this.handleTcpConnection(route, socket));
       server.on('error', (err) => {
-        this.logger.error(`TCP listener on ${port} error: ${err.message || err}`);
+        this.logger.error(`TCP listener on ${bindKey} error: ${err.message || err}`);
       });
       // Await the bind so a bad port (e.g. EADDRINUSE) logs and is skipped without
       // throwing out of start() (which would take the whole worker down). Only
       // track listeners that actually bound.
       const bound = await new Promise((resolve) => {
         server.once('error', () => resolve(false));
-        server.listen(port, httpHost, () => {
-          this.logger.info(`TCP proxy listening on ${httpHost}:${port} -> ${route.backend || 'localhost'}:${route.back_port}`);
+        server.listen(port, bindHost, () => {
+          this.logger.info(`TCP proxy listening on ${bindHost}:${port} -> ${route.backend || 'localhost'}:${route.back_port}`);
           resolve(true);
         });
       });
       if (bound) {
-        this.tcpServers.set(port, server);
+        this.tcpServers.set(bindKey, server);
         // Backends with a probe scheme (dns://…) get periodic protocol-aware
         // health checks over TCP on top of the normal handshake failover.
         this._startProtocolProbes(route, this._rawTargets(route), 'tcp');
@@ -630,8 +644,13 @@ class ProxyServer {
         this.logger.warn(`UDP route ${route.id} has invalid listen_port (${route.listen_port}); skipping`);
         continue;
       }
-      if (this.udpServers.has(port)) {
-        this.logger.warn(`UDP route ${route.id} listen_port ${port} already bound; skipping duplicate`);
+      // Optional per-route bind IP, same semantics as the TCP side: unset →
+      // HTTP_HOST; set → only that IP, coexisting with e.g. a local resolver
+      // holding the same port on another IP.
+      const bindHost = (route.listen_host && String(route.listen_host).trim()) || httpHost;
+      const bindKey = `${bindHost}:${port}`;
+      if (this.udpServers.has(bindKey)) {
+        this.logger.warn(`UDP route ${route.id} ${bindKey} already bound; skipping duplicate`);
         continue;
       }
       const targets = this._rawTargets(route);
@@ -645,20 +664,20 @@ class ProxyServer {
           `unprobed targets are detected via best-effort ICMP errors only`);
       }
 
-      const server = dgram.createSocket(String(httpHost).includes(':') ? 'udp6' : 'udp4');
+      const server = dgram.createSocket(String(bindHost).includes(':') ? 'udp6' : 'udp4');
       const flows = new Map(); // `${clientAddr}:${clientPort}` -> flow
       server.on('message', (msg, rinfo) => this._handleUdpDatagram(route, server, flows, targets, msg, rinfo));
-      server.on('error', (err) => this.logger.error(`UDP listener on ${port} error: ${err.message || err}`));
+      server.on('error', (err) => this.logger.error(`UDP listener on ${bindKey} error: ${err.message || err}`));
 
       const bound = await new Promise((resolve) => {
         server.once('error', () => resolve(false));
-        server.bind(port, httpHost, () => {
-          this.logger.info(`UDP proxy listening on ${httpHost}:${port} -> ${targets.map(t => `${t.hostname}:${t.port}`).join(', ')}`);
+        server.bind(port, bindHost, () => {
+          this.logger.info(`UDP proxy listening on ${bindHost}:${port} -> ${targets.map(t => `${t.hostname}:${t.port}`).join(', ')}`);
           resolve(true);
         });
       });
       if (!bound) continue;
-      this.udpServers.set(port, { server, flows });
+      this.udpServers.set(bindKey, { server, flows });
       this._startProtocolProbes(route, targets, 'udp');
     }
   }

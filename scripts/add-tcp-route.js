@@ -8,7 +8,7 @@ const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'curren
 
 function printUsage() {
   console.log(`
-Usage: node scripts/add-tcp-route.js <listen_port> <backend> <back_port[,back_port...]> [allowed_ips]
+Usage: node scripts/add-tcp-route.js <listen_port> <backend> <back_port[,back_port...]> [allowed_ips] [--bind=<ip>]
 
 Raw TCP proxying (passthrough). jsproxy listens on <listen_port> and forwards raw
 bytes to <backend>:<back_port>. Provide a comma-separated back_port list for HA
@@ -22,6 +22,9 @@ Arguments:
   allowed_ips   Optional comma-separated IPs/CIDRs (default: allow all)
 
 Options:
+  --bind=<ip>   Bind only this local IP (default: HTTP_HOST / all interfaces).
+                Lets the route share a port with another service that owns the
+                same port on a different IP (e.g. a local resolver on :53).
   --delete      Remove the TCP route for <listen_port>
   --list        List all TCP routes
   --help        Show this help
@@ -35,6 +38,9 @@ Examples:
 
   # Restrict to a CIDR
   node scripts/add-tcp-route.js 6379 localhost 6379 10.0.0.0/8
+
+  # Bind only the public IP (leave 127.0.0.53:53 to the local resolver)
+  node scripts/add-tcp-route.js 53 dns://10.0.0.2:5353,dns://10.0.0.3:5353 '' '' --bind=203.0.113.10
 
   # Delete / list
   node scripts/add-tcp-route.js 5432 --delete
@@ -61,6 +67,7 @@ function ensureColumns(db, cb) {
     const toAdd = [];
     if (!names.has('protocol')) toAdd.push("ALTER TABLE mappings ADD COLUMN protocol TEXT DEFAULT 'http'");
     if (!names.has('listen_port')) toAdd.push('ALTER TABLE mappings ADD COLUMN listen_port INTEGER DEFAULT NULL');
+    if (!names.has('listen_host')) toAdd.push('ALTER TABLE mappings ADD COLUMN listen_host TEXT DEFAULT NULL');
     let i = 0;
     const next = () => {
       if (i >= toAdd.length) return cb();
@@ -73,16 +80,17 @@ function ensureColumns(db, cb) {
 function listRoutes() {
   const db = connectDB();
   ensureColumns(db, () => {
-    db.all("SELECT listen_port, backend, back_port, allowed_ips, created_at FROM mappings WHERE protocol = 'tcp' ORDER BY listen_port", (err, rows) => {
+    db.all("SELECT listen_port, listen_host, backend, back_port, allowed_ips, created_at FROM mappings WHERE protocol = 'tcp' ORDER BY listen_port", (err, rows) => {
       if (err) { console.error('Error listing TCP routes:', err.message); db.close(); process.exit(1); }
       console.log('\nTCP routes:\n');
-      console.log('Listen'.padEnd(10), 'Backend'.padEnd(24), 'BackPort'.padEnd(20), 'AllowedIPs');
-      console.log('-'.repeat(80));
+      console.log('Listen'.padEnd(10), 'Bind'.padEnd(16), 'Backend'.padEnd(24), 'BackPort'.padEnd(20), 'AllowedIPs');
+      console.log('-'.repeat(96));
       if (!rows || rows.length === 0) {
         console.log('No TCP routes found.');
       } else {
         rows.forEach(r => console.log(
           String(r.listen_port).padEnd(10),
+          (r.listen_host || '(all)').padEnd(16),
           (r.backend || 'localhost').padEnd(24),
           String(r.back_port).padEnd(20),
           r.allowed_ips || '(all)'
@@ -106,28 +114,28 @@ function deleteRoute(listenPort) {
   });
 }
 
-function addRoute(listenPort, backend, backPort, allowedIps) {
+function addRoute(listenPort, backend, backPort, allowedIps, bindHost) {
   const db = connectDB();
   ensureColumns(db, () => {
     db.get("SELECT id FROM mappings WHERE protocol = 'tcp' AND listen_port = ?", [listenPort], (err, row) => {
       if (err) { console.error('Error checking route:', err.message); db.close(); process.exit(1); }
       const done = (verb) => {
-        console.log(`✓ ${verb} TCP route: :${listenPort} -> ${backend}:${backPort}${allowedIps ? `  (allow ${allowedIps})` : ''}`);
+        console.log(`✓ ${verb} TCP route: ${bindHost || '*'}:${listenPort} -> ${backend}${backPort ? `:${backPort}` : ''}${allowedIps ? `  (allow ${allowedIps})` : ''}`);
         console.log('\nRestart jsproxy for the change to take effect.');
         db.close();
       };
       if (row) {
         db.run(
-          "UPDATE mappings SET backend = ?, back_port = ?, allowed_ips = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-          [backend, String(backPort), allowedIps || null, row.id],
+          "UPDATE mappings SET backend = ?, back_port = ?, allowed_ips = ?, listen_host = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+          [backend, String(backPort || ''), allowedIps || null, bindHost || null, row.id],
           (e) => { if (e) { console.error('Error updating TCP route:', e.message); db.close(); process.exit(1); } done('Updated'); }
         );
       } else {
         const id = require('crypto').randomUUID();
         db.run(
-          `INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port, created_at, updated_at)
-           VALUES (?, '', '', ?, '', ?, ?, 'tcp', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-          [id, String(backPort), backend, allowedIps || null, listenPort],
+          `INSERT INTO mappings (id, domain, front_uri, back_port, back_uri, backend, allowed_ips, protocol, listen_port, listen_host, created_at, updated_at)
+           VALUES (?, '', '', ?, '', ?, ?, 'tcp', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+          [id, String(backPort || ''), backend, allowedIps || null, listenPort, bindHost || null],
           (e) => { if (e) { console.error('Error adding TCP route:', e.message); db.close(); process.exit(1); } done('Added'); }
         );
       }
@@ -136,7 +144,10 @@ function addRoute(listenPort, backend, backPort, allowedIps) {
 }
 
 // Parse arguments
-const args = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const bindArg = rawArgs.find(a => a.startsWith('--bind='));
+const bindHost = bindArg ? bindArg.slice('--bind='.length) : '';
+const args = rawArgs.filter(a => !a.startsWith('--bind='));
 
 if (args.length === 0 || args.includes('--help')) {
   printUsage();
@@ -152,12 +163,15 @@ if (args.includes('--list')) {
 } else {
   const listenPort = parseInt(args[0], 10);
   const backend = args[1];
-  const backPort = args[2];
+  const backPort = args[2] || '';
   const allowedIps = args[3] || null;
-  if (!Number.isInteger(listenPort) || !backend || !backPort) {
-    console.error('Error: listen_port, backend, and back_port are required');
+  // back_port may be omitted when the backend URLs carry their own ports
+  // (tcp://host:port,…) or a probe scheme supplies a default (dns:// → 53).
+  const hasPerUrlPorts = backend && /:\/\//.test(backend);
+  if (!Number.isInteger(listenPort) || !backend || (!backPort && !hasPerUrlPorts)) {
+    console.error('Error: listen_port, backend, and back_port are required (back_port may be omitted only when backend URLs carry ports)');
     printUsage();
     process.exit(1);
   }
-  addRoute(listenPort, backend, backPort, allowedIps);
+  addRoute(listenPort, backend, backPort, allowedIps, bindHost);
 }

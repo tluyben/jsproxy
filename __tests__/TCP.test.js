@@ -184,6 +184,32 @@ describe('Raw TCP proxying', () => {
     }
   }, 15000);
 
+  test('listen_host: binds only that IP, coexisting with another service on the same port (Linux 127/8)', async () => {
+    // Something else owns 127.0.0.1:9380; the route binds 127.0.0.2:9380.
+    const other = makeEchoBackend('other');
+    await listenOn(other, 9380); // listenOn binds 127.0.0.1
+    const backend = makeEchoBackend('mine');
+    await listenOn(backend, 9381);
+    try {
+      await proxy.db.addTcpRoute(9380, '127.0.0.1', '9381', null, '127.0.0.2');
+      await refreshTcp();
+      expect(proxy.tcpServers.has('127.0.0.2:9380')).toBe(true);
+
+      const sendTo = (host) => new Promise((resolve) => {
+        const sock = net.connect(9380, host);
+        sock.on('connect', () => sock.write('ping'));
+        sock.on('data', (d) => { resolve(d.toString()); sock.destroy(); });
+        sock.setTimeout(3000, () => { sock.destroy(); resolve(null); });
+        sock.on('error', () => resolve(null));
+      });
+      expect(await sendTo('127.0.0.2')).toBe('mine:ping');
+      expect(await sendTo('127.0.0.1')).toBe('other:ping');
+    } finally {
+      await closeServer(other);
+      await closeServer(backend);
+    }
+  }, 15000);
+
   test('HTTP mappings still work while TCP listeners are active', async () => {
     const httpBackend = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/plain' });

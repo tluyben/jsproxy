@@ -150,6 +150,13 @@ Opt-in, presence-based: rows with `protocol='tcp'` / `protocol='udp'` in the sam
 `scripts/add-tcp-route.js` / `scripts/add-udp-route.js`. Routes are read once at
 startup. Only the IP allowlist applies — no auth/webhook/plugins.
 
+Optional per-route bind IP: `listen_host` column (`--bind=<ip>` in both CLIs),
+default NULL → bind `HTTP_HOST` as before. Set → the listener binds only that IP
+(`tcpServers`/`udpServers` are keyed `host:port`), so a route can share a port
+with another service on a different IP (local resolver on 127.0.0.53:53 vs the
+public IP) — and a route bound to a non-`HTTP_HOST` IP does NOT trigger the
+:80/:443 takeover; it coexists with the HTTP(S) servers.
+
 - **Targets** come from `_rawTargets(route)`: legacy shape (single bare/http host +
   comma `back_port`) keeps bare-port score keys byte-for-byte; scheme'd or comma
   backend lists (`tcp://a:5432,tcp://b:5432`, `dns://10.0.0.2:5353,…`) get one
