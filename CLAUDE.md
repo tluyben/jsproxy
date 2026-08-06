@@ -156,6 +156,11 @@ startup. Only the IP allowlist applies — no auth/webhook/plugins.
   target per entry keyed `host:port`. Both feed the shared score engine.
 - **TCP** (`handleTcpConnection`): connect-phase-only failover (handshake/timeout,
   before any client byte is forwarded), then bidirectional pipe, TLS passthrough.
+- **Port takeover**: a TCP route with `listen_port == HTTP_PORT/HTTPS_PORT` makes
+  `start()` skip that HTTP(S) server entirely — the port becomes raw passthrough
+  (no domain routing / local TLS / ACME HTTP-01 / redirects; logged as a warn).
+  The TCP-vs-HTTP collision guard only covers ports an HTTP(S) server actually
+  bound. Tests: `__tests__/TCP-takeover.test.js`.
 - **UDP** (`startUdpListeners`/`_handleUdpDatagram`): per-client-flow connected
   dgram sockets (reply routing + backend stickiness), idle expiry
   (`UDP_SESSION_TIMEOUT_MS`), flow cap (`UDP_MAX_FLOWS`). A pre-reply socket error

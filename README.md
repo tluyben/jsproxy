@@ -814,8 +814,24 @@ they cannot affect domain-based HTTP routing.
 | `TCP_CONNECT_TIMEOUT_MS` | `HA_CONNECT_TIMEOUT_MS` (3000) | Upstream connect timeout before failover |
 | `TCP_IDLE_TIMEOUT_MS` | `0` (never) | Idle timeout for established connections |
 
-> A TCP `listen_port` must differ from `HTTP_PORT`/`HTTPS_PORT`; a colliding route is
-> logged and skipped.
+### Taking over :80 / :443 with raw TCP
+
+A TCP route whose `listen_port` **is** `HTTP_PORT` or `HTTPS_PORT` *takes that port
+over*: jsproxy does **not** start the corresponding HTTP(S) server and the port
+becomes pure TCP passthrough (opt-in purely by the route's presence — delete the
+route and the next restart serves HTTP(S) there again):
+
+```bash
+# *:80  -> backend-1 (raw)          *:443 -> backend-1,backend-2 (raw, HA)
+node scripts/add-tcp-route.js 80  tcp://backend-1:80
+node scripts/add-tcp-route.js 443 'tcp://backend-1:443,tcp://backend-2:443'
+```
+
+Be aware of what you give up on a taken-over port — it's raw bytes, so **no domain
+routing, no local TLS termination (the backend terminates TLS; SNI is not inspected),
+no ACME HTTP-01 challenge serving (relevant when taking over :80), no HTTPS
+redirects, and no auth/webhooks/plugins**. The takeover is logged prominently at
+startup.
 
 ### Chaining jsproxy → jsproxy (raw TCP)
 

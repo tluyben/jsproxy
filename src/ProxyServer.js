@@ -256,22 +256,46 @@ class ProxyServer {
     const httpHost = process.env.HTTP_HOST || '0.0.0.0';
     const enableHttps = process.env.ENABLE_HTTPS !== 'false' && (isProduction || process.env.ENABLE_HTTPS === 'true');
 
-    this.httpServer = http.createServer((req, res) => {
-      this.handleRequest(req, res, false);
-    });
+    // A raw TCP route may claim the HTTP or HTTPS port itself (listen_port
+    // 80/443): that port then becomes pure TCP passthrough and the
+    // corresponding HTTP(S) server is NOT started. Opt-in purely by the
+    // route's presence — without such a route both servers bind exactly as
+    // before. (UDP routes never contend here: different protocol space.)
+    let rawTcpPorts = new Set();
+    try {
+      rawTcpPorts = new Set((await this.db.getTcpRoutes())
+        .map(r => parseInt(r.listen_port, 10))
+        .filter(Number.isInteger));
+    } catch (_) { /* no raw routes readable — nothing can be taken over */ }
+    const httpTakenOver  = rawTcpPorts.has(parseInt(httpPort, 10));
+    const httpsTakenOver = rawTcpPorts.has(parseInt(httpsPort, 10));
 
-    this.httpServer.on('upgrade', (req, socket, head) => {
-      this.handleWebSocket(req, socket, head, false);
-    });
-
-    await new Promise((resolve) => {
-      this.httpServer.listen(httpPort, httpHost, () => {
-        this.logger.info(`HTTP server listening on ${httpHost}:${httpPort}`);
-        resolve();
+    if (httpTakenOver) {
+      this.logger.warn(
+        `HTTP port ${httpPort} is claimed by a raw TCP route — the HTTP server is not started; ` +
+        `the port is raw passthrough (no domain routing, no ACME HTTP-01 challenges, no HTTPS redirects)`);
+    } else {
+      this.httpServer = http.createServer((req, res) => {
+        this.handleRequest(req, res, false);
       });
-    });
 
-    if (enableHttps) {
+      this.httpServer.on('upgrade', (req, socket, head) => {
+        this.handleWebSocket(req, socket, head, false);
+      });
+
+      await new Promise((resolve) => {
+        this.httpServer.listen(httpPort, httpHost, () => {
+          this.logger.info(`HTTP server listening on ${httpHost}:${httpPort}`);
+          resolve();
+        });
+      });
+    }
+
+    if (enableHttps && httpsTakenOver) {
+      this.logger.warn(
+        `HTTPS port ${httpsPort} is claimed by a raw TCP route — the HTTPS server is not started; ` +
+        `TLS passes through untouched and the backend terminates it (no SNI routing, no local certs)`);
+    } else if (enableHttps) {
       try {
         const defaultCert = await this.certManager.getDefaultCertificate();
         const sniCallback = await this.certManager.getSNICallback();
@@ -332,7 +356,12 @@ class ProxyServer {
     // Raw TCP/UDP proxying is entirely opt-in: a listener exists only because a
     // protocol='tcp' (or 'udp') row exists. With no such rows these are no-ops
     // and the proxy behaves exactly as it did before raw-socket support existed.
-    await this.startTcpListeners(httpPort, httpsPort, httpHost);
+    // The collision guard only covers ports an HTTP(S) server actually bound —
+    // a taken-over (or unbound/disabled) port is free for the raw listener.
+    await this.startTcpListeners(
+      this.httpServer ? httpPort : NaN,
+      this.httpsEnabled ? httpsPort : NaN,
+      httpHost);
     await this.startUdpListeners(httpHost);
   }
 
