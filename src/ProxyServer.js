@@ -490,7 +490,11 @@ class ProxyServer {
       upstream.once('error', fail);
 
       upstream.connect(target.port, target.hostname, () => {
-        if (settled) { upstream.destroy(); return; }
+        // The client can vanish while this connect is still in flight (a slow
+        // or firewalled backend makes that window seconds wide). Wiring the
+        // pipes to an already-dead client would strand this upstream: no 'end'
+        // can ever arrive to close it.
+        if (settled || clientSocket.destroyed) { upstream.destroy(); return; }
         settled = true;
         upstream.setTimeout(0);              // clear the connect timeout
         upstream.removeListener('error', fail);
@@ -503,9 +507,17 @@ class ProxyServer {
 
         // Bidirectional pipe. Tear down the peer when either side ends/errors so
         // no half-open socket lingers.
+        //
+        // 'close' is the load-bearing one: it fires exactly once per socket no
+        // matter how the connection ended, whereas 'error' only covers the
+        // abnormal case. Wiring 'error' alone leaked the upstream fd on every
+        // cleanly-closed connection — invisible until the process hit its fd
+        // ceiling. destroy() is idempotent, so the overlap is harmless.
         const teardown = () => { clientSocket.destroy(); upstream.destroy(); };
         clientSocket.on('error', teardown);
         upstream.on('error', teardown);
+        clientSocket.on('close', teardown);
+        upstream.on('close', teardown);
         clientSocket.pipe(upstream);
         upstream.pipe(clientSocket);
         clientSocket.resume();

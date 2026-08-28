@@ -24,7 +24,7 @@ describe('WebSocket Proxy - Production Ready Tests', () => {
       warn: jest.fn()
     };
 
-    // HTTP WebSocket Backend (port 3020)
+    // HTTP WebSocket Backend (port 9820)
     httpBackend = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('HTTP Backend OK');
@@ -52,7 +52,7 @@ describe('WebSocket Proxy - Production Ready Tests', () => {
       });
     });
 
-    await new Promise(resolve => httpBackend.listen(3020, resolve));
+    await new Promise(resolve => httpBackend.listen(9820, resolve));
 
     // Setup proxy server
     proxyServer = new ProxyServer(logger);
@@ -66,10 +66,10 @@ describe('WebSocket Proxy - Production Ready Tests', () => {
     await proxyServer.initialize();
 
     // Add various routing mappings
-    await proxyServer.db.addMapping('websocket.test.com', '', 3020, '');
-    await proxyServer.db.addMapping('api.test.com', 'ws', 3020, '');
-    await proxyServer.db.addMapping('chat.test.com', 'socket/v1', 3020, '');
-    await proxyServer.db.addMapping('multi.test.com', 'app/chat', 3020, 'ws');
+    await proxyServer.db.addMapping('websocket.test.com', '', 9820, '');
+    await proxyServer.db.addMapping('api.test.com', 'ws', 9820, '');
+    await proxyServer.db.addMapping('chat.test.com', 'socket/v1', 9820, '');
+    await proxyServer.db.addMapping('multi.test.com', 'app/chat', 9820, 'ws');
 
     await proxyServer.start();
   }, 20000);
