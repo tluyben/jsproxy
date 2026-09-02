@@ -1109,10 +1109,12 @@ class ProxyServer {
           changeOrigin: true
         });
       } else {
-        // Complex URI mapping
+        // Complex URI mapping: the target already carries the rewritten path, so tell
+        // http-proxy not to append req.url to it again (it would double the path).
         const targetUrl = this.buildTargetUrl(mapping, req.url);
         this.proxy.web(req, res, {
           target: targetUrl,
+          ignorePath: true,
           secure: false,
           changeOrigin: true
         });
