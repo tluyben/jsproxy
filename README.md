@@ -1420,3 +1420,18 @@ A: Yes, HTTP/2 is supported automatically with HTTPS connections.
 
 **Q: What about WebSocket connections?**
 A: WebSocket connections are fully supported and proxied transparently.
+
+## Client-disconnect cleanup
+
+SSE feeds and downloads remain active while their client is connected. When the
+client closes an unfinished response, jsproxy closes the associated backend
+request too, including streaming plugin requests. This is separate from an
+aborted upload: a GET can already be complete while its response stays open.
+Completed requests remove their cleanup hooks; client cancellation does not
+trigger backend failover or health penalties.
+
+Regression: `npm test -- --runInBand --coverage=false __tests__/stream-disconnect.test.js`.
+It checks real sockets, repeated disconnects, pending headers/plugin hooks,
+normal completion and active streams. Restart existing workers after deploying
+updated source; rebuild embedded binaries. Local checks are not a substitute
+for observing memory under the deployment's workload.

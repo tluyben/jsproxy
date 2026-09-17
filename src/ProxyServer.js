@@ -79,8 +79,20 @@ class ProxyServer {
     this.setupProxyErrorHandling();
   }
 
+  // A GET has normally finished uploading before its SSE/download is closed,
+  // so IncomingMessage's 'aborted'/'error' events do not cover this lifetime.
+  // Tie each upstream request to the downstream RESPONSE instead. Remove the
+  // hook when that attempt ends so keep-alive and retries retain no old attempts.
+  _closeUpstreamWithClient(proxyReq, res) {
+    const abort = () => { if (!res.writableFinished) proxyReq.destroy(); };
+    if (res.destroyed) abort();
+    else res.once('close', abort);
+    proxyReq.once('close', () => res.removeListener('close', abort));
+  }
+
   setupProxyErrorHandling() {
     this.proxy.on('proxyReq', (proxyReq, req, res, options) => {
+      this._closeUpstreamWithClient(proxyReq, res);
       const originalHost = req.headers.host;
       if (originalHost) {
         proxyReq.setHeader('X-Forwarded-Host', originalHost);
@@ -1069,6 +1081,7 @@ class ProxyServer {
             : parseInt(process.env.HTTP_PORT || (process.env.NODE_ENV === 'production' ? '80' : '8080'), 10);
           const requestId = crypto.randomUUID();
           const { interested, needsBody } = await this.pluginManager.runValid(requestId, domain, inPort, req.url, req.method);
+          if (res.destroyed) return;
           if (interested.length > 0) {
             this.pluginManager.register(requestId, interested, needsBody);
             res.once('close', () => this.pluginManager.cleanup(requestId));
@@ -1805,6 +1818,8 @@ class ProxyServer {
       requestId, domain, inPort, req.url, req.method, req.headers, null
     );
 
+    if (res.destroyed) return;
+
     if (beforeResult.type === 'CANCEL') {
       // The plugin may supply its own headers + body (block page / PoW challenge);
       // fall back to a bare status with an empty text body.
@@ -1864,7 +1879,9 @@ class ProxyServer {
     if (!rewriteReqBody) req.pause();
 
     return new Promise((resolve) => {
+      res.once('close', resolve);
       const attempt = (idx) => {
+      if (res.destroyed) return resolve();
       if (idx >= ordered.length) {
         const list = ordered.map(t => `${t.hostname}:${t.port}`).join(',');
         this.logger.error('all backends unavailable (plugin stream)', {
@@ -1887,12 +1904,14 @@ class ProxyServer {
         { hostname: target.hostname, port, path: targetPath, method, headers: attemptHeaders,
           ...(target.isHttps ? { rejectUnauthorized: false } : {}) },
         async (proxyRes) => {
+          if (res.destroyed) { proxyRes.destroy(); return resolve(); }
           this.boostPort(mapping.id, target.key);
           try {
             if (!skipAfter) {
               const afterResult = await this.pluginManager.runAfter(
                 requestId, domain, inPort, proxyRes.statusCode, proxyRes.headers, null
               );
+              if (res.destroyed) { proxyRes.destroy(); return resolve(); }
               if (afterResult.type === 'CANCEL') {
                 proxyRes.destroy();
                 res.writeHead(afterResult.statusCode, { 'content-type': 'text/plain' });
@@ -1943,8 +1962,10 @@ class ProxyServer {
         }
       );
 
+      this._closeUpstreamWithClient(proxyReq, res);
       proxyReq.on('socket', (socket) => {
         const onConnect = () => {
+          if (res.destroyed) { proxyReq.destroy(); return; }
           committed = true;
           socket.setTimeout(0);
           if (rewriteReqBody) {
@@ -1969,6 +1990,7 @@ class ProxyServer {
       });
 
       proxyReq.on('error', (err) => {
+        if (res.destroyed) return resolve(); // client cancellation is not a backend failure
         if (!committed) {
           // Connect-phase failure: nothing sent yet → penalize and fail over.
           this.penalizePort(mapping.id, target.key);
@@ -2382,6 +2404,7 @@ class ProxyServer {
     res.on('close', clearIdle);
 
     const attempt = (idx) => {
+      if (res.destroyed) { clearIdle(); return; }
       if (idx >= ordered.length) {
         clearIdle();
         const list = ordered.map(t => `${t.hostname}:${t.port}`).join(',');
@@ -2412,6 +2435,7 @@ class ProxyServer {
         headers,
         ...(target.isHttps ? { rejectUnauthorized: false } : {}),
       }, (proxyRes) => {
+        if (res.destroyed) { proxyRes.destroy(); clearIdle(); return; }
         // Response received → backend is healthy. Stream it straight back, resetting
         // the idle deadline on every response chunk so a long download stays alive.
         this.boostPort(mapping.id, target.key);
@@ -2429,9 +2453,11 @@ class ProxyServer {
       });
 
       currentProxyReq = proxyReq;
+      this._closeUpstreamWithClient(proxyReq, res);
 
       proxyReq.on('socket', (socket) => {
         const onConnect = () => {
+          if (res.destroyed) { proxyReq.destroy(); return; }
           committed = true;
           // Connect succeeded: drop the connect deadline and switch to the idle
           // timeout. We use our own timer (reset on real data both ways) rather
@@ -2457,6 +2483,7 @@ class ProxyServer {
       });
 
       proxyReq.on('error', (err) => {
+        if (res.destroyed) { clearIdle(); return; } // not a backend failure; never fail over
         if (!committed) {
           // Connect-phase failure: no body sent yet → penalize and fail over.
           this.penalizePort(mapping.id, target.key);
