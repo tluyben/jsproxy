@@ -325,8 +325,14 @@ class DatabaseManager {
           return;
         }
 
-        // No exact match, try wildcard match
-        const parts = domain.split('.');
+        // No exact match → nearest wildcard, walking UP the labels: a.b.c.tld
+        // tries `*.b.c.tld`, then `*.c.tld`, then `*.tld`, and finally the
+        // global `*`. The nearest wildcard wins, so a deeper catch-all can be
+        // decoupled from a shallower one exactly like an explicit name can.
+        // (Stripping exactly one label used to be the rule; that left every
+        // name two or more labels below a catch-all unroutable.) Whether the
+        // matched wildcard's CERTIFICATE covers the name is decided separately
+        // — see CertificateManager.getSNICallback.
         const wildcardSql = `
           SELECT * FROM mappings
           WHERE domain = ? AND (? LIKE '/' || front_uri || '%' OR front_uri = '')
@@ -334,31 +340,24 @@ class DatabaseManager {
           ORDER BY LENGTH(front_uri) DESC
           LIMIT 1
         `;
+        const candidates = [];
+        const parts = domain.split('.');
+        for (let i = 1; i < parts.length; i++) candidates.push(`*.${parts.slice(i).join('.')}`);
+        candidates.push('*');
 
-        if (parts.length > 1) {
-          parts.shift();
-          const wildcardDomain = `*.${parts.join('.')}`;
-
-          this.db.get(wildcardSql, [wildcardDomain, requestUrl], (wildErr, wildcardRow) => {
+        const tryNext = (idx) => {
+          if (idx >= candidates.length) { resolve(null); return; }
+          this.db.get(wildcardSql, [candidates[idx], requestUrl], (wildErr, wildcardRow) => {
             if (wildErr) {
               this.logger.error('Error getting wildcard mapping:', wildErr);
               reject(wildErr);
               return;
             }
             if (wildcardRow) { resolve(wildcardRow); return; }
-            // Final fallback: global '*' catch-all
-            this.db.get(wildcardSql, ['*', requestUrl], (catchErr, catchRow) => {
-              if (catchErr) { this.logger.error('Error getting catch-all mapping:', catchErr); reject(catchErr); return; }
-              resolve(catchRow || null);
-            });
+            tryNext(idx + 1);
           });
-        } else {
-          // Domain has no dots (e.g. "netcup-7") — try global '*' catch-all directly
-          this.db.get(wildcardSql, ['*', requestUrl], (catchErr, catchRow) => {
-            if (catchErr) { this.logger.error('Error getting catch-all mapping:', catchErr); reject(catchErr); return; }
-            resolve(catchRow || null);
-          });
-        }
+        };
+        tryNext(0);
       });
     });
   }

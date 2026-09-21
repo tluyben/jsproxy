@@ -98,4 +98,29 @@ describe('DatabaseManager', () => {
     expect(mappings.some(m => m.domain === 'example.com')).toBe(true);
     expect(mappings.some(m => m.domain === 'test.com')).toBe(true);
   });
+
+  test('getMapping walks every wildcard level, nearest first, then the global catch-all', async () => {
+    await dbManager.initialize();
+    await dbManager.addMapping('*.example.com', '', 3000, '', 'http://zone');
+    await dbManager.addMapping('*.eu.example.com', '', 3001, '', 'http://eu');
+    await dbManager.addMapping('*', '', 3002, '', 'http://global');
+    await dbManager.addMapping('fixed.eu.example.com', '', 3003, '', 'http://fixed');
+
+    expect((await dbManager.getMapping('fixed.eu.example.com', '/')).backend).toBe('http://fixed');
+    expect((await dbManager.getMapping('a.example.com', '/')).backend).toBe('http://zone');
+    expect((await dbManager.getMapping('a.eu.example.com', '/')).backend).toBe('http://eu');
+    // Deeper names walk UP to the nearest wildcard instead of falling off.
+    expect((await dbManager.getMapping('a.b.example.com', '/')).backend).toBe('http://zone');
+    expect((await dbManager.getMapping('a.b.eu.example.com', '/')).backend).toBe('http://eu');
+    expect((await dbManager.getMapping('x.y.z.example.com', '/')).backend).toBe('http://zone');
+    expect((await dbManager.getMapping('a.other.com', '/')).backend).toBe('http://global');
+    expect((await dbManager.getMapping('netcup-7', '/')).backend).toBe('http://global');
+  });
+
+  test('getMapping returns null when no wildcard at any level matches', async () => {
+    await dbManager.initialize();
+    await dbManager.addMapping('*.eu.example.com', '', 3001, '', 'http://eu');
+    expect(await dbManager.getMapping('a.example.com', '/')).toBeNull();
+    expect(await dbManager.getMapping('eu.example.com', '/')).toBeNull();
+  });
 });

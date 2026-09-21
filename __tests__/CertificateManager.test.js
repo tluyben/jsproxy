@@ -147,4 +147,50 @@ describe('CertificateManager', () => {
     }
     expect(exists).toBe(false);
   });
+
+  test('a wildcard only covers names exactly one label below it', () => {
+    expect(certManager.wildcardParentOf('a.example.com')).toBe('example.com');
+    expect(certManager.wildcardParentOf('a.b.example.com')).toBe('b.example.com');
+    expect(certManager.wildcardParentOf('example.com')).toBeNull();
+    expect(certManager.wildcardParentOf('localhost')).toBeNull();
+    expect(certManager.wildcardCovers('*.example.com', 'a.example.com')).toBe(true);
+    expect(certManager.wildcardCovers('*.example.com', 'a.b.example.com')).toBe(false);
+    expect(certManager.wildcardCovers('*.b.example.com', 'a.b.example.com')).toBe(true);
+    expect(certManager.wildcardCovers('*', 'a.example.com')).toBe(false);
+  });
+
+  test('ensureCertificate serves a wildcard only to the names it covers', async () => {
+    await certManager.initialize();
+    certManager.wildcardCerts.set('example.com', { cert: 'WILDCARD-CERT', key: 'WILDCARD-KEY' });
+    jest.spyOn(certManager, 'isCertificateValid').mockResolvedValue(true);
+
+    const direct = await certManager.ensureCertificate('a.example.com', true);
+    expect(direct.cert).toBe('WILDCARD-CERT');
+
+    // Two labels down: NOT the wildcard (it would fail the handshake).
+    const nested = await certManager.ensureCertificate('a.b.example.com', false);
+    expect(nested.cert).not.toBe('WILDCARD-CERT');
+    expect(nested.type).toBe('selfsigned');
+
+    certManager.certificates.delete('a.b.example.com');
+    certManager.wildcardCerts.set('b.example.com', { cert: 'NESTED-WILDCARD', key: 'k' });
+    const covered = await certManager.ensureCertificate('a.b.example.com', true);
+    expect(covered.cert).toBe('NESTED-WILDCARD');
+
+    expect(await certManager.hasCertificateFor('zzz.example.com')).toBe(true);
+    expect(await certManager.hasCertificateFor('zzz.q.example.com')).toBe(false);
+  });
+
+  test('the SNI callback uses the mapping wildcard cert only for a direct child', async () => {
+    await certManager.initialize();
+    const mappings = { 'a.example.com': { domain: '*.example.com' }, 'a.b.example.com': { domain: '*.example.com' } };
+    certManager.db = { getMapping: async (d) => mappings[d] || null };
+    const asked = [];
+    jest.spyOn(certManager, 'ensureCertificate').mockImplementation(async (d) => { asked.push(d); return { cert: 'c', key: 'k' }; });
+    jest.spyOn(require('tls'), 'createSecureContext').mockReturnValue({});
+    const sni = await certManager.getSNICallback();
+    await new Promise((r) => sni('a.example.com', () => r()));
+    await new Promise((r) => sni('a.b.example.com', () => r()));
+    expect(asked).toEqual(['*.example.com', 'a.b.example.com']);
+  });
 });

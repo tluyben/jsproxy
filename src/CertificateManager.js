@@ -553,7 +553,14 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
 
         const isDomainValidated = true;
         let certDomain = domain;
-        if (domainMapping.domain.startsWith('*.') && !domain.startsWith('*')) {
+        // A wildcard certificate matches exactly ONE label, so the mapping's
+        // wildcard cert is only the right answer when the wildcard is the
+        // name's direct parent (`a.example.com` under `*.example.com`). A name
+        // routed by a deeper walk-up (`a.b.example.com` under `*.example.com`)
+        // or by the global `*` gets its own per-host certificate instead —
+        // the mapping match validates it, so on-demand issuance may run.
+        if (domainMapping.domain.startsWith('*.') && !domain.startsWith('*')
+            && this.wildcardCovers(domainMapping.domain, domain)) {
           certDomain = domainMapping.domain;
         }
 
@@ -590,12 +597,17 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
       this.certificates.delete(domain);
     }
 
-    // Wildcard fallback
-    const mainDomain = this.getMainDomain(domain);
-    if (domain !== mainDomain) {
-      const wildcardCert = await this.getWildcardCertificate(mainDomain);
+    // Wildcard fallback — keyed on the name's DIRECT parent, because that is
+    // the only wildcard that can cover it. Keying on the registrable domain
+    // (as this once did) handed `a.b.example.com` the `*.example.com`
+    // certificate, which does not match it: every nested name under a zone
+    // holding a wildcard failed its handshake, and this branch runs BEFORE the
+    // per-host store, so a valid per-host certificate could never win either.
+    const wildcardParent = this.wildcardParentOf(domain);
+    if (wildcardParent) {
+      const wildcardCert = await this.getWildcardCertificate(wildcardParent);
       if (wildcardCert) {
-        this.logger.info(`Using wildcard certificate for ${domain} from *.${mainDomain}`);
+        this.logger.info(`Using wildcard certificate for ${domain} from *.${wildcardParent}`);
         // Tag as trusted so it stays cached without upgrade checks (wildcard has its own path)
         this.certificates.set(domain, { ...wildcardCert, type: 'trusted' });
         return wildcardCert;
@@ -804,6 +816,25 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
     return domain !== mainDomain && domain !== `www.${mainDomain}`;
   }
 
+  /**
+   * The name whose `*.<name>` certificate would cover `domain`: its direct
+   * parent, one label up. A wildcard matches exactly one label, so this is the
+   * ONLY candidate — `*.example.com` covers `a.example.com` and nothing deeper.
+   * Null when the parent would be a bare TLD (no public wildcard exists there).
+   */
+  wildcardParentOf(domain) {
+    const idx = domain.indexOf('.');
+    if (idx <= 0) return null;
+    const parent = domain.slice(idx + 1);
+    return parent.includes('.') ? parent : null;
+  }
+
+  /** Does the wildcard `*.<x>` cover `domain` (exactly one label below x)? */
+  wildcardCovers(wildcard, domain) {
+    if (!wildcard.startsWith('*.')) return false;
+    return this.wildcardParentOf(domain) === wildcard.slice(2);
+  }
+
   isPublicDomain(domain) {
     if (!domain.includes('.')) return false;
     if (/^\d{1,3}(\.\d{1,3}){3}$/.test(domain)) return false;
@@ -855,15 +886,15 @@ AQELBQADQQAGo8h5J9l8QO2s0/7RGYQwV5o4Yb0w9fX/b8d0+X9sR2Y6NJkPLYy4
   async hasCertificateFor(domain) {
     if (!domain) return false;
 
-    // In-memory: exact domain, or (for a subdomain) a cached covering wildcard.
+    // In-memory: exact domain, or a cached wildcard that actually covers it
+    // (the direct parent's — a wildcard matches one label only).
     if (this.certificates.has(domain)) return true;
-    const mainDomain = this.getMainDomain(domain);
-    const isSubdomain = domain !== mainDomain;
-    if (isSubdomain && this.wildcardCerts.has(mainDomain)) return true;
+    const wildcardParent = this.wildcardParentOf(domain);
+    if (wildcardParent && this.wildcardCerts.has(wildcardParent)) return true;
 
     // Persistent store: trusted, then self-signed, then a covering wildcard.
     const keys = [`${domain}.trusted.crt`, `${domain}.selfsigned.crt`];
-    if (isSubdomain) keys.push(`wildcard.${mainDomain}.crt`);
+    if (wildcardParent) keys.push(`wildcard.${wildcardParent}.crt`);
     try {
       for (const key of keys) {
         const cert = await this.store.read(key);
