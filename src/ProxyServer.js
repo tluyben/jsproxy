@@ -4,6 +4,7 @@ const net = require('net');
 const dgram = require('dgram');
 const crypto = require('crypto');
 const { getProbe } = require('./ProtocolProbes');
+const dnsCache = require('./DnsCache');
 const httpProxy = require('http-proxy');
 const DatabaseManager = require('./DatabaseManager');
 const CertificateManager = require('./CertificateManager');
@@ -501,7 +502,7 @@ class ProxyServer {
       upstream.setTimeout(connectTimeoutMs, fail);
       upstream.once('error', fail);
 
-      upstream.connect(target.port, target.hostname, () => {
+      upstream.connect({ port: target.port, host: target.hostname, lookup: dnsCache.lookup }, () => {
         // The client can vanish while this connect is still in flight (a slow
         // or firewalled backend makes that window seconds wide). Wiring the
         // pipes to an already-dead client would strand this upstream: no 'end'
@@ -748,7 +749,7 @@ class ProxyServer {
     // advances to the next-best backend.
     const target = this.rankedTargets(route.id, targets)[0];
     const idleMs = parseInt(process.env.UDP_SESSION_TIMEOUT_MS || '30000', 10);
-    const sock = dgram.createSocket(target.hostname.includes(':') ? 'udp6' : 'udp4');
+    const sock = dgram.createSocket({ type: target.hostname.includes(':') ? 'udp6' : 'udp4', lookup: dnsCache.lookup });
     const flow = { sock, target, pending: msg, gotReply: false, connected: false, queue: [msg], timer: null, touch: null };
 
     const close = () => {
@@ -1118,6 +1119,7 @@ class ProxyServer {
         const target = `${backend}:${mapping.back_port}`;
         this.proxy.web(req, res, {
           target: target,
+          agent: dnsCache.agentFor(target),
           secure: false,
           changeOrigin: true
         });
@@ -1127,6 +1129,7 @@ class ProxyServer {
         const targetUrl = this.buildTargetUrl(mapping, req.url);
         this.proxy.web(req, res, {
           target: targetUrl,
+          agent: dnsCache.agentFor(targetUrl),
           ignorePath: true,
           secure: false,
           changeOrigin: true
@@ -1238,6 +1241,7 @@ class ProxyServer {
         : `${mapping.backend || 'http://localhost'}:${mapping.back_port}`;
       this.proxy.ws(req, socket, head, {
         target,
+        agent: dnsCache.agentFor(target),
         secure: false,
         changeOrigin: true
       }, (err) => {
@@ -1427,7 +1431,7 @@ class ProxyServer {
     const probe = () => {
       const sock = new net.Socket();
       sock.setTimeout(3000);
-      sock.connect(port, host, () => {
+      sock.connect({ port, host, lookup: dnsCache.lookup }, () => {
         sock.destroy();
         this.bgChecks.delete(key);
         this.portScores.set(key, 50);
@@ -1465,7 +1469,7 @@ class ProxyServer {
         sock.once('connect', () => done(true));
         sock.once('error',   () => done(false));
         sock.once('timeout', () => done(false));
-        sock.connect(target.port, target.hostname);
+        sock.connect({ port: target.port, host: target.hostname, lookup: dnsCache.lookup });
       });
       if (alive) return target;
       this.penalizePort(mapping.id, target.key);
@@ -1563,6 +1567,7 @@ class ProxyServer {
 
       const proxyReq = lib.request({
         hostname: backendUrl.hostname,
+        lookup: dnsCache.lookup,
         port,
         path: targetPath,
         method,
@@ -1901,7 +1906,7 @@ class ProxyServer {
       attemptHeaders['host'] = mapping.back_host || `${target.hostname}:${port}`;
 
       const proxyReq = lib.request(
-        { hostname: target.hostname, port, path: targetPath, method, headers: attemptHeaders,
+        { hostname: target.hostname, lookup: dnsCache.lookup, port, path: targetPath, method, headers: attemptHeaders,
           ...(target.isHttps ? { rejectUnauthorized: false } : {}) },
         async (proxyRes) => {
           if (res.destroyed) { proxyRes.destroy(); return resolve(); }
@@ -2190,6 +2195,7 @@ class ProxyServer {
 
       const proxyReq = lib.request({
         hostname: target.hostname,
+        lookup: dnsCache.lookup,
         port: target.port,
         path: targetPath,
         method,
@@ -2429,6 +2435,7 @@ class ProxyServer {
 
       const proxyReq = lib.request({
         hostname: target.hostname,
+        lookup: dnsCache.lookup,
         port,
         path: targetPath,
         method: req.method,
@@ -2772,6 +2779,7 @@ class ProxyServer {
       const result = await new Promise((resolve, reject) => {
         const reqOptions = {
           hostname: parsed.hostname,
+          lookup: dnsCache.lookup,
           port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
           path: parsed.pathname + parsed.search,
           method: 'POST',

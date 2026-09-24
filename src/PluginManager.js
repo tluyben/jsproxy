@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('http');
+const { lookup } = require('./DnsCache');
 
 /**
  * No-op stub — used when PLUGIN is not set.
@@ -85,6 +86,7 @@ class PluginManager {
       const req = http.request(
         {
           hostname: plugin.host,
+          lookup,
           port: plugin.port,
           path,
           method: 'POST',
@@ -135,6 +137,7 @@ class PluginManager {
       const req = http.request(
         {
           hostname: plugin.host,
+          lookup,
           port: plugin.port,
           path,
           method: 'POST',

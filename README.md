@@ -90,6 +90,14 @@ TRUSTED_PROXIES=private            # Proxies whose X-Forwarded-* headers to trus
                                    #   `loopback` / `private` / `all`.
 DB_PATH=./data/current.db          # Path to SQLite database file
 
+# Backend DNS cache (every backend connect, HA attempt and health probe)
+DNS_CACHE_TTL_MS=30000             # Reuse a resolved backend address this long
+                                   #   (default: 30000; 0 = no cache, plain dns.lookup)
+DNS_CACHE_STALE_MS=300000          # After the TTL, keep serving the old address while
+                                   #   one background refresh runs; also covers resolver
+                                   #   outages (default: 300000)
+DNS_CACHE_NEGATIVE_TTL_MS=5000     # Cache a failed lookup this long (default: 5000)
+
 # Certificates
 CERTS_DIR=./certs                  # Directory for cert files (default: ./certs)
 CERT_STORAGE=disk|db               # Where certs live: disk files or the DB

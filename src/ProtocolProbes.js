@@ -1,4 +1,5 @@
 const dgram = require('dgram');
+const { lookup } = require('./DnsCache');
 const net = require('net');
 const crypto = require('crypto');
 
@@ -46,7 +47,7 @@ function isDnsResponse(buf, id) {
 function probeDnsUdp({ hostname, port, name, timeoutMs }) {
   return new Promise((resolve) => {
     const id = crypto.randomBytes(2).readUInt16BE(0);
-    const sock = dgram.createSocket(hostname.includes(':') ? 'udp6' : 'udp4');
+    const sock = dgram.createSocket({ type: hostname.includes(':') ? 'udp6' : 'udp4', lookup });
     let settled = false;
     const done = (ok) => {
       if (settled) return;
@@ -84,7 +85,7 @@ function probeDnsTcp({ hostname, port, name, timeoutMs }) {
       const len = buf.readUInt16BE(0);
       if (buf.length >= 2 + len) done(isDnsResponse(buf.slice(2, 2 + len), id));
     });
-    sock.connect(port, hostname, () => {
+    sock.connect({ port, host: hostname, lookup }, () => {
       const q = buildDnsQuery(name, id);
       const framed = Buffer.alloc(2 + q.length);
       framed.writeUInt16BE(q.length, 0);
