@@ -11,6 +11,7 @@ const CertificateManager = require('./CertificateManager');
 const { noop } = require('./PluginManager');
 const { URL } = require('url');
 const { tracer, trace, context: otelContext, propagation, SpanKind, SpanStatusCode } = require('./Telemetry');
+const sauromon = require('./Sauromon');
 
 class ProxyServer {
   constructor(logger, pluginManager) {
@@ -24,6 +25,10 @@ class ProxyServer {
     this.portLastSeen = new Map();  // `${mappingId}:${port}` -> Date.now() when last successful
     this.rrCounters   = new Map();  // mappingId -> rotation counter (tie-break)
     this.bgChecks     = new Set();  // keys currently being TCP-probed
+
+    // Live counts for the SauroMON heartbeat (only maintained when it is on).
+    this.liveHttpSockets = 0;
+    this.liveTcpSessions = 0;
 
     // Proxies whose X-Forwarded-* headers we believe. Default: EMPTY — the secure
     // "edge" posture: the client IP is always the real socket peer and inbound
@@ -91,9 +96,171 @@ class ProxyServer {
     proxyReq.once('close', () => res.removeListener('close', abort));
   }
 
+  // SauroMON: remember which backend an attempt went to and whether it rode a
+  // pooled (keep-alive) socket, so a failed request's event names the hop.
+  _tagUpstream(proxyReq, req) {
+    if (!sauromon.enabled || !req) return;
+    req._jspAttempts = (req._jspAttempts || 0) + 1;
+    proxyReq.once('socket', (socket) => {
+      req._jspBackend = `${proxyReq.host}:${socket.remotePort || ''}`;
+      req._jspBackendReused = !!proxyReq.reusedSocket;
+    });
+  }
+
+  // ── SauroMON diagnostics (all no-ops unless SAUROMON_INGEST_KEY is set) ──
+
+  // One event per HTTP request that failed (5xx / jsproxy gateway error) or
+  // never finished (the client or the connection went away mid-request), plus
+  // a SAUROMON_SAMPLE share of healthy ones. Carries the keep-alive context of
+  // the inbound socket (which request on the socket, how long it sat idle
+  // before this one) and the backend hop, which is what separates a keep-alive
+  // race from a backend failure.
+  _trackRequest(req, res, isHttps) {
+    const started = Date.now();
+    const sock = req.socket;
+    const st = sock && sock._jsp;
+    let reqIndex = null;
+    let idleBefore = null;
+    if (st) {
+      st.reqs++;
+      st.inflight++;
+      reqIndex = st.reqs;
+      if (st.lastEndAt) idleBefore = started - st.lastEndAt;
+    }
+    res.once('close', () => {
+      const now = Date.now();
+      if (st) { st.inflight--; st.lastEndAt = now; }
+      const status = res.statusCode || 0;
+      const finished = res.writableFinished;
+      const reason = req._jspGatewayReason;
+      const problem = status >= 500 || !finished || !!reason;
+      if (!problem && (req.url === '/health' || !sauromon.sampled())) return;
+      const h = req.headers || {};
+      const host = (h.host || '').split(':')[0];
+      const path = (req.url || '').split('?')[0].slice(0, 300);
+      const cdn = {};
+      for (const [k, v] of Object.entries(h)) if (k.startsWith('cdn-')) cdn[k] = String(v).slice(0, 200);
+      const level = status >= 500 || reason ? 'error' : (!finished ? 'warn' : 'info');
+      sauromon.event(level, `${req.method} ${host}${path} -> ${finished ? status : `aborted (status ${status})`}${reason ? ` [${reason}]` : ''}`, {
+        kind: 'http',
+        scheme: isHttps ? 'https' : 'http',
+        method: req.method,
+        host,
+        path,
+        status,
+        finished,
+        headers_sent: res.headersSent,
+        gateway_reason: reason,
+        duration_ms: now - started,
+        request_body_complete: req.complete,
+        content_length: h['content-length'],
+        transfer_encoding: h['transfer-encoding'],
+        socket_request_index: reqIndex,
+        idle_before_ms: idleBefore,
+        peer: this.getClientIp(req),
+        xff: h['x-forwarded-for'],
+        ...(Object.keys(cdn).length ? { cdn } : {}),
+        backend: req._jspBackend,
+        backend_reused_socket: req._jspBackendReused,
+        attempts: req._jspAttempts,
+        worker_id: process.env.WORKER_ID,
+      });
+    });
+  }
+
+  // Per-connection bookkeeping on the HTTP(S) servers: a connection that closes
+  // with a request still in flight or with an error is reported, with its age,
+  // request count and idle time — Node's keepAliveTimeout closing a socket just
+  // as the peer reuses it shows up here.
+  _instrumentServer(server, kind) {
+    if (!sauromon.enabled) return;
+    const ev = kind === 'https' ? 'secureConnection' : 'connection';
+    server.on(ev, (socket) => {
+      const st = socket._jsp = { openedAt: Date.now(), reqs: 0, inflight: 0, lastEndAt: 0, errors: [] };
+      let peer = socket.remoteAddress || '';
+      if (peer.startsWith('::ffff:')) peer = peer.slice(7);
+      this.liveHttpSockets++;
+      socket.on('error', (e) => { if (st.errors.length < 3) st.errors.push(e.code || e.message); });
+      socket.once('close', (hadError) => {
+        this.liveHttpSockets--;
+        const problem = st.inflight > 0 || hadError;
+        if (!problem && !sauromon.sampled()) return;
+        const now = Date.now();
+        sauromon.event(problem ? 'warn' : 'info',
+          st.inflight > 0 ? `${kind} connection from ${peer} closed with ${st.inflight} request(s) in flight` : `${kind} connection from ${peer} closed`, {
+            kind: 'http-socket',
+            scheme: kind,
+            peer,
+            had_error: hadError,
+            errors: st.errors.join(',') || undefined,
+            requests: st.reqs,
+            inflight: st.inflight,
+            age_ms: now - st.openedAt,
+            idle_ms: st.lastEndAt ? now - st.lastEndAt : null,
+            bytes_read: socket.bytesRead,
+            bytes_written: socket.bytesWritten,
+            keep_alive_timeout_ms: server.keepAliveTimeout,
+            worker_id: process.env.WORKER_ID,
+          });
+      });
+    });
+    // Having a listener replaces Node's default handling, so reproduce it
+    // exactly (same status choice, only before any response bytes).
+    server.on('clientError', (err, socket) => {
+      const st = socket._jsp;
+      sauromon.event('warn', `${kind} client error: ${err.code || err.message}`, {
+        kind: 'http-client-error',
+        scheme: kind,
+        error: err.message,
+        error_code: err.code,
+        requests: st ? st.reqs : undefined,
+        inflight: st ? st.inflight : undefined,
+        idle_ms: st && st.lastEndAt ? Date.now() - st.lastEndAt : undefined,
+        bytes_read: socket.bytesRead,
+        worker_id: process.env.WORKER_ID,
+      });
+      if (socket.writable && socket.bytesWritten === 0) {
+        const code = err.code === 'HPE_HEADER_OVERFLOW' ? '431 Request Header Fields Too Large'
+          : err.code === 'HPE_CHUNK_EXTENSIONS_OVERFLOW' ? '413 Payload Too Large'
+          : err.code === 'ERR_HTTP_REQUEST_TIMEOUT' ? '408 Request Timeout'
+          : '400 Bad Request';
+        socket.write(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`);
+      }
+      socket.destroy(err);
+    });
+  }
+
+  _announceStart() {
+    if (!sauromon.enabled || this._announced) return;
+    this._announced = true;
+    const pkg = require('../package.json');
+    const env = {};
+    for (const [k, v] of Object.entries(process.env)) if (/^BUNNYNET_/.test(k)) env[k] = v;
+    sauromon.event('info', `jsproxy ${pkg.version} started (worker ${process.env.WORKER_ID || '?'})`, {
+      kind: 'lifecycle',
+      version: pkg.version,
+      node: process.version,
+      pid: process.pid,
+      worker_id: process.env.WORKER_ID,
+      http: !!this.httpServer,
+      https: !!this.httpsServer,
+      keep_alive_timeout_ms: (this.httpsServer || this.httpServer || {}).keepAliveTimeout,
+      headers_timeout_ms: (this.httpsServer || this.httpServer || {}).headersTimeout,
+      tcp_listeners: [...this.tcpServers.keys()].join(','),
+      os_uptime_s: Math.round(require('os').uptime()),
+      ...env,
+    });
+    this._heartbeat = sauromon.startHeartbeat(() => ({
+      worker_id: process.env.WORKER_ID,
+      live_http_sockets: this.liveHttpSockets,
+      live_tcp_sessions: this.liveTcpSessions,
+    }));
+  }
+
   setupProxyErrorHandling() {
     this.proxy.on('proxyReq', (proxyReq, req, res, options) => {
       this._closeUpstreamWithClient(proxyReq, res);
+      this._tagUpstream(proxyReq, req);
       const originalHost = req.headers.host;
       if (originalHost) {
         proxyReq.setHeader('X-Forwarded-Host', originalHost);
@@ -302,6 +469,7 @@ class ProxyServer {
       this.httpServer.on('upgrade', (req, socket, head) => {
         this.handleWebSocket(req, socket, head, false);
       });
+      this._instrumentServer(this.httpServer, 'http');
 
       await new Promise((resolve) => {
         this.httpServer.listen(httpPort, httpHost, () => {
@@ -335,6 +503,7 @@ class ProxyServer {
         this.httpsServer.on('upgrade', (req, socket, head) => {
           this.handleWebSocket(req, socket, head, true);
         });
+        this._instrumentServer(this.httpsServer, 'https');
 
         this.httpsServer.on('tlsClientError', (err, tlsSocket) => {
           // ECONNRESET / "socket hang up" = client disconnected mid-handshake — perfectly normal.
@@ -383,6 +552,7 @@ class ProxyServer {
       this.httpsEnabled ? httpsPort : NaN,
       httpHost);
     await this.startUdpListeners(httpHost);
+    this._announceStart();
   }
 
   // ── Raw TCP proxy ─────────────────────────────────────────────────────────
@@ -473,6 +643,7 @@ class ProxyServer {
     const idleTimeoutMs = parseInt(process.env.TCP_IDLE_TIMEOUT_MS || '0', 10);
 
     const ordered = this.rankedTargets(route.id, targets);
+    const tstat = sauromon.enabled ? { t0: Date.now(), peer: clientIp, failed: [] } : null;
 
     // Try ranked targets until one connects. Failover here is always safe: no
     // client bytes have been forwarded yet (the client socket is paused), so
@@ -481,6 +652,12 @@ class ProxyServer {
       if (clientSocket.destroyed) return;
       if (idx >= ordered.length) {
         this.logger.warn(`TCP: all backends down for route ${route.id} (port ${route.listen_port})`);
+        if (tstat) {
+          sauromon.event('error', `tcp :${route.listen_port} ${clientIp}: all backends down`, {
+            kind: 'tcp', listen_port: route.listen_port, route_id: route.id, peer: clientIp,
+            failed: tstat.failed.join(','), duration_ms: Date.now() - tstat.t0, worker_id: process.env.WORKER_ID,
+          });
+        }
         clientSocket.destroy();
         return;
       }
@@ -488,9 +665,10 @@ class ProxyServer {
       const upstream = new net.Socket();
       let settled = false;
 
-      const fail = () => {
+      const fail = (err) => {
         if (settled) return;
         settled = true;
+        if (tstat) tstat.failed.push(`${target.key}=${err ? (err.code || err.message) : 'connect-timeout'}`);
         upstream.destroy();
         this.penalizePort(route.id, target.key);
         // Probed targets are revived (and penalized) by their periodic protocol
@@ -531,6 +709,7 @@ class ProxyServer {
         upstream.on('error', teardown);
         clientSocket.on('close', teardown);
         upstream.on('close', teardown);
+        if (tstat) this._trackTcpSession(route, target, clientSocket, upstream, tstat);
         clientSocket.pipe(upstream);
         upstream.pipe(clientSocket);
         clientSocket.resume();
@@ -542,6 +721,79 @@ class ProxyServer {
     };
 
     tryNext(0);
+  }
+
+  // SauroMON: one event per raw TCP session that ended abnormally — an error on
+  // either side, bytes still queued for a peer that teardown then destroyed
+  // (lost_bytes), or the "keep-alive race" shape: the client sent bytes after
+  // the last bytes it received and the upstream then closed without answering.
+  // Healthy sessions are only shipped at the SAUROMON_SAMPLE rate.
+  _trackTcpSession(route, target, clientSocket, upstream, tstat) {
+    const t0 = tstat.t0;
+    const connectedAt = Date.now();
+    let lastClientData = 0;
+    let lastUpstreamData = 0;
+    this.liveTcpSessions++;
+    clientSocket.on('data', () => { lastClientData = Date.now(); });
+    upstream.on('data', () => { lastUpstreamData = Date.now(); });
+    clientSocket.once('end', () => { tstat.clientFin = Date.now() - t0; });
+    upstream.once('end', () => { tstat.upstreamFin = Date.now() - t0; });
+    // Prepended so they run BEFORE teardown destroys the peer (and with it
+    // whatever the peer still had queued).
+    const first = (side, other) => (e) => {
+      if (e instanceof Error) tstat[`${side}Err`] = tstat[`${side}Err`] || e.code || e.message;
+      if (tstat.closer) return;
+      tstat.closer = side;
+      tstat.lost = other.writableLength || 0;
+      tstat.lastClient = lastClientData;
+      tstat.lastUpstream = lastUpstreamData;
+    };
+    clientSocket.prependListener('error', first('client', upstream));
+    upstream.prependListener('error', first('upstream', clientSocket));
+    clientSocket.prependOnceListener('close', first('client', upstream));
+    upstream.prependOnceListener('close', first('upstream', clientSocket));
+
+    let closed = 0;
+    const done = () => {
+      if (++closed < 2) return;
+      this.liveTcpSessions--;
+      const race = tstat.closer === 'upstream' && tstat.lastClient > 0 && tstat.lastClient > tstat.lastUpstream;
+      const problem = !!(tstat.clientErr || tstat.upstreamErr || tstat.lost > 0 || race);
+      if (!problem && !sauromon.sampled()) return;
+      const now = Date.now();
+      const tags = [];
+      if (tstat.lost > 0) tags.push(`${tstat.lost} bytes lost`);
+      if (race) tags.push('client sent after last response, then upstream closed');
+      if (tstat.clientErr) tags.push(`client ${tstat.clientErr}`);
+      if (tstat.upstreamErr) tags.push(`upstream ${tstat.upstreamErr}`);
+      sauromon.event(tstat.lost > 0 || race ? 'error' : (problem ? 'warn' : 'info'),
+        `tcp :${route.listen_port} ${tstat.peer} -> ${target.hostname}:${target.port} closed by ${tstat.closer}${tags.length ? ` (${tags.join('; ')})` : ''}`, {
+          kind: 'tcp',
+          listen_port: route.listen_port,
+          route_id: route.id,
+          peer: tstat.peer,
+          backend: `${target.hostname}:${target.port}`,
+          failed_before: tstat.failed.join(',') || undefined,
+          connect_ms: connectedAt - t0,
+          duration_ms: now - t0,
+          closer: tstat.closer,
+          lost_bytes: tstat.lost,
+          keepalive_race_suspect: race,
+          client_err: tstat.clientErr,
+          upstream_err: tstat.upstreamErr,
+          client_fin_ms: tstat.clientFin,
+          upstream_fin_ms: tstat.upstreamFin,
+          last_client_data_ms: tstat.lastClient ? tstat.lastClient - t0 : null,
+          last_upstream_data_ms: tstat.lastUpstream ? tstat.lastUpstream - t0 : null,
+          client_bytes_in: clientSocket.bytesRead,
+          client_bytes_out: clientSocket.bytesWritten,
+          upstream_bytes_in: upstream.bytesRead,
+          upstream_bytes_out: upstream.bytesWritten,
+          worker_id: process.env.WORKER_ID,
+        });
+    };
+    clientSocket.once('close', done);
+    upstream.once('close', done);
   }
 
   // ── Raw route targets (TCP/UDP) ───────────────────────────────────────────
@@ -829,6 +1081,7 @@ class ProxyServer {
     };
     res.on('finish', endSpan);
     res.on('close',  endSpan);
+    if (sauromon.enabled) this._trackRequest(req, res, isHttps);
 
     return otelContext.with(trace.setSpan(parentCtx, span), () => this._handleRequest(req, res, isHttps));
   }
@@ -1968,6 +2221,7 @@ class ProxyServer {
       );
 
       this._closeUpstreamWithClient(proxyReq, res);
+      this._tagUpstream(proxyReq, req);
       proxyReq.on('socket', (socket) => {
         const onConnect = () => {
           if (res.destroyed) { proxyReq.destroy(); return; }
@@ -2042,6 +2296,7 @@ class ProxyServer {
   // error worse. `reason` is a short machine tag (e.g. 'all-backends-unavailable')
   // passed through for the plugin's diagnostics/stats.
   async _sendGatewayError(req, res, statusCode, fallback, reason) {
+    if (req && !req._jspGatewayReason) req._jspGatewayReason = reason || `gateway-${statusCode}`;
     // Defensive: some error paths (WS upgrades) carry a raw socket instead of a
     // ServerResponse. Never throw out of here — this runs inside error handlers
     // where an exception becomes an unhandled rejection.
@@ -2220,6 +2475,7 @@ class ProxyServer {
       });
 
       currentProxyReq = proxyReq;
+      this._tagUpstream(proxyReq, req);
 
       proxyReq.on('socket', (socket) => {
         if (socket.connecting) {
@@ -2460,6 +2716,7 @@ class ProxyServer {
       });
 
       currentProxyReq = proxyReq;
+      this._tagUpstream(proxyReq, req);
       this._closeUpstreamWithClient(proxyReq, res);
 
       proxyReq.on('socket', (socket) => {
@@ -2834,6 +3091,7 @@ class ProxyServer {
   }
 
   async stop() {
+    if (this._heartbeat) clearInterval(this._heartbeat);
     if (this.httpServer) {
       this.httpServer.closeAllConnections();
       await new Promise((resolve) => this.httpServer.close(resolve));

@@ -1,6 +1,7 @@
 'use strict';
 
 const { trace } = require('@opentelemetry/api');
+const sauromon = require('./Sauromon');
 
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 const _configured = LEVELS[process.env.LOG_LEVEL?.toLowerCase()] ?? LEVELS.info;
@@ -68,7 +69,10 @@ class Logger {
   }
 
   _write(level, firstArg, secondArg) {
-    if (LEVELS[level] < _configured) return;
+    // Console and SauroMON have independent thresholds (SAUROMON_LEVEL).
+    const toConsole = LEVELS[level] >= _configured;
+    const toSauromon = sauromon.wants(level);
+    if (!toConsole && !toSauromon) return;
 
     let msg;
     let fields = {};
@@ -102,6 +106,9 @@ class Logger {
         }
       }
     } catch { /* OTEL not initialised yet */ }
+
+    if (toSauromon) sauromon.log(level, msg, { ...this._ctx, ...fields, ...traceCtx });
+    if (!toConsole) return;
 
     const ts   = new Date().toISOString();
     const line = _json
