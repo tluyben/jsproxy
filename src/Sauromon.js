@@ -18,7 +18,8 @@
  *   SAUROMON_INGEST_KEY    slk_… project ingest key — enables shipping
  *   SAUROMON_ENDPOINT      base URL (default https://sauromon.com)
  *   SAUROMON_LEVEL         lowest Logger level shipped: debug|info|warn|error
- *                          (default info; independent of LOG_LEVEL)
+ *                          (default warn; independent of LOG_LEVEL). jsproxy's own
+ *                          events (request/tcp/failover/lifecycle/heartbeat) always ship.
  *   SAUROMON_HOST          host tag (default os.hostname())
  *   SAUROMON_SERVICE       service tag (default jsproxy)
  *   SAUROMON_SAMPLE        0..1 share of HEALTHY requests / TCP sessions that
@@ -36,7 +37,7 @@ const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 const key = (process.env.SAUROMON_INGEST_KEY || '').trim();
 const enabled = key.length > 0;
 const endpoint = (process.env.SAUROMON_ENDPOINT || 'https://sauromon.com').trim().replace(/\/+$/, '');
-const minLevel = LEVELS[(process.env.SAUROMON_LEVEL || 'info').toLowerCase()] ?? LEVELS.info;
+const minLevel = LEVELS[(process.env.SAUROMON_LEVEL || 'warn').toLowerCase()] ?? LEVELS.warn;
 const hostTag = process.env.SAUROMON_HOST || os.hostname();
 const service = process.env.SAUROMON_SERVICE || 'jsproxy';
 const sampleRate = Math.min(1, Math.max(0, parseFloat(process.env.SAUROMON_SAMPLE || '0') || 0));

@@ -115,6 +115,53 @@ class ProxyServer {
   // the inbound socket (which request on the socket, how long it sat idle
   // before this one) and the backend hop, which is what separates a keep-alive
   // race from a backend failure.
+  // Short machine tag for an upstream error: the code, or a slug of the message
+  // ('Connect timeout' → 'connect-timeout').
+  _errTag(err) {
+    if (!err) return 'error';
+    if (err.code) return err.code;
+    return String(err.message || 'error').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'error';
+  }
+
+  // SauroMON: failovers are normal (blue/green idle port, a restarting backend),
+  // so they are not shipped one by one. They are counted per domain + backend +
+  // error and reported as ONE warning per window — a backend that keeps
+  // refusing, or keeps timing out on connect (each costing the full connect
+  // timeout before the next backend is tried), stands out without flooding.
+  _noteFailover(domain, backend, err) {
+    if (!sauromon.enabled) return;
+    const tag = this._errTag(err);
+    const key = `${domain}|${backend}|${tag}`;
+    const f = this._failovers || (this._failovers = new Map());
+    const cur = f.get(key);
+    if (cur) cur.count++;
+    else f.set(key, { domain, backend, tag, count: 1 });
+    if (!this._failoverTimer) {
+      const windowMs = parseInt(process.env.SAUROMON_FAILOVER_WINDOW_MS || '300000', 10);
+      this._failoverTimer = setInterval(() => this._flushFailovers(windowMs), windowMs);
+      if (this._failoverTimer.unref) this._failoverTimer.unref();
+    }
+  }
+
+  _flushFailovers(windowMs) {
+    const f = this._failovers;
+    if (!f || f.size === 0) return;
+    this._failovers = new Map();
+    const connectTimeoutMs = parseInt(process.env.HA_CONNECT_TIMEOUT_MS || '3000', 10);
+    const mins = Math.round(windowMs / 60000) || 1;
+    for (const { domain, backend, tag, count } of f.values()) {
+      const slow = tag === 'connect-timeout' || tag === 'ECONNTIMEOUT';
+      sauromon.event('warn',
+        `failover: ${domain} → ${backend} ${tag} ×${count} in ${mins} min` +
+        (slow ? ` (≈${Math.round(count * connectTimeoutMs / 1000)} s of connect timeouts added)` : ''), {
+          kind: 'failover', domain, backend, error: tag, count,
+          window_s: Math.round(windowMs / 1000),
+          added_latency_ms: slow ? count * connectTimeoutMs : undefined,
+          worker_id: process.env.WORKER_ID,
+        });
+    }
+  }
+
   _trackRequest(req, res, isHttps) {
     const started = Date.now();
     const sock = req.socket;
@@ -1727,7 +1774,8 @@ class ProxyServer {
       if (alive) return target;
       this.penalizePort(mapping.id, target.key);
       this.startBackgroundCheckTarget(mapping, target);
-      this.logger.warn('HA probe: backend down, trying next', {
+      this._noteFailover(mapping.domain, `${target.hostname}:${target.port}`, { code: 'probe-down' });
+      this.logger.info(`HA failover: ${mapping.domain} ${target.hostname}:${target.port} probe-down — trying next`, {
         mapping_id: mapping.id, backend: `${target.hostname}:${target.port}`,
       });
     }
@@ -1963,7 +2011,8 @@ class ProxyServer {
         // connect-phase failure (any method) OR post-connect on an idempotent
         // request: penalize, probe in the background, and fail over to the next
         // ranked backend.
-        this.logger.warn('HA backend failed, trying next', {
+        this._noteFailover(mapping.domain, where, err);
+        this.logger.info(`HA failover: ${mapping.domain} ${where} ${this._errTag(err)} (${err.phase || '?'}) — trying next`, {
           domain:           mapping.domain,
           backend:          where,
           uri,
@@ -2254,7 +2303,8 @@ class ProxyServer {
           // Connect-phase failure: nothing sent yet → penalize and fail over.
           this.penalizePort(mapping.id, target.key);
           this.startBackgroundCheckTarget(mapping, target);
-          this.logger.warn('plugin stream connect failed, trying next backend', {
+          this._noteFailover(domain, `${target.hostname}:${port}`, err);
+          this.logger.info(`HA failover: ${domain} ${target.hostname}:${port} ${this._errTag(err)} (plugin stream connect) — trying next`, {
             domain, backend: `${target.hostname}:${port}`, url: req.url,
             error: err.message, error_code: err.code,
           });
@@ -2524,7 +2574,8 @@ class ProxyServer {
           this._sendGatewayError(req, res, 504, 'Gateway Timeout', 'post-connect-timeout');
           return;
         }
-        this.logger.warn('HA backend failed, trying next', {
+        this._noteFailover(mapping.domain, where, err);
+        this.logger.info(`HA failover: ${mapping.domain} ${where} ${this._errTag(err)} (${phase}) — trying next`, {
           domain: mapping.domain, backend: where, uri, method, phase,
           error: err.message, error_code: err.code, address: err.address,
         });
@@ -2752,7 +2803,8 @@ class ProxyServer {
           // Connect-phase failure: no body sent yet → penalize and fail over.
           this.penalizePort(mapping.id, target.key);
           this.startBackgroundCheckTarget(mapping, target);
-          this.logger.warn('HA stream connect failed, trying next backend', {
+          this._noteFailover(mapping.domain, where, err);
+          this.logger.info(`HA failover: ${mapping.domain} ${where} ${this._errTag(err)} (stream connect) — trying next`, {
             domain: mapping.domain, backend: where, url: req.url, error: err.message, error_code: err.code,
           });
           attempt(idx + 1);
@@ -3092,6 +3144,7 @@ class ProxyServer {
 
   async stop() {
     if (this._heartbeat) clearInterval(this._heartbeat);
+    if (this._failoverTimer) clearInterval(this._failoverTimer);
     if (this.httpServer) {
       this.httpServer.closeAllConnections();
       await new Promise((resolve) => this.httpServer.close(resolve));

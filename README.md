@@ -1234,12 +1234,13 @@ What is shipped:
 
 | `fields.kind` | when | key fields |
 |---|---|---|
-| (Logger lines) | every log line ≥ `SAUROMON_LEVEL`, independent of `LOG_LEVEL` | the line's own fields |
+| (Logger lines) | every log line ≥ `SAUROMON_LEVEL` (default `warn`), independent of `LOG_LEVEL` | the line's own fields |
 | `lifecycle` | once per worker at start | `version`, `keep_alive_timeout_ms`, `tcp_listeners`, `BUNNYNET_*` env |
 | `heartbeat` | every `SAUROMON_HEARTBEAT_MS` | `live_http_sockets`, `live_tcp_sessions`, `shipped`/`dropped`/`capped` |
 | `http` | a request answered 5xx, hit a jsproxy gateway error, or never finished | `status`, `gateway_reason`, `finished`, `request_body_complete`, `socket_request_index`, `idle_before_ms`, `backend`, `backend_reused_socket`, `cdn-*` headers — never the query string |
 | `http-socket` | an inbound connection closed with a request in flight or with an error | `requests`, `inflight`, `age_ms`, `idle_ms`, `keep_alive_timeout_ms` |
 | `http-client-error` | Node `clientError` (parse error, reset, timeout) | `error_code`, `requests`, `idle_ms` |
+| `failover` | once per `SAUROMON_FAILOVER_WINDOW_MS` per domain + backend + error, when HA failed over (the request itself may have succeeded) | `count`, `error` (e.g. `ECONNREFUSED`, `connect-timeout`), `added_latency_ms` for connect timeouts |
 | `tcp` | a raw TCP session ended with an error, lost bytes, or the keep-alive race shape; or all backends were down | `closer`, `lost_bytes`, `keepalive_race_suspect`, `client_err`/`upstream_err`, byte counts, `*_fin_ms`, `last_*_data_ms` |
 
 `lost_bytes` = bytes still queued in userland for the peer when the other side
@@ -1250,12 +1251,13 @@ the signature of a pooled connection reused just as the far end timed it out.
 ```bash
 SAUROMON_INGEST_KEY=slk_...            # enables shipping
 SAUROMON_ENDPOINT=https://sauromon.com # default
-SAUROMON_LEVEL=info                    # lowest Logger level shipped
+SAUROMON_LEVEL=warn                    # lowest Logger level shipped
 SAUROMON_HOST=$(hostname)              # host tag
 SAUROMON_SERVICE=jsproxy               # service tag
 SAUROMON_SAMPLE=0                      # 0..1 share of HEALTHY requests/sessions also shipped
 SAUROMON_MAX_PER_MIN=1200              # per-process event cap (excess counted as `capped`)
 SAUROMON_HEARTBEAT_MS=60000            # 0 = off
+SAUROMON_FAILOVER_WINDOW_MS=300000     # failover summary window (per worker)
 ```
 
 Shipping never affects proxying: bounded queue (oldest dropped), per-process

@@ -4,6 +4,7 @@ process.env.SAUROMON_INGEST_KEY = 'slk_test_key';
 process.env.SAUROMON_ENDPOINT = 'http://127.0.0.1:9651';
 process.env.SAUROMON_HEARTBEAT_MS = '0';
 process.env.SAUROMON_HOST = 'test-host';
+process.env.SAUROMON_FAILOVER_WINDOW_MS = '300';
 
 const http = require('http');
 const net = require('net');
@@ -117,6 +118,37 @@ describe('SauroMON shipping', () => {
     expect(ev.fields.status).toBe(status);
     expect(ev.fields.path).toBe('/x');            // query string never shipped
     expect(ev.fields.socket_request_index).toBe(1);
+  }, 15000);
+
+  test('aggregates failovers into one warning per domain + backend + error', async () => {
+    const backend = http.createServer((q, r) => r.end('ok'));
+    await new Promise((r) => backend.listen(9671, '127.0.0.1', r));
+    try {
+      // 9670 is dead: every request fails over from it to 9671 (it may be
+      // ranked first or second; penalized after the first failure).
+      await proxy.db.addMapping('fo.test', '', '9670,9671', '');
+      for (let i = 0; i < 4; i++) {
+        proxy.portScores.clear();                 // keep the dead port ranked first
+        const status = await new Promise((resolve) => {
+          http.get({ port: PROXY_PORT, host: '127.0.0.1', path: '/', headers: { host: 'fo.test' } }, (res) => {
+            res.resume(); res.on('end', () => resolve(res.statusCode));
+          }).on('error', () => resolve(0));
+        });
+        expect(status).toBe(200);
+      }
+      await waitFor(() => received.some((l) => l.fields.kind === 'failover' && l.fields.domain === 'fo.test'));
+      const evs = received.filter((l) => l.fields.kind === 'failover' && l.fields.domain === 'fo.test');
+      expect(evs).toHaveLength(1);
+      expect(evs[0].level).toBe('warn');
+      expect(evs[0].fields.backend).toMatch(/:9670$/);
+      expect(evs[0].fields.error).toBe('ECONNREFUSED');
+      expect(evs[0].fields.count).toBeGreaterThanOrEqual(1);
+      expect(evs[0].message).toMatch(/^failover: fo\.test → .*:9670 ECONNREFUSED ×\d+ in 1 min$/);
+      // the per-request failover lines are info → below the default SAUROMON_LEVEL
+      expect(received.some((l) => /^HA failover:/.test(l.message))).toBe(false);
+    } finally {
+      await new Promise((r) => backend.close(r));
+    }
   }, 15000);
 
   test('flags the keep-alive race shape on a raw TCP session', async () => {
