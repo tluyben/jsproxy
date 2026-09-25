@@ -115,6 +115,19 @@ class ProxyServer {
   // the inbound socket (which request on the socket, how long it sat idle
   // before this one) and the backend hop, which is what separates a keep-alive
   // race from a backend failure.
+  // Node (>= 18) gives every http(s).Server requestTimeout = 300000: the WHOLE
+  // request, body included, must arrive within 5 minutes or Node answers 408 and
+  // drops the connection (checked every 30 s, so it fires at 300-330 s). For a
+  // proxy that kills every upload slower than ~5 min — e.g. 368 MB at 1.1 MB/s
+  // through Bunny died at 330 s with an edge 502. jsproxy already guards streams
+  // with its own idle watchdog (no bytes moving), so the total-duration cap is
+  // off by default. headersTimeout (60 s) still bounds slow header delivery.
+  //   REQUEST_TIMEOUT_MS  total request deadline, 0 = none (default 0)
+  _applyServerTimeouts(server) {
+    const ms = parseInt(process.env.REQUEST_TIMEOUT_MS || '0', 10);
+    server.requestTimeout = Number.isFinite(ms) && ms > 0 ? ms : 0;
+  }
+
   // Short machine tag for an upstream error: the code, or a slug of the message
   // ('Connect timeout' → 'connect-timeout').
   _errTag(err) {
@@ -516,6 +529,7 @@ class ProxyServer {
       this.httpServer.on('upgrade', (req, socket, head) => {
         this.handleWebSocket(req, socket, head, false);
       });
+      this._applyServerTimeouts(this.httpServer);
       this._instrumentServer(this.httpServer, 'http');
 
       await new Promise((resolve) => {
@@ -550,6 +564,7 @@ class ProxyServer {
         this.httpsServer.on('upgrade', (req, socket, head) => {
           this.handleWebSocket(req, socket, head, true);
         });
+        this._applyServerTimeouts(this.httpsServer);
         this._instrumentServer(this.httpsServer, 'https');
 
         this.httpsServer.on('tlsClientError', (err, tlsSocket) => {

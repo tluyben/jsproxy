@@ -1224,6 +1224,18 @@ environment:
   - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318   # optional
 ```
 
+### Request deadline
+
+Node gives every HTTP server `requestTimeout = 300000` (5 min for the *whole*
+request, body included — then a 408 and a dropped connection, checked every
+30 s). jsproxy turns that off: uploads slower than ~5 minutes used to die at
+300–330 s. Streams are still guarded by jsproxy's own idle watchdog and
+`headersTimeout` (60 s) still bounds slow headers.
+
+```bash
+REQUEST_TIMEOUT_MS=0     # total request deadline in ms, 0 = none (default)
+```
+
 ### SauroMON (optional)
 
 Set `SAUROMON_INGEST_KEY` (a `slk_…` project ingest key) and jsproxy ships its

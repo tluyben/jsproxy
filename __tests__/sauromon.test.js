@@ -75,6 +75,11 @@ describe('SauroMON shipping', () => {
     expect(sauromon.enabled).toBe(true);
   });
 
+  test('lifts Node\'s 5-minute total request deadline (slow uploads)', () => {
+    expect(proxy.httpServer.requestTimeout).toBe(0);
+    expect(proxy.httpServer.headersTimeout).toBeGreaterThan(0);
+  });
+
   test('announces the process start', async () => {
     await waitFor(() => received.some((l) => l.fields.kind === 'lifecycle'));
     const start = received.find((l) => l.fields.kind === 'lifecycle');
