@@ -684,6 +684,19 @@ class ProxyServer {
     // Don't lose any bytes the client sends before the upstream is connected.
     clientSocket.pause();
 
+    // Handle client errors from the very first moment. Until the upstream
+    // connects nothing else listens on this socket, and a client that resets
+    // while we are still dialing the backend (ECONNRESET) was an UNHANDLED
+    // 'error' — an uncaught exception that killed the worker and with it every
+    // connection it was relaying (the hetzner-1 host jsproxy crash-restarted
+    // several times a day on exactly this, cutting uploads mid-stream).
+    let pendingUpstream = null;
+    const onEarlyClientError = () => {
+      clientSocket.destroy();
+      if (pendingUpstream) pendingUpstream.destroy();
+    };
+    clientSocket.on('error', onEarlyClientError);
+
     let clientIp = clientSocket.remoteAddress || '';
     if (clientIp.startsWith('::ffff:')) clientIp = clientIp.slice(7);
 
@@ -725,11 +738,14 @@ class ProxyServer {
       }
       const target = ordered[idx];
       const upstream = new net.Socket();
+      pendingUpstream = upstream;
       let settled = false;
 
       const fail = (err) => {
         if (settled) return;
         settled = true;
+        // The client is already gone: not the backend's fault, nothing to retry.
+        if (clientSocket.destroyed) { upstream.destroy(); return; }
         if (tstat) tstat.failed.push(`${target.key}=${err ? (err.code || err.message) : 'connect-timeout'}`);
         upstream.destroy();
         this.penalizePort(route.id, target.key);
@@ -749,6 +765,8 @@ class ProxyServer {
         // can ever arrive to close it.
         if (settled || clientSocket.destroyed) { upstream.destroy(); return; }
         settled = true;
+        pendingUpstream = null;
+        clientSocket.removeListener('error', onEarlyClientError);
         upstream.setTimeout(0);              // clear the connect timeout
         upstream.removeListener('error', fail);
         this.boostPort(route.id, target.key);
