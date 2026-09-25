@@ -32,6 +32,7 @@ describe('SauroMON shipping', () => {
   let ingest;
   let received = [];
   let auth = [];
+  let failNext = 0;
   let proxy;
   let testDataDir;
 
@@ -40,6 +41,7 @@ describe('SauroMON shipping', () => {
       let body = '';
       req.on('data', (d) => { body += d; });
       req.on('end', () => {
+        if (failNext > 0) { failNext--; res.writeHead(503); return res.end(); }
         auth.push(req.headers.authorization);
         received.push(...JSON.parse(body).logs);
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -87,6 +89,17 @@ describe('SauroMON shipping', () => {
     const line = received.find((l) => l.message === 'tee check');
     expect(line.level).toBe('warn');
     expect(line.fields.answer).toBe(42);
+  });
+
+  test('drain() ships queued lines through a failed send and its backoff', async () => {
+    failNext = 1;
+    sauromon.event('error', 'first line', { kind: 'drain-test' });
+    await sauromon.flush();                       // 503 → requeued, backoff armed
+    expect(received.some((l) => l.message === 'first line')).toBe(false);
+    sauromon.event('error', 'last words', { kind: 'drain-test' });
+    await sauromon.drain(1500);
+    expect(received.filter((l) => l.fields.kind === 'drain-test').map((l) => l.message))
+      .toEqual(['first line', 'last words']);
   });
 
   test('reports a gateway error with its reason', async () => {

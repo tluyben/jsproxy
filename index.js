@@ -4,6 +4,15 @@ require('dotenv').config({ quiet: true });
 require('./src/Telemetry');
 
 const { createLogger } = require('./src/Logger');
+const sauromon = require('./src/Sauromon');
+
+// Exit a crashed worker — after giving SauroMON (when enabled) up to 1.5 s to
+// ship the line that says WHY, which an immediate exit would drop from its queue.
+function exitWorker() {
+  if (!sauromon.enabled) process.exit(1);
+  const t = setTimeout(() => process.exit(1), 2000);
+  sauromon.drain(1500).finally(() => { clearTimeout(t); process.exit(1); });
+}
 const cluster = require('cluster');
 const numCPUs = require('os').cpus().length;
 
@@ -64,20 +73,20 @@ if (cluster.isMaster) {
       wLogger.info('worker ready');
     } catch (error) {
       wLogger.error('worker failed to start', { error: error.message, stack: error.stack });
-      process.exit(1);
+      exitWorker();
     }
   }
 
   process.on('uncaughtException', (error) => {
     logger.error('uncaught exception in worker', { error: error.message, stack: error.stack });
-    process.exit(1);
+    exitWorker();
   });
 
   process.on('unhandledRejection', (reason) => {
     const msg = reason instanceof Error ? reason.message : String(reason);
     const stack = reason instanceof Error ? reason.stack : undefined;
     logger.error('unhandled rejection in worker', { error: msg, stack });
-    process.exit(1);
+    exitWorker();
   });
 
   startWorker();

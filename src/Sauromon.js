@@ -159,6 +159,22 @@ async function flush() {
   }
 }
 
+/**
+ * Best effort before an exit: ship everything queued within `ms`, ignoring the
+ * backoff (a crashing worker's last lines are the ones worth having).
+ */
+async function drain(ms = 1500) {
+  if (!enabled) return;
+  const until = Date.now() + ms;
+  const pause = (t) => new Promise((r) => setTimeout(r, t));
+  while (queue.length > 0 && Date.now() < until) {
+    if (sending) { await pause(25); continue; }
+    backoffUntil = 0;
+    await flush();
+    if (queue.length > 0) await pause(100);
+  }
+}
+
 /** Should a Logger line at `level` be shipped? */
 function wants(level) {
   return enabled && (LEVELS[level] ?? LEVELS.info) >= minLevel;
@@ -203,4 +219,4 @@ function startHeartbeat(collect) {
   return t;
 }
 
-module.exports = { enabled, wants, log, event, sampled, flush, startHeartbeat, stats };
+module.exports = { enabled, wants, log, event, sampled, flush, drain, startHeartbeat, stats };
