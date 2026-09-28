@@ -926,7 +926,10 @@ class ProxyServer {
         this.logger.warn(`Raw route ${route.id}: backend entry "${entry}" has no port (and no numeric back_port fallback); skipped`);
         return null;
       }
-      return { hostname: url.hostname, port, key: `${url.hostname}:${port}`, probe: probeDef ? scheme : null };
+      // `?backup=1` marks a standby: used only while no primary is healthy (see
+      // rankedTargets). The key stays host:port, so scores are unaffected.
+      const backup = url.searchParams.get('backup') === '1' || url.searchParams.get('backup') === 'true';
+      return { hostname: url.hostname, port, key: `${url.hostname}:${port}`, probe: probeDef ? scheme : null, ...(backup ? { backup: true } : {}) };
     }).filter(Boolean);
   }
 
@@ -1734,8 +1737,19 @@ class ProxyServer {
     this.rrCounters.set(mappingId, i + 1);
     const off = i % n;
     const rotated = [...targets.slice(off), ...targets.slice(0, off)];
+    // Tiers: healthy primaries, then healthy backups (`backup: true`), then the
+    // unhealthy ones. Without backups this is exactly the old score order. A
+    // standby therefore takes traffic only while every primary is down — a raw
+    // edge in front of one origin box can list the others as failover targets
+    // without round-robining live traffic onto boxes that are not meant to serve
+    // it.
+    const tier = (t) => {
+      const healthy = this.getPortScore(mappingId, t.key) > 0;
+      return (healthy ? 0 : 2) + (t.backup ? 1 : 0);
+    };
     return rotated.slice().sort((a, b) =>
-      this.getPortScore(mappingId, b.key) - this.getPortScore(mappingId, a.key)
+      (tier(a) - tier(b)) ||
+      (this.getPortScore(mappingId, b.key) - this.getPortScore(mappingId, a.key))
     );
   }
 

@@ -159,6 +159,57 @@ describe('Raw TCP proxying', () => {
     }
   }, 15000);
 
+  test('backup targets take traffic only while every primary is down', async () => {
+    const primary = makeEchoBackend('primary');
+    const standby = makeEchoBackend('standby');
+    await listenOn(primary, 9371);
+    await listenOn(standby, 9372);
+    try {
+      await proxy.db.addTcpRoute(9314, 'tcp://127.0.0.1:9371,tcp://127.0.0.1:9372?backup=1', '');
+      await refreshTcp();
+      proxy.portScores.clear();
+      proxy.rrCounters.clear();
+
+      // Healthy primary: every connection goes there, never round-robined to the standby.
+      for (let i = 0; i < 4; i++) {
+        const res = await tcpSend(9314, 'a');
+        expect(res.data).toBe('primary:a');
+      }
+
+      // Primary dies: the standby answers.
+      await closeServer(primary);
+      const res = await tcpSend(9314, 'b');
+      expect(res.data).toBe('standby:b');
+      const route = (await proxy.db.getTcpRoutes()).find((r) => r.listen_port === 9314);
+      expect(proxy.getPortScore(route.id, '127.0.0.1:9371')).toBe(0);
+
+      // Primary back (its background re-check marks it alive): traffic returns to it.
+      await listenOn(primary, 9371);
+      proxy.portScores.set(proxy._portKey(route.id, '127.0.0.1:9371'), 50);
+      const back = await tcpSend(9314, 'c');
+      expect(back.data).toBe('primary:c');
+    } finally {
+      await closeServer(primary).catch(() => {});
+      await closeServer(standby);
+    }
+  }, 20000);
+
+  test('rankedTargets: tiers are healthy primaries, healthy backups, then the dead', () => {
+    const t = (key, backup) => ({ hostname: 'h', port: 1, key, ...(backup ? { backup: true } : {}) });
+    proxy.portScores.clear();
+    proxy.rrCounters.clear();
+    proxy.portScores.set(proxy._portKey('m', 'p2'), 0);
+    const order = proxy.rankedTargets('m', [t('b1', true), t('p1'), t('p2'), t('b2', true)]).map((x) => x.key);
+    expect(order[0]).toBe('p1');
+    expect(order.slice(1, 3).sort()).toEqual(['b1', 'b2']);
+    expect(order[3]).toBe('p2');
+  });
+
+  test('_rawTargets: ?backup=1 marks a standby and keeps the host:port score key', () => {
+    const targets = proxy._rawTargets({ id: 'r', backend: 'tcp://10.0.0.1:25,tcp://10.0.0.2:25?backup=1', back_port: '' });
+    expect(targets.map((x) => [x.key, !!x.backup])).toEqual([['10.0.0.1:25', false], ['10.0.0.2:25', true]]);
+  });
+
   test('all backends down: proxy closes the client connection with no data', async () => {
     await proxy.db.addTcpRoute(9313, '127.0.0.1', '9350,9351'); // neither listening
     await refreshTcp();
