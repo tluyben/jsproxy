@@ -2102,6 +2102,18 @@ class ProxyServer {
       return this._streamWithPlugins(requestId, domain, inPort, mapping, req, res);
     }
 
+    // An event stream (SSE) never ends, so buffering its response for after()
+    // means the client gets nothing at all until an upstream timeout — a plugin
+    // that only wants to rewrite HTML pages (e.g. an injection on the domain)
+    // would silently break every SSE endpoint behind it. The plugin decided
+    // needsBody from method + URL alone; the Accept header says better. Buffer
+    // the (small, finite) request body so before() still sees it, then stream
+    // the response with a headers-only after().
+    if (this._acceptsEventStream(req)) {
+      const requestBody = await this.bufferBody(req);
+      return this._streamWithPlugins(requestId, domain, inPort, mapping, req, res, { requestBody, keepHost: true });
+    }
+
     // Buffer request body (needed for before() payload and for re-sending to backend)
     const requestBody = await this.bufferBody(req);
 
@@ -2167,9 +2179,15 @@ class ProxyServer {
 
   // Streaming plugin path: run before()/after() with null body, pipe request and
   // response directly. Used when every interested plugin declared needsBody: false.
-  async _streamWithPlugins(requestId, domain, inPort, mapping, req, res) {
+  //
+  // opts.requestBody: the client body, already read (the SSE case in
+  //   _handleWithPlugins) — handed to before() and sent from memory.
+  // opts.keepHost: forward the client Host like the buffered path does, instead
+  //   of this path's historical backend host:port.
+  async _streamWithPlugins(requestId, domain, inPort, mapping, req, res, opts = {}) {
+    const bufferedBody = opts.requestBody ?? null;
     const beforeResult = await this.pluginManager.runBefore(
-      requestId, domain, inPort, req.url, req.method, req.headers, null
+      requestId, domain, inPort, req.url, req.method, req.headers, bufferedBody
     );
 
     if (res.destroyed) return;
@@ -2202,7 +2220,7 @@ class ProxyServer {
     // the original — no buffering required.
     const rewriteReqBody = beforeResult.type === 'REWRITE_REQUEST' && beforeResult.payload != null
       ? beforeResult.payload
-      : null;
+      : bufferedBody;
     if (rewriteReqBody) {
       headers = { ...headers };
       headers['content-length'] = rewriteReqBody.length;
@@ -2252,7 +2270,7 @@ class ProxyServer {
       // Honor a back_host rewrite when set; otherwise keep this path's historical
       // behavior of addressing the backend by its own host:port.
       const attemptHeaders = { ...headers };
-      attemptHeaders['host'] = mapping.back_host || `${target.hostname}:${port}`;
+      attemptHeaders['host'] = mapping.back_host || (opts.keepHost && headers['host']) || `${target.hostname}:${port}`;
 
       const proxyReq = lib.request(
         { hostname: target.hostname, lookup: dnsCache.lookup, port, path: targetPath, method, headers: attemptHeaders,
@@ -2641,6 +2659,10 @@ class ProxyServer {
   //   - SSE / event-streams
   //   - bodies larger than HA_STREAM_THRESHOLD
   //   - chunked bodies with no declared content-length (the streaming-upload case)
+  _acceptsEventStream(req) {
+    return /text\/event-stream/i.test(String(req.headers.accept || ''));
+  }
+
   _isStreamingRequest(req) {
     const cl        = parseInt(req.headers['content-length'] ?? '-1', 10);
     const isSSE     = req.headers.accept?.includes('text/event-stream');
