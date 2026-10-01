@@ -1854,7 +1854,7 @@ class ProxyServer {
 
   // Legacy signature (fixed backend host + port) kept for the plugin/single path.
   // Builds a target from mapping.backend + port and delegates to _tryTarget.
-  _tryPort(mapping, port, uri, method, reqHeaders, body) {
+  _tryPort(mapping, port, uri, method, reqHeaders, body, opts = {}) {
     const backend = mapping.backend || 'http://localhost';
     const backendUrl = new URL(backend.startsWith('http') ? backend : `http://${backend}`);
     const target = {
@@ -1863,7 +1863,7 @@ class ProxyServer {
       isHttps: backendUrl.protocol === 'https:',
       key: String(port),
     };
-    return this._tryTarget(mapping, target, uri, method, reqHeaders, body);
+    return this._tryTarget(mapping, target, uri, method, reqHeaders, body, opts);
   }
 
   // Core single-backend request against one target `{ hostname, port, isHttps, key }`.
@@ -1877,7 +1877,11 @@ class ProxyServer {
   //   - phase === 'response' → connection succeeded, request may already be in
   //     flight on the backend; failing over would risk duplicating non-idempotent
   //     operations and the backend is provably up. Surface to client as-is.
-  _tryTarget(mapping, target, uri, method, reqHeaders, body) {
+  //
+  // opts.openEventStreams: a `text/event-stream` response is resolved as soon as
+  // its headers arrive, with `body: null` and the live response in `stream`
+  // (the caller pipes it). Buffering it would wait for an end that never comes.
+  _tryTarget(mapping, target, uri, method, reqHeaders, body, opts = {}) {
     return new Promise((resolve, reject) => {
       const backendUrl = { hostname: target.hostname };
       const isHttpsBackend = target.isHttps;
@@ -1925,6 +1929,13 @@ class ProxyServer {
         ...(isHttpsBackend ? { rejectUnauthorized: false } : {}),
       }, (proxyRes) => {
         responseStarted = true;
+        if (opts.openEventStreams && /text\/event-stream/i.test(String(proxyRes.headers['content-type'] || ''))) {
+          proxyReq.setTimeout(0);   // the response deadline must not cut a quiet stream
+          return resolve({
+            port, key: target.key, statusCode: proxyRes.statusCode, headers: proxyRes.headers,
+            body: null, stream: proxyRes,
+          });
+        }
         const chunks = [];
         proxyRes.on('data', chunk => chunks.push(chunk));
         proxyRes.on('end', () => resolve({
@@ -1978,10 +1989,10 @@ class ProxyServer {
 
   // Single-port backend request for the plugin path. Returns a result object or
   // a synthetic 502 on error.
-  async _requestSingle(mapping, uri, method, headers, body) {
+  async _requestSingle(mapping, uri, method, headers, body, opts = {}) {
     const port = parseInt(mapping.back_port, 10);
     try {
-      return await this._tryPort(mapping, port, uri, method, headers, body);
+      return await this._tryPort(mapping, port, uri, method, headers, body, opts);
     } catch (err) {
       this.logger.error('backend request failed', {
         domain:     mapping.domain,
@@ -2003,7 +2014,7 @@ class ProxyServer {
   // best-score-first; short-circuits on the first that actually responds (any
   // status code). Connection-level failures (no response at all) penalize that
   // target and move to the next one.
-  async _requestHA(mapping, uri, method, headers, body, span = null) {
+  async _requestHA(mapping, uri, method, headers, body, span = null, opts = {}) {
     const ordered = this.rankedTargets(mapping.id, this._backendTargets(mapping));
 
     // Idempotent (safe) methods can be retried on another backend without risk of
@@ -2015,7 +2026,7 @@ class ProxyServer {
     for (const target of ordered) {
       const where = `${target.hostname}:${target.port}`;
       try {
-        const result = await this._tryTarget(mapping, target, uri, method, headers, body);
+        const result = await this._tryTarget(mapping, target, uri, method, headers, body, opts);
         this.boostPort(mapping.id, target.key);
         return result;
       } catch (err) {
@@ -2145,8 +2156,8 @@ class ProxyServer {
 
     // ── backend request ──────────────────────────────────────────────────────
     const backendResult = this._isHA(mapping)
-      ? await this._requestHA(mapping, uri, method, headers, body, req._span)
-      : await this._requestSingle(mapping, uri, method, headers, body);
+      ? await this._requestHA(mapping, uri, method, headers, body, req._span, { openEventStreams: true })
+      : await this._requestSingle(mapping, uri, method, headers, body, { openEventStreams: true });
 
     // ── after() ──────────────────────────────────────────────────────────────
     // Skipped when before() returned IGNORE (cleanup already done)
@@ -2159,6 +2170,7 @@ class ProxyServer {
     );
 
     if (afterResult.type === 'CANCEL') {
+      backendResult.stream?.destroy();
       res.writeHead(afterResult.statusCode, { 'content-type': 'text/plain' });
       return res.end();
     }
@@ -2166,6 +2178,11 @@ class ProxyServer {
     if (afterResult.type === 'REWRITE_RESPONSE') {
       const status  = afterResult.statusCode ?? backendResult.statusCode;
       const hdrs    = afterResult.headers    ?? backendResult.headers;
+      if (backendResult.stream && afterResult.payload == null) {
+        // Headers-only rewrite of an open event stream: keep streaming it.
+        return this.sendHAResponse(req, res, { ...backendResult, statusCode: status, headers: hdrs });
+      }
+      backendResult.stream?.destroy();
       const resBody = afterResult.payload != null
         ? afterResult.payload
         : backendResult.body;
@@ -2399,6 +2416,13 @@ class ProxyServer {
       if (!skip.has(k.toLowerCase())) headers[k] = v;
     }
     res.writeHead(result.statusCode, headers);
+    if (result.stream) {
+      // An open event stream (_tryTarget opts.openEventStreams): relay it live.
+      res.flushHeaders();
+      res.once('close', () => result.stream.destroy());
+      result.stream.pipe(res);
+      return;
+    }
     res.end(result.body);
   }
 

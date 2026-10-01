@@ -26,6 +26,9 @@ function makeSseBackend(seen) {
       seen.push({ host: req.headers.host, body: Buffer.concat(chunks).toString(), url: req.url });
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       res.write('event: hello\ndata: {}\n\n');
+      // A second event after a quiet spell longer than HA_RESPONSE_TIMEOUT_MS below.
+      const t = setTimeout(() => res.write('event: later\ndata: {}\n\n'), 800);
+      res.on('close', () => clearTimeout(t));
     });
   });
 }
@@ -39,21 +42,35 @@ function makePlugin(calls) {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ valid: true, needsBody: true }));
       }
+      const meta = req.headers['x-plugin-meta'] ? JSON.parse(req.headers['x-plugin-meta']) : {};
       calls.push({ hook: req.url, payload: Buffer.concat(chunks).toString() });
+      if (req.url === '/after' && plugin.rewriteHeaders) {
+        // Headers-only rewrite (fluxwall strips cookies this way): the stream must survive it.
+        const headers = { ...meta.headers, 'x-rewritten': '1' };
+        res.writeHead(200, { 'x-plugin-result': 'REWRITE_RESPONSE', 'x-plugin-meta': JSON.stringify({ statusCode: meta.statusCode, headers }), 'content-length': 0 });
+        return res.end();
+      }
       res.writeHead(200, { 'x-plugin-result': 'CONTINUE', 'content-length': 0 });
       res.end();
     });
   });
 }
 
-// Resolve with the first chunk of the response body (or reject on timeout).
-function firstChunk(port, host, { method = 'GET', body = null } = {}) {
+// Resolve with the first `want` chunks of the response body (or reject on timeout).
+function firstChunk(port, host, { method = 'GET', body = null, accept = 'text/event-stream', want = 1 } = {}) {
   return new Promise((resolve, reject) => {
-    const headers = { Host: host, Accept: 'text/event-stream' };
+    const headers = { Host: host };
+    if (accept) headers.Accept = accept;
     if (body) headers['content-length'] = Buffer.byteLength(body);
     const timer = setTimeout(() => { req.destroy(); reject(new Error('no bytes within 3 s')); }, 3000);
     const req = http.request({ hostname: '127.0.0.1', port, method, path: '/stream', headers }, res => {
-      res.once('data', c => { clearTimeout(timer); resolve({ status: res.statusCode, headers: res.headers, chunk: c.toString() }); req.destroy(); });
+      let got = '';
+      let n = 0;
+      res.on('data', c => {
+        got += c.toString();
+        if (++n < want) return;
+        clearTimeout(timer); resolve({ status: res.statusCode, headers: res.headers, chunk: got }); req.destroy();
+      });
     });
     req.on('error', () => {});
     if (body) req.write(body);
@@ -72,6 +89,7 @@ beforeAll(async () => {
   plugin = makePlugin(calls); await listen(plugin, 0);
   process.env.HTTP_PORT = '0';
   process.env.ENABLE_HTTPS = 'false';
+  process.env.HA_RESPONSE_TIMEOUT_MS = '400';
   proxy = new ProxyServer(logger, new PluginManager(logger, `127.0.0.1:${plugin.address().port}`));
   proxy.db.dbPath = path.join(TEST_DIR, 'db.db');
   proxy.certManager.certsDir = path.join(TEST_DIR, 'certs');
@@ -84,6 +102,7 @@ afterAll(async () => {
   await proxy.stop(); await close(plugin); await close(backend);
   delete process.env.HTTP_PORT;
   delete process.env.ENABLE_HTTPS;
+  delete process.env.HA_RESPONSE_TIMEOUT_MS;
   await fs.rm(TEST_DIR, { recursive: true, force: true }).catch(() => {});
 });
 
@@ -102,4 +121,24 @@ test('POST event stream: before() sees the request body and the backend gets it'
   expect(r.chunk).toContain('event: hello');
   expect(seen.at(-1).body).toBe('{"prompt":"hi"}');
   expect(calls[0]).toEqual({ hook: '/before', payload: '{"prompt":"hi"}' });
+}, 10000);
+
+test('no Accept header (plain fetch): the response is still relayed live, past the response timeout', async () => {
+  calls.length = 0;
+  const r = await firstChunk(proxy.httpServer.address().port, 'sse.test', { accept: null, want: 2 });
+  expect(r.status).toBe(200);
+  expect(r.chunk).toContain('event: hello');
+  expect(r.chunk).toContain('event: later');
+  expect(seen.at(-1).host).toBe('sse.test');
+  expect(calls.map(c => c.hook)).toEqual(['/before', '/after']);
+  expect(calls[1].payload).toBe('');                          // after() got headers only
+}, 10000);
+
+test('headers-only after() rewrite keeps the stream open', async () => {
+  plugin.rewriteHeaders = true;
+  try {
+    const r = await firstChunk(proxy.httpServer.address().port, 'sse.test', { accept: null, want: 2 });
+    expect(r.headers['x-rewritten']).toBe('1');
+    expect(r.chunk).toContain('event: later');
+  } finally { plugin.rewriteHeaders = false; }
 }, 10000);
