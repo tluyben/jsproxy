@@ -55,6 +55,9 @@ export default class DatabaseManager {
 
   connectToDatabase() {
     this.db = new Database(this.dbPath, { create: true });
+    // The database can be shared with other processes (in viberun: herd's content.db, also
+    // written by herd and openwrapper): wait for a competing writer instead of failing at once.
+    this.db.exec("PRAGMA busy_timeout=5000;");
     this.logger.info(`Connected to SQLite database: ${this.dbPath}`);
   }
 
