@@ -3,6 +3,15 @@ const path = require('path');
 const fs = require('fs').promises;
 const { v4: uuidv4 } = require('uuid');
 
+// Every worker of a cluster opens the same DB and runs these migrations at the
+// same moment. PRAGMA-then-ALTER is not atomic across processes, so on a fresh
+// DB (e.g. every edge pod boot) several workers see the column missing and all
+// but one ALTER fail with "duplicate column name" — which used to crash the
+// worker. Another worker having added the column is success, not an error.
+function isDuplicateColumn(err) {
+  return /duplicate column name/i.test(String(err && err.message));
+}
+
 class DatabaseManager {
   constructor(logger) {
     this.logger = logger;
@@ -14,8 +23,30 @@ class DatabaseManager {
     await this.ensureDataDirectory();
     await this.connectToDatabase();
     await this.enableWALMode();
-    await this.createMappingsTable();
-    await this.applyMigrations();
+    // Schema setup runs in ONE write transaction: every cluster worker starts at
+    // the same moment on the same file, and "check column, then ALTER" is only
+    // safe if no other worker can slip in between. BEGIN IMMEDIATE takes the
+    // write lock up front (others wait on busyTimeout), so the next worker sees
+    // the finished schema and its checks skip every ALTER.
+    await this.inWriteTransaction(async () => {
+      await this.createMappingsTable();
+      await this.applyMigrations();
+    });
+  }
+
+  run(sql) {
+    return new Promise((resolve, reject) => this.db.run(sql, (err) => (err ? reject(err) : resolve())));
+  }
+
+  async inWriteTransaction(fn) {
+    await this.run('BEGIN IMMEDIATE');
+    try {
+      await fn();
+      await this.run('COMMIT');
+    } catch (err) {
+      await this.run('ROLLBACK').catch(() => {});
+      throw err;
+    }
   }
 
   // Idempotent column migrations, applied on initialize() and again after a hot
@@ -45,6 +76,9 @@ class DatabaseManager {
           this.logger.error('Error connecting to database:', err);
           reject(err);
         } else {
+          // All cluster workers share this file; wait for a writer instead of
+          // failing at once with SQLITE_BUSY (worker crash on every pod boot).
+          this.db.configure('busyTimeout', 10000);
           this.logger.info(`Connected to SQLite database: ${this.dbPath}`);
           resolve();
         }
@@ -53,6 +87,17 @@ class DatabaseManager {
   }
 
   async enableWALMode() {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.enableWALModeOnce();
+      } catch (err) {
+        if (!/SQLITE_BUSY|database is locked/i.test(String(err && err.message)) || attempt >= 50) throw err;
+        await new Promise((r) => setTimeout(r, 50 + Math.random() * 150));
+      }
+    }
+  }
+
+  async enableWALModeOnce() {
     return new Promise((resolve, reject) => {
       this.db.run('PRAGMA journal_mode=WAL;', (err) => {
         if (err) {
@@ -132,7 +177,7 @@ class DatabaseManager {
         if (!hasBackendColumn) {
           const addColumnSQL = "ALTER TABLE mappings ADD COLUMN backend TEXT DEFAULT NULL";
           this.db.run(addColumnSQL, (err) => {
-            if (err) {
+            if (err && !isDuplicateColumn(err)) {
               this.logger.error('Error adding backend column:', err);
               reject(err);
             } else {
@@ -153,7 +198,7 @@ class DatabaseManager {
         if (err) { reject(err); return; }
         if (columns.some(col => col.name === 'allowed_ips')) { resolve(); return; }
         this.db.run('ALTER TABLE mappings ADD COLUMN allowed_ips TEXT DEFAULT NULL', (err2) => {
-          if (err2) { this.logger.error('Error adding allowed_ips column:', err2); reject(err2); }
+          if (err2 && !isDuplicateColumn(err2)) { this.logger.error('Error adding allowed_ips column:', err2); reject(err2); }
           else { this.logger.info('Added allowed_ips column to mappings table'); resolve(); }
         });
       });
@@ -173,7 +218,7 @@ class DatabaseManager {
         let i = 0;
         const next = () => {
           if (i >= toAdd.length) { this.logger.info('Added auth columns to mappings table'); resolve(); return; }
-          this.db.run(toAdd[i++], (err2) => { if (err2) reject(err2); else next(); });
+          this.db.run(toAdd[i++], (err2) => { if (err2 && !isDuplicateColumn(err2)) reject(err2); else next(); });
         };
         next();
       });
@@ -198,7 +243,7 @@ class DatabaseManager {
         let i = 0;
         const next = () => {
           if (i >= toAdd.length) { this.logger.info('Added TCP columns to mappings table'); resolve(); return; }
-          this.db.run(toAdd[i++], (err2) => { if (err2) reject(err2); else next(); });
+          this.db.run(toAdd[i++], (err2) => { if (err2 && !isDuplicateColumn(err2)) reject(err2); else next(); });
         };
         next();
       });
