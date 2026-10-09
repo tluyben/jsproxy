@@ -1193,6 +1193,23 @@ class ProxyServer {
     }
   }
 
+  // Run the preflight header script on a request (plain or WebSocket upgrade).
+  // Returns false when the script declined it (caller answers 403). A thrown
+  // error fails open so a script bug can't blackhole traffic.
+  _applyPreflight(req) {
+    if (!this.preflight) return true;
+    let rewritten;
+    try {
+      rewritten = this.preflight(req.headers);
+    } catch (err) {
+      this.logger.warn(`preflight script error (fail-open): ${err.message}`);
+      rewritten = req.headers;
+    }
+    if (rewritten === null) return false;
+    if (rewritten && typeof rewritten === 'object') req.headers = rewritten;
+    return true;
+  }
+
   async _handleRequest(req, res, isHttps) {
     try {
       // Health check endpoint
@@ -1235,20 +1252,10 @@ class ProxyServer {
       // declines the request; a returned object replaces req.headers. A thrown
       // error fails open (headers left unchanged) so a script bug can't blackhole
       // traffic. ACME/health above are intentionally exempt.
-      if (this.preflight) {
-        let rewritten;
-        try {
-          rewritten = this.preflight(req.headers);
-        } catch (err) {
-          this.logger.warn(`preflight script error (fail-open): ${err.message}`);
-          rewritten = req.headers;
-        }
-        if (rewritten === null) {
-          res.writeHead(403, { 'Content-Type': 'text/plain' });
-          res.end('Forbidden');
-          return;
-        }
-        if (rewritten && typeof rewritten === 'object') req.headers = rewritten;
+      if (!this._applyPreflight(req)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden');
+        return;
       }
 
       // Redirect HTTP to HTTPS if FORCE_HTTPS is enabled. The forwarded scheme
@@ -1494,6 +1501,16 @@ class ProxyServer {
 
   async handleWebSocket(req, socket, head, isHttps) {
     try {
+      // Same preflight as plain requests, BEFORE routing: behind a CDN the
+      // inbound Host is the platform zone and the real site is in a header the
+      // script adopts (fluxwall: cdn-host). Skipping it routed every upgrade to
+      // the platform's own app, which never answers — WebSockets hung forever.
+      if (!this._applyPreflight(req)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nForbidden');
+        socket.destroy();
+        return;
+      }
+
       const host = req.headers.host;
       if (!host) {
         socket.destroy();
