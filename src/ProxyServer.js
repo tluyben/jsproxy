@@ -929,7 +929,9 @@ class ProxyServer {
       // `?backup=1` marks a standby: used only while no primary is healthy (see
       // rankedTargets). The key stays host:port, so scores are unaffected.
       const backup = url.searchParams.get('backup') === '1' || url.searchParams.get('backup') === 'true';
-      return { hostname: url.hostname, port, key: `${url.hostname}:${port}`, probe: probeDef ? scheme : null, ...(backup ? { backup: true } : {}) };
+      // `?host=` names the Host header / SNI an http(s)+check probe sends.
+      const probeHost = url.searchParams.get('host') || null;
+      return { hostname: url.hostname, port, key: `${url.hostname}:${port}`, probe: probeDef ? scheme : null, ...(backup ? { backup: true } : {}), ...(probeHost ? { probeHost } : {}) };
     }).filter(Boolean);
   }
 
@@ -957,7 +959,7 @@ class ProxyServer {
       const key = this._portKey(route.id, target.key);
       const tick = async () => {
         let ok = false;
-        try { ok = await probeFn({ hostname: target.hostname, port: target.port, name, timeoutMs }); }
+        try { ok = await probeFn({ hostname: target.hostname, port: target.port, name: target.probeHost || name, timeoutMs }); }
         catch (_) { ok = false; }
         const prev = this.portScores.get(key) ?? 100;
         if (ok) {

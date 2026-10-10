@@ -2,6 +2,7 @@ const dgram = require('dgram');
 const { lookup } = require('./DnsCache');
 const net = require('net');
 const crypto = require('crypto');
+const tls = require('tls');
 
 // ── Protocol-aware health probes ("hardcoded plugins") ──────────────────────
 //
@@ -95,10 +96,57 @@ function probeDnsTcp({ hostname, port, name, timeoutMs }) {
   });
 }
 
+// HTTP(S) liveness over a raw TCP route: a HEAD request on a fresh connection.
+// Alive = an HTTP status line arrives within timeoutMs, whatever the status (a
+// 404/502 still proves the box's proxy answers). Catches the failure a plain
+// handshake misses: the box accepts the connection but nothing behind it
+// answers (hetzner-1, 2026-10-10 07:56 — disk-stalled box, edge kept routing to
+// it because connect() succeeded). `name` is the Host header / TLS SNI.
+function httpHeadProbe(connect, { name, timeoutMs }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let buf = '';
+    let sock;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { sock && sock.destroy(); } catch (_) {}
+      resolve(ok);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    if (timer.unref) timer.unref();
+    const send = () => sock.write(
+      `HEAD / HTTP/1.1\r\nHost: ${name}\r\nUser-Agent: jsproxy-probe\r\nAccept: */*\r\nConnection: close\r\n\r\n`);
+    try { sock = connect(send); } catch (_) { return done(false); }
+    sock.on('error', () => done(false));
+    sock.on('close', () => done(/^HTTP\/\d(\.\d)? \d{3}/.test(buf)));
+    sock.on('data', (d) => {
+      buf += d.toString('latin1');
+      if (buf.length >= 12) done(/^HTTP\/\d(\.\d)? \d{3}/.test(buf));
+    });
+  });
+}
+
+function probeHttpTcp({ hostname, port, name, timeoutMs }) {
+  return httpHeadProbe((onConnect) => net.connect({ port, host: hostname, lookup }, onConnect), { name, timeoutMs });
+}
+
+function probeHttpsTcp({ hostname, port, name, timeoutMs }) {
+  return httpHeadProbe((onConnect) => tls.connect({
+    port, host: hostname, lookup, servername: name, ALPNProtocols: ['http/1.1'],
+    // Liveness, not identity: the box may serve a cert we can't validate here.
+    rejectUnauthorized: false,
+  }, onConnect), { name, timeoutMs });
+}
+
 // Registry: scheme -> { udp, tcp, defaultPort }. Adding a new protocol probe
 // (e.g. ntp://, syslog://) means adding one entry here — nothing else changes.
 const PROBES = {
   dns: { udp: probeDnsUdp, tcp: probeDnsTcp, defaultPort: 53 },
+  // `+check` keeps these apart from the http/https mapping schemes. TCP only.
+  'http+check': { tcp: probeHttpTcp, defaultPort: 80 },
+  'https+check': { tcp: probeHttpsTcp, defaultPort: 443 },
 };
 
 // Returns the probe definition for a backend URL scheme, or null when the
@@ -107,4 +155,4 @@ function getProbe(scheme) {
   return (scheme && PROBES[String(scheme).toLowerCase()]) || null;
 }
 
-module.exports = { getProbe, buildDnsQuery, isDnsResponse, probeDnsUdp, probeDnsTcp };
+module.exports = { getProbe, buildDnsQuery, isDnsResponse, probeDnsUdp, probeDnsTcp, probeHttpTcp, probeHttpsTcp };
