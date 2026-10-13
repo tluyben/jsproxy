@@ -90,6 +90,12 @@ TRUSTED_PROXIES=private            # Proxies whose X-Forwarded-* headers to trus
                                    #   `loopback` / `private` / `all`.
 DB_PATH=./data/current.db          # Path to SQLite database file
 
+# Per-SNI TLS passthrough on the HTTPS port (see "Per-SNI TLS Passthrough")
+TLS_PASSTHROUGH=false              # Disable the SNI gate entirely (default: enabled)
+TLS_PEEK_TIMEOUT_MS=5000           # Max wait for a complete ClientHello, then close
+TLS_PASSTHROUGH_CACHE_TTL_MS=5000  # Per-worker lookup cache TTL (row changes go live within this)
+TLS_PASSTHROUGH_CACHE_MAX=10000    # Lookup cache entry cap
+
 # Backend DNS cache (every backend connect, HA attempt and health probe)
 DNS_CACHE_TTL_MS=30000             # Reuse a resolved backend address this long
                                    #   (default: 30000; 0 = no cache, plain dns.lookup)
@@ -895,6 +901,71 @@ or two DB replicas).
 > the real client address is still visible. (PROXY-protocol header injection, which
 > would carry the original IP across hops, is intentionally out of scope for the raw
 > passthrough path.)
+
+## Per-SNI TLS Passthrough (HTTPS port)
+
+Some hosts must keep their TLS **end-to-end**: the certificate lives on the
+customer's own server and jsproxy must never decrypt the traffic. For those, a row
+in the `tls_passthrough` table makes jsproxy route the connection by the **SNI in
+the TLS ClientHello** and relay the raw TLS bytes to a backend — while every other
+host on the same HTTPS port keeps being terminated by jsproxy exactly as before.
+
+```sql
+CREATE TABLE tls_passthrough (
+  sni            TEXT PRIMARY KEY,           -- exact hostname, lowercase, no wildcards
+  backend        TEXT NOT NULL,              -- host or IP
+  back_port      INTEGER NOT NULL,
+  proxy_protocol INTEGER NOT NULL DEFAULT 1, -- 1 = send a PROXY v2 header first
+  enabled        INTEGER NOT NULL DEFAULT 1,
+  updated_at     TEXT
+);
+```
+
+The table is created automatically (same schema transaction as the other tables).
+Manage rows with the CLI, or write them directly (e.g. FluxWall does):
+
+```bash
+node scripts/add-tls-passthrough.js app.customer.com 10.0.0.5 9443          # with PROXY v2
+node scripts/add-tls-passthrough.js app.customer.com 10.0.0.5 9443 --no-proxy-protocol
+node scripts/add-tls-passthrough.js app.customer.com 10.0.0.5 9443 --disabled
+node scripts/add-tls-passthrough.js --list
+node scripts/remove-tls-passthrough.js app.customer.com
+```
+
+**No restart needed** — lookups are cached per worker for
+`TLS_PASSTHROUGH_CACHE_TTL_MS` (default 5 s, at most `TLS_PASSTHROUGH_CACHE_MAX`
+= 10000 entries), so a change is live within ~5 s.
+
+How a connection on the HTTPS port is handled:
+
+1. While the table has **no enabled rows**, connections go straight to the HTTPS
+   server (no peek at all). Otherwise jsproxy reads the ClientHello (records split
+   across TCP segments and handshakes split across TLS records are reassembled),
+   capped at **16 KB** and `TLS_PEEK_TIMEOUT_MS` (default **5 s**); over either cap
+   the connection is closed.
+2. SNI matches an **enabled** row → connect `backend:back_port`
+   (`TCP_CONNECT_TIMEOUT_MS`), send the PROXY v2 header (if `proxy_protocol=1`),
+   then the buffered ClientHello, then relay both directions with backpressure and
+   half-close (`TCP_IDLE_TIMEOUT_MS` applies, default none — same as raw TCP
+   routes). Nothing is ever buffered beyond the ClientHello. Backend unreachable →
+   the client socket is closed (TLS: no plaintext error page is possible).
+3. Anything else — no matching/enabled row, no SNI, not TLS, or **a DB error**
+   (fail-safe) — is handed, on the very same socket, to the normal HTTPS server:
+   certs, SNICallback/ACME, WebSocket, keep-alive, timeouts and the client IP
+   (logs, `X-Forwarded-For`) are unchanged.
+
+**PROXY protocol v2 header** (`proxy_protocol=1`): signature
+`\r\n\r\n\0\r\nQUIT\n`, version/command `0x21` (v2, PROXY), family `0x11`
+(TCP/IPv4) when both ends are IPv4 (IPv4-mapped IPv6 is unmapped) else `0x21`
+(TCP/IPv6), source = real client address/port, destination = the jsproxy address/port
+the client connected to, then one TLV `PP2_TYPE_AUTHORITY` (`0x02`) = the SNI.
+Without both addresses the family is `0x00` (UNSPEC) and only the TLV follows.
+
+One debug line per passthrough connection at close (`tls passthrough closed`:
+sni, backend, client_ip, bytes_in, bytes_out, duration_ms). `TLS_PASSTHROUGH=false`
+disables the gate entirely. If a raw TCP route has taken the HTTPS port over (see
+above) there is no HTTPS server and this feature does not apply — that port stays
+pure raw TCP.
 
 ## Raw UDP Proxying
 

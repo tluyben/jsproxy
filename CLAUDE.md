@@ -186,6 +186,34 @@ Tests: `__tests__/TCP.test.js`, `__tests__/UDP.test.js` (forwarding, stickiness,
 dns:// probe failover, ICMP replay, allowlist, tcp+udp same-port coexistence,
 HTTP regression), `__tests__/ProtocolProbes.test.js` (probe units).
 
+## Per-SNI TLS passthrough (HTTPS port)
+
+`tls_passthrough(sni PK, backend, back_port, proxy_protocol DEFAULT 1, enabled
+DEFAULT 1, updated_at)` — written by FluxWall (or `scripts/add-tls-passthrough.js` /
+`scripts/remove-tls-passthrough.js`). Code: `src/TlsPassthrough.js`, installed by
+`ProxyServer._installTlsPassthrough` on the HTTPS server right after it is created.
+
+- **Gate, not a second listener.** `installGate` captures the HTTPS server's own
+  `'connection'` listeners (tls.Server's `tlsConnectionListener`), replaces them,
+  peeks the ClientHello, and either relays the raw bytes (enabled row for the exact
+  lowercase SNI) or `unshift`s the bytes and calls the captured listeners with the
+  SAME socket. Node's TLSSocket drains bytes already buffered on the wrapped
+  net.Socket (`initRead`), so local termination, connection tracking, timeouts and
+  `remoteAddress` (client IP/XFF) are untouched. No enabled rows → no peek at all.
+- **Fail safe**: lookup/DB errors → normal termination; errors are not cached.
+  Lookups cached per worker (`PassthroughLookup`, TTL 5 s, bounded entries) — rows
+  go live without a restart.
+- **Limits**: 16 KB / `TLS_PEEK_TIMEOUT_MS` (5 s) to complete a ClientHello, then
+  close. Relay is `pipe()` both ways with `allowHalfOpen` (half-close preserved);
+  a side that closes uncleanly destroys the peer; `stop()` destroys gated sockets.
+- **PROXY v2** (`proxy_protocol=1`): real client src + local dst addr/port
+  (AF_INET, or AF_INET6 if either side is real IPv6), TLV `0x02` AUTHORITY = SNI.
+- Raw-TCP takeover of the HTTPS port: no HTTPS server → no gate (unchanged).
+
+Tests: `__tests__/tls-passthrough.test.js` — own-cert backend, PROXY v2 bytes,
+non-matching/no SNI/disabled/DB-error → local cert, split ClientHello, garbage,
+slowloris, 16 KB cap, dead backend, cache, 2×200 MB with flat RSS.
+
 ## Preflight header rewrite
 
 A user-supplied script that runs against every request's headers **before

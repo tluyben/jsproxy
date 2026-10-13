@@ -57,6 +57,68 @@ class DatabaseManager {
     await this.addAllowedIpsColumnIfMissing();
     await this.addAuthColumnsIfMissing();
     await this.addTcpColumnsIfMissing();
+    await this.createTlsPassthroughTable();
+  }
+
+  // Per-SNI TLS passthrough on the HTTPS port (written by FluxWall). A row
+  // routes connections whose ClientHello SNI equals `sni` (lowercase, exact,
+  // no wildcards) as raw bytes to backend:back_port; jsproxy never terminates
+  // that TLS. CREATE IF NOT EXISTS inside the schema transaction is safe when
+  // every cluster worker runs it at once (see initialize()).
+  async createTlsPassthroughTable() {
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS tls_passthrough (
+        sni TEXT PRIMARY KEY,
+        backend TEXT NOT NULL,
+        back_port INTEGER NOT NULL,
+        proxy_protocol INTEGER NOT NULL DEFAULT 1,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT
+      )
+    `);
+  }
+
+  // Enabled row for one SNI, or undefined. Rejects on DB error — callers must
+  // treat that as "no passthrough" (terminate TLS locally).
+  async getTlsPassthrough(sni) {
+    return new Promise((resolve, reject) => {
+      if (!this.db) { reject(new Error('database not open')); return; }
+      this.db.get('SELECT * FROM tls_passthrough WHERE sni = ? AND enabled = 1',
+        [String(sni).toLowerCase()], (err, row) => (err ? reject(err) : resolve(row)));
+    });
+  }
+
+  async hasEnabledTlsPassthrough() {
+    return new Promise((resolve, reject) => {
+      if (!this.db) { reject(new Error('database not open')); return; }
+      this.db.get('SELECT 1 AS x FROM tls_passthrough WHERE enabled = 1 LIMIT 1', [],
+        (err, row) => (err ? reject(err) : resolve(!!row)));
+    });
+  }
+
+  async getTlsPassthroughRoutes() {
+    return new Promise((resolve, reject) => {
+      this.db.all('SELECT * FROM tls_passthrough ORDER BY sni', [], (err, rows) => (err ? reject(err) : resolve(rows || [])));
+    });
+  }
+
+  async addTlsPassthrough(sni, backend, backPort, proxyProtocol = true, enabled = true) {
+    const sql = `INSERT INTO tls_passthrough (sni, backend, back_port, proxy_protocol, enabled, updated_at)
+                 VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 ON CONFLICT(sni) DO UPDATE SET backend = excluded.backend, back_port = excluded.back_port,
+                   proxy_protocol = excluded.proxy_protocol, enabled = excluded.enabled, updated_at = excluded.updated_at`;
+    return new Promise((resolve, reject) => {
+      this.db.run(sql, [String(sni).toLowerCase(), backend, parseInt(backPort, 10), proxyProtocol ? 1 : 0, enabled ? 1 : 0],
+        (err) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  async removeTlsPassthrough(sni) {
+    return new Promise((resolve, reject) => {
+      this.db.run('DELETE FROM tls_passthrough WHERE sni = ?', [String(sni).toLowerCase()], function (err) {
+        if (err) reject(err); else resolve(this.changes);
+      });
+    });
   }
 
   async ensureDataDirectory() {

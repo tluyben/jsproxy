@@ -12,6 +12,7 @@ const { noop } = require('./PluginManager');
 const { URL } = require('url');
 const { tracer, trace, context: otelContext, propagation, SpanKind, SpanStatusCode } = require('./Telemetry');
 const sauromon = require('./Sauromon');
+const TlsPassthrough = require('./TlsPassthrough');
 
 class ProxyServer {
   constructor(logger, pluginManager) {
@@ -82,6 +83,12 @@ class ProxyServer {
     this.tcpServers = new Map();  // listen_port -> net.Server (raw TCP proxy, opt-in)
     this.udpServers = new Map();  // listen_port -> { server, flows } (raw UDP proxy, opt-in)
     this.probeTimers = [];        // periodic protocol-probe intervals (dns:// etc.)
+    // Per-SNI TLS passthrough on the HTTPS port (tls_passthrough table).
+    this.tlsPassthroughLookup = new TlsPassthrough.PassthroughLookup(this.db, {
+      ttlMs: parseInt(process.env.TLS_PASSTHROUGH_CACHE_TTL_MS || '5000', 10),
+      maxEntries: parseInt(process.env.TLS_PASSTHROUGH_CACHE_MAX || '10000', 10),
+    });
+    this.tlsPassthroughGate = null;
     this.setupProxyErrorHandling();
   }
 
@@ -566,6 +573,7 @@ class ProxyServer {
         });
         this._applyServerTimeouts(this.httpsServer);
         this._instrumentServer(this.httpsServer, 'https');
+        this._installTlsPassthrough(this.httpsServer);
 
         this.httpsServer.on('tlsClientError', (err, tlsSocket) => {
           // ECONNRESET / "socket hang up" = client disconnected mid-handshake — perfectly normal.
@@ -615,6 +623,28 @@ class ProxyServer {
       httpHost);
     await this.startUdpListeners(httpHost);
     this._announceStart();
+  }
+
+  // ── Per-SNI TLS passthrough (HTTPS port) ──────────────────────────────────
+  //
+  // Every HTTPS-port connection is peeked for its ClientHello SNI first; an
+  // enabled tls_passthrough row for that exact host sends the raw TLS bytes to
+  // its backend (PROXY v2 header first unless proxy_protocol=0) — jsproxy never
+  // decrypts it. Everything else (no row, no SNI, not TLS, DB error) is handed,
+  // on the same socket, to the HTTPS server's own connection listener, so local
+  // termination is unchanged. While the table has no enabled rows connections
+  // skip the peek altogether. TLS_PASSTHROUGH=false disables the gate.
+  // Not used when a raw TCP route has taken the HTTPS port over (no server).
+  _installTlsPassthrough(server) {
+    if (process.env.TLS_PASSTHROUGH === 'false') return;
+    const num = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 ? n : d; };
+    this.tlsPassthroughGate = TlsPassthrough.installGate(server, {
+      lookup: this.tlsPassthroughLookup,
+      logger: this.logger,
+      peekTimeoutMs: num(process.env.TLS_PEEK_TIMEOUT_MS, 5000),
+      connectTimeoutMs: num(process.env.TCP_CONNECT_TIMEOUT_MS || process.env.HA_CONNECT_TIMEOUT_MS, 3000),
+      idleTimeoutMs: num(process.env.TCP_IDLE_TIMEOUT_MS, 0),
+    });
   }
 
   // ── Raw TCP proxy ─────────────────────────────────────────────────────────
@@ -3261,6 +3291,7 @@ class ProxyServer {
       this.httpServer.closeAllConnections();
       await new Promise((resolve) => this.httpServer.close(resolve));
     }
+    if (this.tlsPassthroughGate) this.tlsPassthroughGate.destroyAll();
     if (this.httpsServer) {
       this.httpsServer.closeAllConnections();
       await new Promise((resolve) => this.httpsServer.close(resolve));
