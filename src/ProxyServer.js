@@ -818,8 +818,27 @@ class ProxyServer {
         const teardown = () => { clientSocket.destroy(); upstream.destroy(); };
         clientSocket.on('error', teardown);
         upstream.on('error', teardown);
-        clientSocket.on('close', teardown);
-        upstream.on('close', teardown);
+        // A side that closed CLEANLY (its read side ended, so pipe() already
+        // end()ed the peer) must not destroy the peer: destroy() discards what
+        // is still queued in the peer's write buffer. 2026-11-03: a backend that
+        // answers `Connection: close` and closes right after its last write lost
+        // the tail of the response whenever the client side (a tailnet hop) was
+        // slower: MadeWithTech's 6.7 MB page arrived 67 KB short (KU flapping).
+        // So the peer is destroyed only once its queued bytes are flushed
+        // ('finish'); any other close (error, idle destroy, reset, peer still
+        // owed bytes) destroys it at once, and TCP_DRAIN_MS (default 30 s) caps
+        // a flush that never completes, so nothing lingers.
+        const drainMs = parseInt(process.env.TCP_DRAIN_MS || '30000', 10);
+        const onClosed = (self, peer) => () => {
+          if (peer.destroyed) return;
+          if (!(peer.writableEnded && self.writableFinished) || peer.writableFinished) { peer.destroy(); return; }
+          const t = setTimeout(() => peer.destroy(), drainMs);
+          if (t.unref) t.unref();
+          peer.once('finish', () => { clearTimeout(t); peer.destroy(); });
+          peer.once('close', () => clearTimeout(t));
+        };
+        clientSocket.on('close', onClosed(clientSocket, upstream));
+        upstream.on('close', onClosed(upstream, clientSocket));
         if (tstat) this._trackTcpSession(route, target, clientSocket, upstream, tstat);
         clientSocket.pipe(upstream);
         upstream.pipe(clientSocket);
