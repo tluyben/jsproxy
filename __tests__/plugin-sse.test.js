@@ -68,6 +68,8 @@ function firstChunk(port, host, { method = 'GET', body = null, accept = 'text/ev
       let n = 0;
       res.on('data', c => {
         got += c.toString();
+        // SSE comment-only writes (jsproxy's CDN flush `:\n`) are not data chunks.
+        if (/^(:[^\n]*\n)+$/.test(c.toString())) return;
         if (++n < want) return;
         clearTimeout(timer); resolve({ status: res.statusCode, headers: res.headers, chunk: got }); req.destroy();
       });

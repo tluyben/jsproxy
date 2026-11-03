@@ -1,3 +1,4 @@
+const { pipeBody } = require('./SseCdnFlush');
 const http = require('http');
 const https = require('https');
 const net = require('net');
@@ -2346,7 +2347,7 @@ class ProxyServer {
                   return resolve();
                 }
                 res.writeHead(afterResult.statusCode ?? proxyRes.statusCode, outHeaders);
-                proxyRes.pipe(res);
+                pipeBody(proxyRes, res, outHeaders);
                 proxyRes.on('end', resolve);
                 proxyRes.on('error', () => resolve());
                 return;
@@ -2357,7 +2358,7 @@ class ProxyServer {
               if (!skip.has(k.toLowerCase())) fwdHeaders[k] = v;
             }
             res.writeHead(proxyRes.statusCode, fwdHeaders);
-            proxyRes.pipe(res);
+            pipeBody(proxyRes, res, fwdHeaders);
             proxyRes.on('end', resolve);
             proxyRes.on('error', () => resolve());
           } catch (err) {
@@ -2439,7 +2440,7 @@ class ProxyServer {
       // An open event stream (_tryTarget opts.openEventStreams): relay it live.
       res.flushHeaders();
       res.once('close', () => result.stream.destroy());
-      result.stream.pipe(res);
+      pipeBody(result.stream, res, headers);
       return;
     }
     res.end(result.body);
@@ -2628,7 +2629,7 @@ class ProxyServer {
         if (proxyReq.socket) proxyReq.socket.setTimeout(0);
         watch.start();
         proxyRes.on('end', watch.clear);
-        proxyRes.pipe(res);
+        pipeBody(proxyRes, res, fwd);
         proxyRes.on('error', () => { watch.clear(); if (!res.writableEnded) res.destroy(); });
       });
 
@@ -2874,7 +2875,7 @@ class ProxyServer {
         // Download progress keeps the idle monitor satisfied via the socket's
         // bytesRead counter; stop monitoring once the response completes.
         proxyRes.on('end', clearIdle);
-        proxyRes.pipe(res);
+        pipeBody(proxyRes, res, fwd);
         proxyRes.on('error', () => { clearIdle(); if (!res.writableEnded) res.destroy(); });
       });
 
