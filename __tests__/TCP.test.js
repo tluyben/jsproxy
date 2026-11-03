@@ -216,10 +216,104 @@ describe('Raw TCP proxying', () => {
     proxy.portScores.clear();
     proxy.rrCounters.clear();
 
-    const res = await tcpSend(9313, 'x');
-    expect(res.got).toBe(false);
-    expect(res.data).toBe('');
+    process.env.TCP_RETRY_BUDGET_MS = '0';   // one pass, no retry rounds
+    try {
+      const res = await tcpSend(9313, 'x');
+      expect(res.got).toBe(false);
+      expect(res.data).toBe('');
+    } finally { delete process.env.TCP_RETRY_BUDGET_MS; }
   }, 15000);
+
+  test('edge stall: every backend unreachable for a moment, client still gets through (retry rounds)', async () => {
+    await proxy.db.addTcpRoute(9326, '127.0.0.1', '9366,9367'); // nothing listening yet
+    await refreshTcp();
+    proxy.portScores.clear();
+    proxy.rrCounters.clear();
+
+    const backend = makeEchoBackend('late');
+    // The "path" comes back 1.5 s after the client connected.
+    const t = setTimeout(() => backend.listen(9367, '127.0.0.1'), 1500);
+    try {
+      const t0 = Date.now();
+      const res = await new Promise((resolve) => {
+        const sock = net.connect(9326, '127.0.0.1');
+        let buf = '';
+        sock.on('connect', () => sock.write('hi'));
+        sock.on('data', (d) => { buf += d.toString(); sock.end(); });
+        sock.on('close', () => resolve({ data: buf, ms: Date.now() - t0 }));
+        sock.on('error', () => resolve({ data: buf, ms: Date.now() - t0, error: true }));
+        sock.setTimeout(10000, () => sock.destroy());
+      });
+      expect(res.data).toBe('late:hi');
+      expect(res.ms).toBeGreaterThanOrEqual(1400);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/reached (127\.0\.0\.1:)?9367 after \d+ retry round/));
+    } finally {
+      clearTimeout(t);
+      await closeServer(backend).catch(() => {});
+    }
+  }, 15000);
+
+  test('retry budget: still unreachable after TCP_RETRY_BUDGET_MS -> client closed with no data', async () => {
+    await proxy.db.addTcpRoute(9327, '127.0.0.1', '9368,9369');
+    await refreshTcp();
+    proxy.portScores.clear();
+    process.env.TCP_RETRY_BUDGET_MS = '2000';
+    try {
+      const t0 = Date.now();
+      const res = await tcpSend(9327, 'x');
+      expect(res.got).toBe(false);
+      expect(res.timedOut).not.toBe(true);
+      const ms = Date.now() - t0;
+      expect(ms).toBeGreaterThanOrEqual(1500);   // it did retry
+      expect(ms).toBeLessThan(3900);
+    } finally { delete process.env.TCP_RETRY_BUDGET_MS; }
+  }, 15000);
+
+  test('client that gives up during retry rounds stops the dialing at once', async () => {
+    await proxy.db.addTcpRoute(9328, '127.0.0.1', '9373,9374');  // never listening
+    await refreshTcp();
+    proxy.portScores.clear();
+    // Count only the relay's own dial() calls (by stack): health probes and
+    // background re-checks of the same ports run on their own schedule.
+    const relayDials = [];
+    const origConnect = net.Socket.prototype.connect;
+    const dialSpy = jest.spyOn(net.Socket.prototype, 'connect').mockImplementation(function (...args) {
+      const o = args[0];
+      if (o && typeof o === 'object' && [9373, 9374].includes(o.port) && /\bat dial\b/.test(new Error().stack)) relayDials.push(o.port);
+      return origConnect.apply(this, args);
+    });
+    try {
+      await new Promise((resolve) => {
+        const sock = net.connect(9328, '127.0.0.1');
+        sock.on('connect', () => setTimeout(() => sock.end(), 600));  // FIN, not RST
+        sock.on('close', resolve);
+        sock.on('error', resolve);
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      const handlerDials = () => relayDials.length;
+      const before = handlerDials();
+      expect(before).toBeGreaterThan(0);               // it did dial before the client left
+      await new Promise((r) => setTimeout(r, 2500));   // a live loop would dial again by now
+      expect(handlerDials()).toBe(before);
+    } finally { dialSpy.mockRestore(); }
+  }, 15000);
+
+  test('probe hysteresis: one failed protocol probe does not score a target 0', async () => {
+    process.env.PROTOCOL_PROBE_INTERVAL_MS = '400';
+    process.env.PROTOCOL_PROBE_TIMEOUT_MS = '200';
+    const route = { id: 'hyst-route', domain: 'x.test' };
+    const target = { hostname: '127.0.0.1', port: 9375, key: '127.0.0.1:9375', probe: 'https+check' };  // closed
+    try {
+      proxy._startProtocolProbes(route, [target], 'tcp');
+      await new Promise((r) => setTimeout(r, 250));     // first probe has failed
+      expect(proxy.getPortScore(route.id, target.key)).toBe(100);
+      await new Promise((r) => setTimeout(r, 500));     // second consecutive failure
+      expect(proxy.getPortScore(route.id, target.key)).toBe(0);
+    } finally {
+      delete process.env.PROTOCOL_PROBE_INTERVAL_MS;
+      delete process.env.PROTOCOL_PROBE_TIMEOUT_MS;
+    }
+  }, 10000);
 
   test('IP allowlist: connection from a disallowed source is rejected', async () => {
     const backend = makeEchoBackend('secret');

@@ -691,9 +691,11 @@ class ProxyServer {
     // connection it was relaying (the hetzner-1 host jsproxy crash-restarted
     // several times a day on exactly this, cutting uploads mid-stream).
     let pendingUpstream = null;
+    let onEarlyAbort = null;     // cancels in-flight retry-round dials
     const onEarlyClientError = () => {
       clientSocket.destroy();
       if (pendingUpstream) pendingUpstream.destroy();
+      if (onEarlyAbort) onEarlyAbort();
     };
     clientSocket.on('error', onEarlyClientError);
 
@@ -720,86 +722,206 @@ class ProxyServer {
     const ordered = this.rankedTargets(route.id, targets);
     const tstat = sauromon.enabled ? { t0: Date.now(), peer: clientIp, failed: [] } : null;
 
-    // Try ranked targets until one connects. Failover here is always safe: no
-    // client bytes have been forwarded yet (the client socket is paused), so
-    // there is no duplication risk regardless of protocol.
-    const tryNext = (idx) => {
+    // Edge pods (Bunny MC) lose their path to every origin for 5-10 s now and
+    // then. Refusing the client after one pass turned each such gap into errors
+    // users saw. So: one ranked pass first (keeps primary/backup tiers), then
+    // retry rounds that race every target at once, with backoff, until the
+    // client goes away or TCP_RETRY_BUDGET_MS runs out. No client bytes have
+    // been forwarded yet (the client socket is paused), so retrying is safe for
+    // any protocol.
+    const retryBudgetMs = parseInt(process.env.TCP_RETRY_BUDGET_MS || '25000', 10);
+    let round = 0;
+
+    const giveUp = () => {
+      this.logger.warn(`TCP: all backends down for route ${route.id} (port ${route.listen_port})`);
+      if (tstat) {
+        sauromon.event('error', `tcp :${route.listen_port} ${clientIp}: all backends down`, {
+          kind: 'tcp', listen_port: route.listen_port, route_id: route.id, peer: clientIp,
+          failed: tstat.failed.join(','), duration_ms: Date.now() - tstat.t0, rounds: round + 1,
+          worker_id: process.env.WORKER_ID,
+        });
+      }
+      clientSocket.destroy();
+    };
+
+    // While we wait between rounds the client socket must be read, or a client
+    // that gives up (FIN) is invisible and we keep dialing for the whole budget.
+    // Bytes it sends meanwhile are held (capped) and replayed on attach.
+    const held = [];
+    let heldBytes = 0;
+    let watching = false;
+    const holdCap = parseInt(process.env.TCP_RETRY_HOLD_BYTES || '262144', 10);
+    const onHeldData = (d) => {
+      held.push(d);
+      heldBytes += d.length;
+      if (heldBytes >= holdCap) clientSocket.pause();
+    };
+    const onClientEnd = () => {
+      clientSocket.destroy();
+      if (onEarlyAbort) onEarlyAbort();
+    };
+    const watchClient = () => {
+      if (watching) return;
+      watching = true;
+      clientSocket.on('data', onHeldData);
+      clientSocket.once('end', onClientEnd);
+      clientSocket.resume();
+    };
+
+    const nextRound = () => {
       if (clientSocket.destroyed) return;
-      if (idx >= ordered.length) {
-        this.logger.warn(`TCP: all backends down for route ${route.id} (port ${route.listen_port})`);
+      watchClient();
+      const elapsed = Date.now() - (tstat ? tstat.t0 : t0);
+      const backoff = Math.min(2000, 250 * 2 ** round);
+      if (elapsed + backoff > retryBudgetMs) return giveUp();   // worst case: budget + one connect timeout
+      round++;
+      const t = setTimeout(() => raceAll(), backoff);
+      if (t.unref) t.unref();
+    };
+
+    // Wire a connected upstream to the client. Returns false if the client is gone.
+    const attach = (target, upstream) => {
+      if (clientSocket.destroyed) { upstream.destroy(); return false; }
+      pendingUpstream = null;
+      clientSocket.removeListener('error', onEarlyClientError);
+      upstream.setTimeout(0);              // clear the connect timeout
+      upstream.removeAllListeners('error');
+      upstream.removeAllListeners('timeout');
+      this.boostPort(route.id, target.key);
+      if (round > 0) {
+        const ms = Date.now() - (tstat ? tstat.t0 : t0);
+        this.logger.warn(`TCP: route ${route.id} (port ${route.listen_port}) reached ${target.key} after ${round} retry round(s), ${ms}ms`);
         if (tstat) {
-          sauromon.event('error', `tcp :${route.listen_port} ${clientIp}: all backends down`, {
+          sauromon.event('warn', `tcp :${route.listen_port} ${clientIp}: rescued after ${round} retry round(s)`, {
             kind: 'tcp', listen_port: route.listen_port, route_id: route.id, peer: clientIp,
-            failed: tstat.failed.join(','), duration_ms: Date.now() - tstat.t0, worker_id: process.env.WORKER_ID,
+            backend: target.key, rounds: round, duration_ms: ms, worker_id: process.env.WORKER_ID,
           });
         }
-        clientSocket.destroy();
-        return;
       }
-      const target = ordered[idx];
-      const upstream = new net.Socket();
-      pendingUpstream = upstream;
-      let settled = false;
 
+      if (idleTimeoutMs > 0) {
+        clientSocket.setTimeout(idleTimeoutMs, () => clientSocket.destroy());
+        upstream.setTimeout(idleTimeoutMs, () => upstream.destroy());
+      }
+
+      // Bidirectional pipe. Tear down the peer when either side ends/errors so
+      // no half-open socket lingers.
+      //
+      // 'close' is the load-bearing one: it fires exactly once per socket no
+      // matter how the connection ended, whereas 'error' only covers the
+      // abnormal case. Wiring 'error' alone leaked the upstream fd on every
+      // cleanly-closed connection — invisible until the process hit its fd
+      // ceiling. destroy() is idempotent, so the overlap is harmless.
+      const teardown = () => { clientSocket.destroy(); upstream.destroy(); };
+      clientSocket.on('error', teardown);
+      upstream.on('error', teardown);
+      // A side that closed CLEANLY (its read side ended, so pipe() already
+      // end()ed the peer) must not destroy the peer: destroy() discards what
+      // is still queued in the peer's write buffer. 2026-11-03: a backend that
+      // answers `Connection: close` and closes right after its last write lost
+      // the tail of the response whenever the client side was slower:
+      // MadeWithTech's 6.7 MB page arrived 67 KB short (KU flapping).
+      // So the peer is destroyed only once its queued bytes are flushed
+      // ('finish'); any other close (error, idle destroy, reset, peer still
+      // owed bytes) destroys it at once, and TCP_DRAIN_MS (default 30 s) caps
+      // a flush that never completes, so nothing lingers.
+      const drainMs = parseInt(process.env.TCP_DRAIN_MS || '30000', 10);
+      const onClosed = (self, peer) => () => {
+        if (peer.destroyed) return;
+        if (!(peer.writableEnded && self.writableFinished) || peer.writableFinished) { peer.destroy(); return; }
+        const t = setTimeout(() => peer.destroy(), drainMs);
+        if (t.unref) t.unref();
+        peer.once('finish', () => { clearTimeout(t); peer.destroy(); });
+        peer.once('close', () => clearTimeout(t));
+      };
+      clientSocket.on('close', onClosed(clientSocket, upstream));
+      upstream.on('close', onClosed(upstream, clientSocket));
+      if (tstat) this._trackTcpSession(route, target, clientSocket, upstream, tstat);
+      if (watching) {
+        clientSocket.pause();
+        clientSocket.removeListener('data', onHeldData);
+        clientSocket.removeListener('end', onClientEnd);
+        for (const d of held) upstream.write(d);
+        held.length = 0;
+      }
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+      clientSocket.resume();
+
+      if (process.env.LOG_LEVEL === 'debug') {
+        this.logger.debug(`TCP: ${clientIp} -> ${target.hostname}:${target.port} (route ${route.id})`);
+      }
+      return true;
+    };
+
+    // Dial one target; cb(err) on failure, cb(null, upstream) on connect.
+    const dial = (target, cb) => {
+      const upstream = new net.Socket();
+      let settled = false;
       const fail = (err) => {
         if (settled) return;
         settled = true;
-        // The client is already gone: not the backend's fault, nothing to retry.
-        if (clientSocket.destroyed) { upstream.destroy(); return; }
-        if (tstat) tstat.failed.push(`${target.key}=${err ? (err.code || err.message) : 'connect-timeout'}`);
         upstream.destroy();
-        this.penalizePort(route.id, target.key);
-        // Probed targets are revived (and penalized) by their periodic protocol
-        // probe; plain targets keep the original background TCP re-check.
-        if (!target.probe) this.startBackgroundCheckTarget(route, target);
-        tryNext(idx + 1);
+        cb(err || null, null);
       };
-
-      upstream.setTimeout(connectTimeoutMs, fail);
+      upstream.setTimeout(connectTimeoutMs, () => fail(null));
       upstream.once('error', fail);
-
       upstream.connect({ port: target.port, host: target.hostname, lookup: dnsCache.lookup }, () => {
-        // The client can vanish while this connect is still in flight (a slow
-        // or firewalled backend makes that window seconds wide). Wiring the
-        // pipes to an already-dead client would strand this upstream: no 'end'
-        // can ever arrive to close it.
-        if (settled || clientSocket.destroyed) { upstream.destroy(); return; }
+        if (settled) { upstream.destroy(); return; }
         settled = true;
-        pendingUpstream = null;
-        clientSocket.removeListener('error', onEarlyClientError);
-        upstream.setTimeout(0);              // clear the connect timeout
-        upstream.removeListener('error', fail);
-        this.boostPort(route.id, target.key);
+        cb(null, upstream);
+      });
+      return upstream;
+    };
 
-        if (idleTimeoutMs > 0) {
-          clientSocket.setTimeout(idleTimeoutMs, () => clientSocket.destroy());
-          upstream.setTimeout(idleTimeoutMs, () => upstream.destroy());
-        }
+    const noteFailure = (target, err) => {
+      if (tstat && round === 0) tstat.failed.push(`${target.key}=${err ? (err.code || err.message) : 'connect-timeout'}`);
+      this.penalizePort(route.id, target.key);
+      // Probed targets are revived (and penalized) by their periodic protocol
+      // probe; plain targets keep the original background TCP re-check.
+      if (!target.probe) this.startBackgroundCheckTarget(route, target);
+    };
 
-        // Bidirectional pipe. Tear down the peer when either side ends/errors so
-        // no half-open socket lingers.
-        //
-        // 'close' is the load-bearing one: it fires exactly once per socket no
-        // matter how the connection ended, whereas 'error' only covers the
-        // abnormal case. Wiring 'error' alone leaked the upstream fd on every
-        // cleanly-closed connection — invisible until the process hit its fd
-        // ceiling. destroy() is idempotent, so the overlap is harmless.
-        const teardown = () => { clientSocket.destroy(); upstream.destroy(); };
-        clientSocket.on('error', teardown);
-        upstream.on('error', teardown);
-        clientSocket.on('close', teardown);
-        upstream.on('close', teardown);
-        if (tstat) this._trackTcpSession(route, target, clientSocket, upstream, tstat);
-        clientSocket.pipe(upstream);
-        upstream.pipe(clientSocket);
-        clientSocket.resume();
-
-        if (process.env.LOG_LEVEL === 'debug') {
-          this.logger.debug(`TCP: ${clientIp} -> ${target.hostname}:${target.port} (route ${route.id})`);
-        }
+    // Pass 0: ranked, one at a time (respects backup tiers).
+    const tryNext = (idx) => {
+      if (clientSocket.destroyed) return;
+      if (idx >= ordered.length) return nextRound();
+      const target = ordered[idx];
+      pendingUpstream = dial(target, (err, upstream) => {
+        // The client is already gone: not the backend's fault, nothing to retry.
+        if (clientSocket.destroyed) { if (upstream) upstream.destroy(); return; }
+        if (!upstream) { noteFailure(target, err); return tryNext(idx + 1); }
+        attach(target, upstream);
       });
     };
 
+    // Retry rounds: dial every target at once, first connect wins.
+    const raceAll = () => {
+      if (clientSocket.destroyed) return;
+      let pending = ordered.length;
+      let won = false;
+      const dialing = [];
+      const cancelOthers = (keep) => { for (const s of dialing) if (s !== keep) s.destroy(); };
+      onEarlyAbort = () => cancelOthers(null);
+      for (const target of ordered) {
+        const sock = dial(target, (err, upstream) => {
+          if (won) { if (upstream) upstream.destroy(); return; }
+          if (clientSocket.destroyed) { if (upstream) upstream.destroy(); return; }
+          if (upstream) {
+            won = true;
+            onEarlyAbort = null;
+            cancelOthers(upstream);
+            attach(target, upstream);
+            return;
+          }
+          noteFailure(target, err);
+          if (--pending === 0) { onEarlyAbort = null; nextRound(); }
+        });
+        dialing.push(sock);
+      }
+    };
+
+    const t0 = Date.now();
     tryNext(0);
   }
 
@@ -957,16 +1079,22 @@ class ProxyServer {
       const probeFn = getProbe(target.probe)[transport];
       if (typeof probeFn !== 'function') continue;
       const key = this._portKey(route.id, target.key);
+      // One missed probe is not an outage: a pod that stalls for a few seconds
+      // misses every probe at once. Only PROTOCOL_PROBE_FAILS consecutive
+      // failures (default 2) score a target 0.
+      const failsNeeded = Math.max(1, parseInt(process.env.PROTOCOL_PROBE_FAILS || '2', 10));
+      let fails = 0;
       const tick = async () => {
         let ok = false;
         try { ok = await probeFn({ hostname: target.hostname, port: target.port, name: target.probeHost || name, timeoutMs }); }
         catch (_) { ok = false; }
         const prev = this.portScores.get(key) ?? 100;
         if (ok) {
+          fails = 0;
           if (prev === 0) this.logger.info(`Probe(${target.probe}/${transport}): ${target.hostname}:${target.port} back up (route ${route.id})`);
           this.boostPort(route.id, target.key);
-        } else {
-          if (prev !== 0) this.logger.warn(`Probe(${target.probe}/${transport}): ${target.hostname}:${target.port} failed — scored 0 (route ${route.id})`);
+        } else if (++fails >= failsNeeded) {
+          if (prev !== 0) this.logger.warn(`Probe(${target.probe}/${transport}): ${target.hostname}:${target.port} failed ${fails}x — scored 0 (route ${route.id})`);
           this.penalizePort(route.id, target.key);
         }
       };
